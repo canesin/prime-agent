@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { SessionAlreadyActiveError } from "../src/core/session-lease.js";
+import { DaemonCapabilityUnavailableError } from "../src/modes/daemon/daemon-client.js";
 import {
 	DaemonSessionCreateError,
 	deserializeDaemonCreateError,
@@ -53,6 +54,31 @@ describe("RLM child roster errors", () => {
 		expect(restored).toMatchObject({
 			expectedRosterToken: "a".repeat(64),
 			actualRosterToken: "b".repeat(64),
+		});
+	});
+});
+
+describe("daemon capability errors", () => {
+	it("round-trips the exact command and missing worker capability", () => {
+		const source = new DaemonCapabilityUnavailableError("cron_add", "conditional_cron_follow_up");
+		const errorInfo = serializeDaemonError(source);
+		expect(errorInfo).toEqual({
+			code: "daemon_capability_unavailable",
+			command: "cron_add",
+			capability: "conditional_cron_follow_up",
+		});
+
+		const restored = deserializeDaemonError({
+			type: "response",
+			command: "cron_add",
+			success: false,
+			error: source.message,
+			errorInfo,
+		});
+		expect(restored).toBeInstanceOf(DaemonCapabilityUnavailableError);
+		expect(restored).toMatchObject({
+			command: "cron_add",
+			capability: "conditional_cron_follow_up",
 		});
 	});
 });

@@ -1104,6 +1104,11 @@ export type DaemonErrorInfo =
 	| { code: "session_import_file_not_found"; filePath: string }
 	| { code: "session_already_active"; sessionPath: string; activeSessionId?: string }
 	| {
+			code: "daemon_capability_unavailable";
+			command: DaemonCommand["type"];
+			capability?: DaemonServerCapability;
+	  }
+	| {
 			code: "rlm_child_roster_changed";
 			expectedRosterToken: string;
 			actualRosterToken: string;

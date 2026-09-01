@@ -69,6 +69,7 @@ import {
 import { CommandRecoveryJournal, createCommandIdempotencyKey } from "./command-recovery-journal.js";
 import { CompactAssistantStreamReconstructor, isCompactAssistantDelta } from "./compact-session-stream.js";
 import { DAEMON_CATALOG_ROLE_ENV, DaemonCatalogClient } from "./daemon-catalog-process.js";
+import { DaemonCapabilityUnavailableError } from "./daemon-client.js";
 import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
 import {
 	collectDaemonClientEnv,
@@ -91,8 +92,10 @@ import {
 	type DaemonServerCapability,
 	type DaemonUpdateRestartManifest,
 	failure,
+	getDaemonCommandCompatibilities,
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
+	meetsDaemonCommandCompatibility,
 	salvageDaemonCommandId,
 	success,
 	UPDATE_RESTART_DRAIN_COMMANDS,
@@ -4501,6 +4504,13 @@ export class DaemonSupervisor {
 		timeoutMs = WORKER_REQUEST_TIMEOUT_MS,
 	): Promise<DaemonResponse> {
 		const client = this.requireAvailableWorkerClient(worker, command.type === "kill");
+		const workerHello = client.hello;
+		const missingCompatibility = getDaemonCommandCompatibilities(command).find(
+			(compatibility) => workerHello === undefined || !meetsDaemonCommandCompatibility(workerHello, compatibility),
+		);
+		if (missingCompatibility) {
+			throw new DaemonCapabilityUnavailableError(command.type, missingCompatibility.capability);
+		}
 		const response = await client.request(withoutCommandId(command), timeoutMs);
 		if (command.type === "get_state" && response.success && isSessionSummary(response.data)) {
 			return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };
