@@ -66,6 +66,35 @@ describe("buildSessionList", () => {
 		expect(second.created).toBe(first.created);
 	});
 
+	it("exposes the durable conditional follow-up receipt in the goal fence", () => {
+		const summary = summaryForActiveSession(
+			makeState({
+				activeSessionId: "active-follow-up",
+				goalState: {
+					active: true,
+					status: "active",
+					goalId: "goal-1",
+					objective: "finish kene",
+					tokensUsed: 0,
+					timeUsedSeconds: 0,
+					continuationsUsed: 0,
+					updatedAt: 7,
+					followUpDispatchReceiptId: "follow-up-1",
+					followUpDispatchPhase: "receipt",
+				},
+			}),
+		);
+
+		expect(summary.goal).toEqual({
+			active: true,
+			status: "active",
+			goalId: "goal-1",
+			updatedAt: 7,
+			followUpDispatchReceiptId: "follow-up-1",
+			followUpDispatchPhase: "receipt",
+		});
+	});
+
 	it("takes last activity from custom messages and tool results", () => {
 		const oldMessage = {
 			role: "user",

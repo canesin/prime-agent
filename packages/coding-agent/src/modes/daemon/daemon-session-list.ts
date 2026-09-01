@@ -25,7 +25,14 @@ export type SessionLifecycle = "draft" | "live" | "archived";
 export type SessionActivity = "working" | "idle";
 export type SessionGoalFence = Pick<
 	GoalState,
-	"active" | "status" | "goalId" | "updatedAt" | "dispatchReceiptId" | "dispatchPhase"
+	| "active"
+	| "status"
+	| "goalId"
+	| "updatedAt"
+	| "dispatchReceiptId"
+	| "dispatchPhase"
+	| "followUpDispatchReceiptId"
+	| "followUpDispatchPhase"
 >;
 
 // Upper bound on the spawn-code source carried in a session summary. Generous
@@ -274,6 +281,12 @@ export function summaryForActiveSession(
 						...(goalState.goalId ? { goalId: goalState.goalId } : {}),
 						...(goalState.dispatchReceiptId ? { dispatchReceiptId: goalState.dispatchReceiptId } : {}),
 						...(goalState.dispatchPhase ? { dispatchPhase: goalState.dispatchPhase } : {}),
+						...(goalState.followUpDispatchReceiptId
+							? { followUpDispatchReceiptId: goalState.followUpDispatchReceiptId }
+							: {}),
+						...(goalState.followUpDispatchPhase
+							? { followUpDispatchPhase: goalState.followUpDispatchPhase }
+							: {}),
 						...(goalState.updatedAt !== undefined ? { updatedAt: goalState.updatedAt } : {}),
 					},
 		unfinishedActionCount: session.unfinishedActionCount,

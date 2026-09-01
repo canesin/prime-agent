@@ -252,7 +252,7 @@ const structuredLog = getLogger("coding-agent.daemon");
 const WORKER_SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS = 1_000;
 const UPDATE_RESTART_PREPARE_TIMEOUT_MS = 90_000;
 const MAX_SESSION_SNAPSHOT_STABILIZATION_RETRIES = 3;
-const MAX_CONDITIONAL_GOAL_RECOVERY_ATTEMPTS = 5;
+const MAX_CONDITIONAL_CRON_RECOVERY_ATTEMPTS = 5;
 
 function matchesGoalFence(expected: AgentCronDeliveryFence["goal"], actual: SessionSummary["goal"]): boolean {
 	const normalizedActual = actual ?? null;
@@ -264,6 +264,8 @@ function matchesGoalFence(expected: AgentCronDeliveryFence["goal"], actual: Sess
 				normalizedActual.goalId === expected.goalId &&
 				normalizedActual.dispatchReceiptId === expected.dispatchReceiptId &&
 				normalizedActual.dispatchPhase === expected.dispatchPhase &&
+				normalizedActual.followUpDispatchReceiptId === expected.followUpDispatchReceiptId &&
+				normalizedActual.followUpDispatchPhase === expected.followUpDispatchPhase &&
 				normalizedActual.updatedAt === expected.updatedAt;
 }
 
@@ -1611,7 +1613,12 @@ export class AgentDaemon {
 	private recoverConditionalCronDeliveryForState(state: ActiveSessionState): void {
 		const goalState = state.runtime.session.goalState;
 		const receiptId = goalState?.dispatchReceiptId;
-		if (!receiptId) return;
+		if (receiptId) this.recoverConditionalGoalStartForState(state, receiptId);
+		const followUpReceiptId = goalState?.followUpDispatchReceiptId;
+		if (followUpReceiptId) this.recoverConditionalGoalFollowUpForState(state, followUpReceiptId);
+	}
+
+	private conditionalRecoveryJob(state: ActiveSessionState, receiptId: string): AgentCronJob | undefined {
 		const job =
 			this.recoveredConditionalCronJobs.get(receiptId) ??
 			this.cronStore
@@ -1623,12 +1630,18 @@ export class AgentDaemon {
 						candidate.status === "cancelled" &&
 						candidate.lastError !== "Delivery fence changed before prompt admission",
 				);
-		if (!job || job.sessionId !== state.runtime.session.sessionId) return;
-		if (goalState.dispatchPhase !== "receipt") {
+		return job?.sessionId === state.runtime.session.sessionId ? job : undefined;
+	}
+
+	private recoverConditionalGoalStartForState(state: ActiveSessionState, receiptId: string): void {
+		const goalState = state.runtime.session.goalState;
+		if (goalState?.dispatchReceiptId !== receiptId || goalState.dispatchPhase !== "receipt") {
 			this.recoveredConditionalCronJobs.delete(receiptId);
 			return;
 		}
-		if ((job.deliveryRecoveryCount ?? 0) >= MAX_CONDITIONAL_GOAL_RECOVERY_ATTEMPTS) {
+		const job = this.conditionalRecoveryJob(state, receiptId);
+		if (!job || job.deliveryMode === "follow_up") return;
+		if ((job.deliveryRecoveryCount ?? 0) >= MAX_CONDITIONAL_CRON_RECOVERY_ATTEMPTS) {
 			const alreadyFailed =
 				goalState.status === "error" && goalState.lastError === "Conditional goal delivery recovery exhausted";
 			try {
@@ -1654,6 +1667,43 @@ export class AgentDaemon {
 			this.recoveredConditionalCronJobs.delete(receiptId);
 		} catch (error) {
 			this.log(`Conditional cron recovery ${receiptId} failed: ${String(error)}`);
+		}
+	}
+
+	private recoverConditionalGoalFollowUpForState(state: ActiveSessionState, receiptId: string): void {
+		const goalState = state.runtime.session.goalState;
+		if (goalState?.followUpDispatchReceiptId !== receiptId || goalState.followUpDispatchPhase !== "receipt") {
+			this.recoveredConditionalCronJobs.delete(receiptId);
+			return;
+		}
+		const job = this.conditionalRecoveryJob(state, receiptId);
+		if (!job || job.deliveryMode !== "follow_up") return;
+		if ((job.deliveryRecoveryCount ?? 0) >= MAX_CONDITIONAL_CRON_RECOVERY_ATTEMPTS) {
+			const fail = state.runtime.session.failConditionalGoalFollowUpDelivery;
+			if (typeof fail !== "function") return;
+			try {
+				if (fail.call(state.runtime.session, receiptId)) {
+					this.cronStore.recordDeliveryRecoveryExhausted(receiptId);
+					this.recoveredConditionalCronJobs.delete(receiptId);
+				}
+			} catch (error) {
+				this.log(`Conditional cron follow-up recovery exhaustion ${receiptId} failed: ${String(error)}`);
+			}
+			return;
+		}
+		const recover = state.runtime.session.recoverConditionalGoalFollowUpDelivery;
+		if (typeof recover !== "function") return;
+		try {
+			recover.call(state.runtime.session, receiptId, job.prompt, {
+				recoveryCommitted: () => {
+					if (!this.cronStore.recordDeliveryRecoveryAttempt(receiptId)) {
+						throw new Error(`Conditional cron follow-up recovery receipt ${receiptId} disappeared`);
+					}
+				},
+			});
+			this.recoveredConditionalCronJobs.delete(receiptId);
+		} catch (error) {
+			this.log(`Conditional cron follow-up recovery ${receiptId} failed: ${String(error)}`);
 		}
 	}
 
@@ -1934,6 +1984,21 @@ export class AgentDaemon {
 		if (!state || !runnableJob || !this.isCronJobRunnableForState(runnableJob, state, requirePersistedJob)) {
 			return "skipped";
 		}
+		if (
+			runnableJob.source === "conditional_cron" &&
+			runnableJob.deliveryMode === "follow_up" &&
+			state.runtime.session.goalState.followUpDispatchReceiptId === runnableJob.id
+		) {
+			if (state.runtime.session.goalState.followUpDispatchPhase === "provider_committed") return;
+			if (state.runtime.session.goalState.followUpDispatchPhase === "receipt") {
+				this.cronStore.rejectDelivery(
+					runnableJob.id,
+					"Conditional goal follow-up receipt persisted before interrupted delivery",
+				);
+				this.recoverConditionalCronDeliveryForState(state);
+				return "skipped";
+			}
+		}
 		if (runnableJob.deliveryFence && !matchesCronDeliveryFence(runnableJob.deliveryFence, state)) {
 			this.cronStore.rejectDelivery(runnableJob.id, "Delivery fence changed before prompt admission");
 			return "skipped";
@@ -1993,10 +2058,17 @@ export class AgentDaemon {
 				return;
 			}
 			if (current.deliveryFence) {
-				await session.startGoalFromConditionalPrompt(current.prompt, {
-					admissionCommitted,
-					receiptId: current.id,
-				});
+				if (current.deliveryMode === "follow_up") {
+					await session.startGoalFollowUpFromConditionalPrompt(current.prompt, {
+						admissionCommitted,
+						receiptId: current.id,
+					});
+				} else {
+					await session.startGoalFromConditionalPrompt(current.prompt, {
+						admissionCommitted,
+						receiptId: current.id,
+					});
+				}
 				return;
 			}
 			await session.promptUntilAccepted(current.prompt, {
@@ -2016,13 +2088,20 @@ export class AgentDaemon {
 			}
 			if (current.deliveryFence) {
 				const reason = error instanceof Error ? error.message : String(error);
-				const receiptPersisted = session.goalState.dispatchReceiptId === current.id;
+				const followUpDelivery = current.deliveryMode === "follow_up";
+				const receiptPersisted = followUpDelivery
+					? session.goalState.followUpDispatchReceiptId === current.id
+					: session.goalState.dispatchReceiptId === current.id;
 				this.cronStore.rejectDelivery(
 					current.id,
 					`${
 						receiptPersisted
-							? "Conditional goal receipt persisted before delivery error"
-							: "Conditional goal delivery retryable"
+							? followUpDelivery
+								? "Conditional goal follow-up receipt persisted before delivery error"
+								: "Conditional goal receipt persisted before delivery error"
+							: followUpDelivery
+								? "Conditional goal follow-up delivery retryable"
+								: "Conditional goal delivery retryable"
 					}: ${reason.slice(0, 500)}`,
 				);
 				if (receiptPersisted) this.recoverConditionalCronDeliveryForState(state);
@@ -2041,6 +2120,7 @@ export class AgentDaemon {
 		schedule: string,
 		prompt: string,
 		deliveryFence?: AgentCronDeliveryFence,
+		deliveryMode?: "follow_up",
 	): AgentCronJob {
 		const session = state.runtime.session;
 		const sessionFile = session.sessionFile;
@@ -2056,6 +2136,7 @@ export class AgentDaemon {
 			scheduleText: schedule,
 			prompt,
 			deliveryFence,
+			deliveryMode,
 		});
 		this.cronScheduler.wake();
 		return job;
@@ -4811,7 +4892,13 @@ export class AgentDaemon {
 
 			case "cron_add": {
 				const state = this.getSessionState(command.activeSessionId);
-				const job = this.createCronJobForState(state, command.schedule, command.prompt, command.deliveryFence);
+				const job = this.createCronJobForState(
+					state,
+					command.schedule,
+					command.prompt,
+					command.deliveryFence,
+					command.deliveryMode,
+				);
 				this.scheduleRosterFlush();
 				return success(command.id, "cron_add", { job });
 			}

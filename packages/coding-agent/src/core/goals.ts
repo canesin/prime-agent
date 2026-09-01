@@ -19,6 +19,10 @@ export interface GoalState {
 	dispatchReceiptId?: string;
 	/** Durable provider boundary for crash-safe conditional delivery recovery. */
 	dispatchPhase?: "receipt" | "provider_committed";
+	/** Durable correlation for a conditionally delivered follow-up to this active goal. */
+	followUpDispatchReceiptId?: string;
+	/** Durable provider boundary for crash-safe conditional follow-up recovery. */
+	followUpDispatchPhase?: "receipt" | "provider_committed" | "failed";
 	objective?: string;
 	tokenBudget?: number;
 	tokensUsed: number;
@@ -146,6 +150,25 @@ export function isPersistedGoalState(value: unknown): value is GoalState {
 		return false;
 	}
 	if (record.dispatchPhase !== undefined && typeof record.dispatchReceiptId !== "string") {
+		return false;
+	}
+	if (
+		record.followUpDispatchReceiptId !== undefined &&
+		(typeof record.followUpDispatchReceiptId !== "string" ||
+			record.followUpDispatchReceiptId.length === 0 ||
+			record.followUpDispatchReceiptId.length > MAX_GOAL_DISPATCH_RECEIPT_CHARS)
+	) {
+		return false;
+	}
+	if (
+		record.followUpDispatchPhase !== undefined &&
+		record.followUpDispatchPhase !== "receipt" &&
+		record.followUpDispatchPhase !== "provider_committed" &&
+		record.followUpDispatchPhase !== "failed"
+	) {
+		return false;
+	}
+	if (record.followUpDispatchPhase !== undefined && typeof record.followUpDispatchReceiptId !== "string") {
 		return false;
 	}
 	return (

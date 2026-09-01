@@ -72,8 +72,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 24 adds the capability-gated agent-roster subscription and push.
 // Revision 25 adds compare-and-cancel RLM child runs and delivery-time fenced cron prompts.
 // Revision 26 adds an exact-idle, session-only profile transition.
-export const DAEMON_SCHEMA_REVISION = 26;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-26-b768e5fc768a";
+// Revision 27 adds capability-gated, fenced follow-ups for unchanged active goals.
+export const DAEMON_SCHEMA_REVISION = 27;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-27-50c3f25e1d34";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -122,6 +123,7 @@ export type DaemonServerCapability =
 	| "owned_prompt_cancellation"
 	| "acp_mcp_servers"
 	| "conditional_cron_delivery"
+	| "conditional_cron_follow_up"
 	| "conditional_session_profile";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
@@ -169,6 +171,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"session_input_pause",
 	"acp_mcp_servers",
 	"conditional_cron_delivery",
+	"conditional_cron_follow_up",
 	"conditional_session_profile",
 ];
 
@@ -619,6 +622,7 @@ export type DaemonCommand =
 			schedule: string;
 			prompt: string;
 			deliveryFence?: AgentCronDeliveryFence;
+			deliveryMode?: "follow_up";
 			promoteOwnedSession?: boolean;
 	  }
 	| { id?: string; type: "cron_cancel"; activeSessionId?: string; jobId: string }
@@ -773,6 +777,11 @@ const CONDITIONAL_CRON_DELIVERY_COMMAND = {
 	minSchemaRevision: 25,
 	capability: "conditional_cron_delivery",
 } as const;
+const CONDITIONAL_CRON_FOLLOW_UP_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 27,
+	capability: "conditional_cron_follow_up",
+} as const;
 const CONDITIONAL_SESSION_PROFILE_COMMAND = {
 	minProtocol: 7,
 	minSchemaRevision: 26,
@@ -911,6 +920,9 @@ export function getDaemonCommandCompatibilities(command: DaemonCommand): readonl
 	}
 	if (command.type === "cron_add" && command.deliveryFence !== undefined) {
 		requirements.push(CONDITIONAL_CRON_DELIVERY_COMMAND);
+	}
+	if (command.type === "cron_add" && command.deliveryMode === "follow_up") {
+		requirements.push(CONDITIONAL_CRON_FOLLOW_UP_COMMAND);
 	}
 	return [...requirements, DAEMON_COMMAND_COMPATIBILITY[command.type]];
 }

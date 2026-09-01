@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { lockSync } from "proper-lockfile";
-import type { GoalState } from "./goals.js";
+import { type GoalState, MAX_GOAL_DISPATCH_RECEIPT_CHARS } from "./goals.js";
 import { getSessionArtifactPathForFile } from "./session-manager.js";
 
 export type AgentCronJobStatus = "active" | "paused" | "completed" | "cancelled";
@@ -35,7 +35,14 @@ export interface AgentCronSchedule {
 
 export type AgentCronGoalFence = Pick<
 	GoalState,
-	"active" | "status" | "goalId" | "updatedAt" | "dispatchReceiptId" | "dispatchPhase"
+	| "active"
+	| "status"
+	| "goalId"
+	| "updatedAt"
+	| "dispatchReceiptId"
+	| "dispatchPhase"
+	| "followUpDispatchReceiptId"
+	| "followUpDispatchPhase"
 >;
 
 export interface AgentCronModelFence {
@@ -61,7 +68,7 @@ export interface AgentCronJob {
 	status: AgentCronJobStatus;
 	source?: AgentCronJobSource;
 	runtimeKind?: AgentCronJobRuntimeKind;
-	/** Delivery mode for heartbeat/rlm_heartbeat jobs when the session is busy. Defaults to "steer". */
+	/** Heartbeat mode, or "follow_up" for a fenced continuation of an active goal. */
 	deliveryMode?: AgentHeartbeatDeliveryMode;
 	deliveryFence?: AgentCronDeliveryFence;
 	/** Durable bounded attempts to rebuild a pre-provider conditional goal turn. */
@@ -259,12 +266,28 @@ export class AgentCronJobStore {
 		}
 		const parsed = parseAgentCronSchedule(input.scheduleText, now);
 		const deliveryFence = normalizeAgentCronDeliveryFence(input.deliveryFence);
+		if (input.deliveryMode !== undefined && input.deliveryMode !== "follow_up") {
+			throw new Error('Conditional cron delivery mode must be "follow_up"');
+		}
+		if (input.deliveryMode !== undefined && !deliveryFence) {
+			throw new Error("Conditional cron follow-up requires a delivery fence");
+		}
+		if (deliveryFence) {
+			const activeGoal = isActiveAgentCronGoalFence(deliveryFence.goal);
+			if (input.deliveryMode === "follow_up" && !activeGoal) {
+				throw new Error("Conditional cron follow-up requires an active goal fence");
+			}
+			if (input.deliveryMode === undefined && activeGoal) {
+				throw new Error("Conditional cron goal start requires an inactive goal fence");
+			}
+		}
 		const nowIso = now.toISOString();
 		const job: AgentCronJob = {
 			id: randomUUID(),
 			status: "active",
 			source: deliveryFence ? "conditional_cron" : (input.source ?? "cron"),
 			runtimeKind: input.runtimeKind,
+			deliveryMode: deliveryFence ? input.deliveryMode : undefined,
 			activeSessionId: input.activeSessionId,
 			sessionId: input.sessionId,
 			sessionFile: input.sessionFile,
@@ -1820,17 +1843,44 @@ export function normalizeAgentCronDeliveryFence(value: unknown): AgentCronDelive
 		const goalKeys = Object.keys(candidate.goal).sort();
 		if (
 			goalKeys.some(
-				(key) => !["active", "dispatchPhase", "dispatchReceiptId", "goalId", "status", "updatedAt"].includes(key),
+				(key) =>
+					![
+						"active",
+						"dispatchPhase",
+						"dispatchReceiptId",
+						"followUpDispatchPhase",
+						"followUpDispatchReceiptId",
+						"goalId",
+						"status",
+						"updatedAt",
+					].includes(key),
 			) ||
-			candidate.goal.active !== false ||
-			(candidate.goal.status !== "complete" && candidate.goal.status !== "error") ||
+			!(
+				(candidate.goal.active === true && candidate.goal.status === "active") ||
+				(candidate.goal.active === false &&
+					(candidate.goal.status === "complete" || candidate.goal.status === "error"))
+			) ||
 			(candidate.goal.goalId !== undefined && typeof candidate.goal.goalId !== "string") ||
+			(candidate.goal.active === true &&
+				(typeof candidate.goal.goalId !== "string" || candidate.goal.goalId.length === 0)) ||
 			(candidate.goal.dispatchReceiptId !== undefined &&
-				(typeof candidate.goal.dispatchReceiptId !== "string" || candidate.goal.dispatchReceiptId.length === 0)) ||
+				(typeof candidate.goal.dispatchReceiptId !== "string" ||
+					candidate.goal.dispatchReceiptId.length === 0 ||
+					candidate.goal.dispatchReceiptId.length > MAX_GOAL_DISPATCH_RECEIPT_CHARS)) ||
 			(candidate.goal.dispatchPhase !== undefined &&
 				candidate.goal.dispatchPhase !== "receipt" &&
 				candidate.goal.dispatchPhase !== "provider_committed") ||
 			(candidate.goal.dispatchPhase !== undefined && candidate.goal.dispatchReceiptId === undefined) ||
+			(candidate.goal.followUpDispatchReceiptId !== undefined &&
+				(typeof candidate.goal.followUpDispatchReceiptId !== "string" ||
+					candidate.goal.followUpDispatchReceiptId.length === 0 ||
+					candidate.goal.followUpDispatchReceiptId.length > MAX_GOAL_DISPATCH_RECEIPT_CHARS)) ||
+			(candidate.goal.followUpDispatchPhase !== undefined &&
+				candidate.goal.followUpDispatchPhase !== "receipt" &&
+				candidate.goal.followUpDispatchPhase !== "provider_committed" &&
+				candidate.goal.followUpDispatchPhase !== "failed") ||
+			(candidate.goal.followUpDispatchPhase !== undefined &&
+				candidate.goal.followUpDispatchReceiptId === undefined) ||
 			(candidate.goal.updatedAt !== undefined &&
 				(typeof candidate.goal.updatedAt !== "number" || !Number.isFinite(candidate.goal.updatedAt)))
 		) {
@@ -1855,6 +1905,10 @@ export function normalizeAgentCronDeliveryFence(value: unknown): AgentCronDelive
 function withoutNextRunAt(job: AgentCronJob): AgentCronJob {
 	const { nextRunAt: _nextRunAt, ...rest } = job;
 	return rest;
+}
+
+function isActiveAgentCronGoalFence(goal: AgentCronGoalFence | null): boolean {
+	return goal?.active === true && goal.status === "active";
 }
 
 function isAgentCronJob(value: unknown): value is AgentCronJob {
@@ -1884,8 +1938,17 @@ function isAgentCronJob(value: unknown): value is AgentCronJob {
 		(candidate.deliveryRecoveryExhaustedAt === undefined ||
 			(typeof candidate.deliveryRecoveryExhaustedAt === "string" &&
 				Number.isFinite(new Date(candidate.deliveryRecoveryExhaustedAt).getTime()))) &&
-		((candidate.source === "conditional_cron" && isAgentCronDeliveryFence(candidate.deliveryFence)) ||
-			(candidate.source !== "conditional_cron" && candidate.deliveryFence === undefined)) &&
+		((candidate.source === "conditional_cron" &&
+			isAgentCronDeliveryFence(candidate.deliveryFence) &&
+			((candidate.deliveryMode === "follow_up" && isActiveAgentCronGoalFence(candidate.deliveryFence.goal)) ||
+				(candidate.deliveryMode === undefined && !isActiveAgentCronGoalFence(candidate.deliveryFence.goal)))) ||
+			((candidate.source === "heartbeat" || candidate.source === "rlm_heartbeat") &&
+				candidate.deliveryFence === undefined) ||
+			(candidate.source !== "conditional_cron" &&
+				candidate.source !== "heartbeat" &&
+				candidate.source !== "rlm_heartbeat" &&
+				candidate.deliveryMode === undefined &&
+				candidate.deliveryFence === undefined)) &&
 		typeof candidate.activeSessionId === "string" &&
 		typeof candidate.sessionId === "string" &&
 		typeof candidate.sessionFile === "string" &&
