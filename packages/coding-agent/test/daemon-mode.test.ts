@@ -53,7 +53,7 @@ import {
 	type DaemonOutbound,
 	failure,
 } from "../src/modes/daemon/daemon-protocol.js";
-import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
+import { type SessionSummary, summaryForActiveSession } from "../src/modes/daemon/daemon-session-list.js";
 import { DAEMON_WORKER_SUPERVISOR_SOCKET_ENV } from "../src/modes/daemon/daemon-worker-protocol.js";
 import { RlmSpawnLedger } from "../src/modes/daemon/rlm-ledger.js";
 
@@ -1271,6 +1271,314 @@ describe("daemon mode helpers", () => {
 			expect(await internals.cronScheduler.runDue(new Date(Date.now() + 10 * 60 * 1000))).toBe(0);
 			expect(promptUntilAccepted).toHaveBeenCalledOnce();
 			expect(internals.cronStore.list().find((candidate) => candidate.id === job.id)?.status).toBe("cancelled");
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a guarded cron job when its session fence drifts during admission", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-guarded-cron-admission-"));
+		try {
+			const sessionDir = join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			manager.newSession();
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Missing session file");
+
+			const createRuntime = vi.fn(async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => {
+				const session = makeRuntimeSession(options.sessionManager);
+				options.sessionManager.appendSessionInfo("guarded-root");
+				const promptUntilAccepted = vi.fn(
+					async (_prompt: string, promptOptions?: { admissionCommitted?: () => void }) => {
+						Object.assign(session, { thinkingLevel: "high" });
+						promptOptions?.admissionCommitted?.();
+					},
+				);
+				Object.assign(session, {
+					model: { provider: "test", id: "planner" } as Model<Api>,
+					thinkingLevel: "xhigh",
+					isStreaming: false,
+					isCompacting: false,
+					isRetrying: false,
+					isBashRunning: false,
+					isSessionActive: false,
+					unfinishedActionCount: 0,
+					rlmDepth: 0,
+					goalState: { active: false, status: "idle", tokensUsed: 0, timeUsedSeconds: 0, continuationsUsed: 0 },
+					state: { pendingToolCalls: new Set(), streamingMessage: undefined },
+					hasRunningRlmChildren: () => false,
+					getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
+					promptUntilAccepted,
+					startGoalFromConditionalPrompt: promptUntilAccepted,
+				});
+				return {
+					session,
+					extensionsResult: { extensions: [], errors: [], runtime: {} } as unknown as Awaited<
+						ReturnType<CreateAgentSessionRuntimeFactory>
+					>["extensionsResult"],
+					services: { cwd: options.cwd, agentDir: options.agentDir } as Awaited<
+						ReturnType<CreateAgentSessionRuntimeFactory>
+					>["services"],
+					diagnostics: [],
+				};
+			});
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir },
+				createRuntime,
+			});
+			const internals = daemon as unknown as {
+				cronStore: AgentCronJobStore;
+				cronScheduler: { runDue(now: Date): Promise<number> };
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+			};
+			const state = await internals.createRuntime({ type: "create", sessionPath: sessionFile });
+			state.summaryState = { taskState: "needs_input", basedOnMessageCount: 0 } as never;
+			const baseline = summaryForActiveSession(state);
+			const job = internals.cronStore.create({
+				activeSessionId: state.activeSessionId,
+				sessionId: state.runtime.session.sessionId,
+				sessionFile,
+				cwd: tempDir,
+				scheduleText: "in 1m",
+				prompt: "/goal guarded objective",
+				deliveryFence: {
+					version: 1,
+					activeSessionId: state.activeSessionId,
+					sessionName: baseline.sessionName!,
+					cwd: baseline.cwd,
+					model: { provider: baseline.model!.provider, id: baseline.model!.id },
+					thinkingLevel: baseline.thinkingLevel!,
+					messageCount: baseline.messageCount,
+					lastActivityAt: baseline.lastActivityAt!,
+					taskState: "needs_input",
+					goal: null,
+				},
+			});
+
+			expect(await internals.cronScheduler.runDue(new Date(Date.now() + 2 * 60 * 1000))).toBe(0);
+			expect(internals.cronStore.list().find((candidate) => candidate.id === job.id)).toMatchObject({
+				status: "cancelled",
+				lastError: "Delivery fence changed before prompt admission",
+				runCount: 0,
+			});
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a guarded cron job before the busy queue path when its idle profile drifts", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-guarded-cron-busy-"));
+		try {
+			const sessionDir = join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			manager.newSession();
+			manager.appendSessionInfo("guarded-root");
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Missing session file");
+
+			const followUp = vi.fn(async () => {});
+			const promptUntilAccepted = vi.fn(async () => {});
+			const createRuntime = vi.fn(async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => {
+				const session = makeRuntimeSession(options.sessionManager);
+				Object.assign(session, {
+					model: { provider: "test", id: "planner" } as Model<Api>,
+					thinkingLevel: "xhigh",
+					isStreaming: false,
+					isCompacting: false,
+					isRetrying: false,
+					isBashRunning: false,
+					isSessionActive: false,
+					unfinishedActionCount: 0,
+					rlmDepth: 0,
+					goalState: { active: false, status: "idle", tokensUsed: 0, timeUsedSeconds: 0, continuationsUsed: 0 },
+					state: { pendingToolCalls: new Set(), streamingMessage: undefined },
+					hasRunningRlmChildren: () => false,
+					getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
+					followUp,
+					promptUntilAccepted,
+					startGoalFromConditionalPrompt: promptUntilAccepted,
+				});
+				return {
+					session,
+					extensionsResult: { extensions: [], errors: [], runtime: {} } as unknown as Awaited<
+						ReturnType<CreateAgentSessionRuntimeFactory>
+					>["extensionsResult"],
+					services: { cwd: options.cwd, agentDir: options.agentDir } as Awaited<
+						ReturnType<CreateAgentSessionRuntimeFactory>
+					>["services"],
+					diagnostics: [],
+				};
+			});
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir },
+				createRuntime,
+			});
+			const internals = daemon as unknown as {
+				cronStore: AgentCronJobStore;
+				cronScheduler: { runDue(now: Date): Promise<number> };
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+			};
+			const state = await internals.createRuntime({ type: "create", sessionPath: sessionFile });
+			state.summaryState = { taskState: "needs_input", basedOnMessageCount: 0 } as never;
+			const baseline = summaryForActiveSession(state);
+			const job = internals.cronStore.create({
+				activeSessionId: state.activeSessionId,
+				sessionId: state.runtime.session.sessionId,
+				sessionFile,
+				cwd: tempDir,
+				scheduleText: "in 1m",
+				prompt: "/goal guarded objective",
+				deliveryFence: {
+					version: 1,
+					activeSessionId: state.activeSessionId,
+					sessionName: baseline.sessionName!,
+					cwd: baseline.cwd,
+					model: { provider: baseline.model!.provider, id: baseline.model!.id },
+					thinkingLevel: baseline.thinkingLevel!,
+					messageCount: baseline.messageCount,
+					lastActivityAt: baseline.lastActivityAt!,
+					taskState: "needs_input",
+					goal: null,
+				},
+			});
+
+			Object.assign(state.runtime.session, {
+				isStreaming: true,
+				model: { provider: "test", id: "changed-model" } as Model<Api>,
+			});
+			expect(await internals.cronScheduler.runDue(new Date(Date.now() + 2 * 60 * 1000))).toBe(0);
+			expect(followUp).not.toHaveBeenCalled();
+			expect(promptUntilAccepted).not.toHaveBeenCalled();
+			expect(internals.cronStore.list().find((candidate) => candidate.id === job.id)).toMatchObject({
+				status: "cancelled",
+				lastError: "Delivery fence changed before prompt admission",
+				runCount: 0,
+			});
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("terminalizes a pre-provider goal receipt when conditional recovery is exhausted", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-guarded-cron-exhausted-"));
+		try {
+			const sessionDir = join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			manager.newSession();
+			manager.appendSessionInfo("guarded-root");
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Missing session file");
+			let expectedReceiptId = "pending";
+			const failConditionalGoalDelivery = vi.fn((receiptId: string) => {
+				if (receiptId !== expectedReceiptId) return false;
+				Object.assign(goalState, {
+					active: false,
+					status: "error",
+					lastError: "Conditional goal delivery recovery exhausted",
+				});
+				return true;
+			});
+			const goalState = {
+				active: true,
+				status: "active",
+				goalId: "guarded-goal",
+				dispatchReceiptId: expectedReceiptId,
+				dispatchPhase: "receipt",
+				objective: "guarded objective",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				continuationsUsed: 0,
+			};
+			let recoveryQueued = false;
+			const recoverConditionalGoalDelivery = vi.fn(
+				(_receiptId: string, options?: { recoveryCommitted?: () => void }) => {
+					options?.recoveryCommitted?.();
+					recoveryQueued = true;
+					return true;
+				},
+			);
+			const createRuntime = vi.fn(async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => {
+				const session = makeRuntimeSession(options.sessionManager);
+				Object.assign(session, {
+					model: { provider: "test", id: "planner" } as Model<Api>,
+					thinkingLevel: "xhigh",
+					goalState,
+					failConditionalGoalDelivery,
+					recoverConditionalGoalDelivery,
+				});
+				return {
+					session,
+					extensionsResult: { extensions: [], errors: [], runtime: {} } as unknown as Awaited<
+						ReturnType<CreateAgentSessionRuntimeFactory>
+					>["extensionsResult"],
+					services: { cwd: options.cwd, agentDir: options.agentDir } as Awaited<
+						ReturnType<CreateAgentSessionRuntimeFactory>
+					>["services"],
+					diagnostics: [],
+				};
+			});
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir },
+				createRuntime,
+			});
+			const internals = daemon as unknown as {
+				cronStore: AgentCronJobStore;
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				recoverConditionalCronDeliveryForState(state: ActiveSessionState): void;
+			};
+			const state = await internals.createRuntime({ type: "create", sessionPath: sessionFile });
+			const job = internals.cronStore.create({
+				activeSessionId: state.activeSessionId,
+				sessionId: state.runtime.session.sessionId,
+				sessionFile,
+				cwd: tempDir,
+				scheduleText: "in 1m",
+				prompt: "/goal guarded objective",
+				deliveryFence: {
+					version: 1,
+					activeSessionId: state.activeSessionId,
+					sessionName: "guarded-root",
+					cwd: tempDir,
+					model: { provider: "test", id: "planner" },
+					thinkingLevel: "xhigh",
+					messageCount: 0,
+					lastActivityAt: "2026-01-01T00:00:00.000Z",
+					taskState: "needs_input",
+					goal: null,
+				},
+			});
+			expectedReceiptId = job.id;
+			goalState.dispatchReceiptId = job.id;
+			internals.cronStore.rejectDelivery(
+				job.id,
+				"Conditional goal receipt persisted before delivery error: disk full",
+			);
+			const recoveryWrite = vi
+				.spyOn(internals.cronStore, "recordDeliveryRecoveryAttempt")
+				.mockImplementationOnce(() => {
+					throw new Error("recovery counter write failed");
+				});
+
+			internals.recoverConditionalCronDeliveryForState(state);
+
+			expect(recoveryQueued).toBe(false);
+			expect(internals.cronStore.list().find((candidate) => candidate.id === job.id)).not.toHaveProperty(
+				"deliveryRecoveryCount",
+			);
+			recoveryWrite.mockRestore();
+			for (let attempt = 0; attempt < 5; attempt += 1) {
+				internals.cronStore.recordDeliveryRecoveryAttempt(job.id);
+			}
+
+			internals.recoverConditionalCronDeliveryForState(state);
+
+			expect(failConditionalGoalDelivery).toHaveBeenCalledOnce();
+			expect(goalState).toMatchObject({ active: false, status: "error" });
+			expect(internals.cronStore.list().find((candidate) => candidate.id === job.id)).toMatchObject({
+				deliveryRecoveryCount: 5,
+				deliveryRecoveryExhaustedAt: expect.any(String),
+				lastError: "Conditional goal delivery recovery exhausted",
+			});
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -7566,6 +7874,40 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("blocks deleting a live session through a symlinked path", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-delete-symlink-"));
+		try {
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+			});
+			const internals = daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			const sessionFile = join(tempDir, "live-session.jsonl");
+			writeFileSync(sessionFile, "");
+			const linkPath = join(tempDir, "live-session-link.jsonl");
+			symlinkSync(sessionFile, linkPath);
+			const state = makeState("active-1");
+			(state.runtime as { session?: unknown }).session = { sessionFile };
+			internals.sessions.set(state.activeSessionId, state);
+
+			await expect(
+				internals.handleCommand(makeClient("client-1", "active-1"), {
+					id: "command-1",
+					type: "delete_saved_session",
+					sessionPath: linkPath,
+				}),
+			).rejects.toThrow("Cannot delete the currently active session");
+			expect(existsSync(sessionFile)).toBe(true);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("cancels scheduled jobs when a saved session is deleted", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-delete-cron-"));
 		try {
@@ -8739,6 +9081,293 @@ describe("daemon mode helpers", () => {
 		expect(setModel).toHaveBeenCalledWith(model, { waitForExtensions: false });
 	});
 
+	it("does not change a profile when provider work starts after the caller snapshot", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp/project" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const { state, session, targetModel } = makeConditionalProfileState("active-1");
+		session.waitForSessionInputCheckpoint.mockImplementation(async () => {
+			session.isStreaming = true;
+		});
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+
+		const response = await internals.handleCommand(
+			makeClient("client-1", state.activeSessionId),
+			conditionalProfileCommand(state.activeSessionId),
+		);
+
+		expect(response).toMatchObject({ success: true, data: { status: "precondition_changed" } });
+		expect(session.setModel).not.toHaveBeenCalled();
+		expect(session.model).not.toBe(targetModel);
+		expect(session.acquireSessionInputPause.mock.invocationCallOrder[0]).toBeLessThan(
+			session.waitForSessionInputCheckpoint.mock.invocationCallOrder[0],
+		);
+		expect(session.inputPauseRelease).toHaveBeenCalledOnce();
+		expect(session.pauseRelease).toHaveBeenCalledOnce();
+	});
+
+	it("changes an exact idle profile once with session-only persistence", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp/project" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const { state, session, targetModel } = makeConditionalProfileState("active-1");
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+
+		const response = await internals.handleCommand(
+			makeClient("client-1", state.activeSessionId),
+			conditionalProfileCommand(state.activeSessionId),
+		);
+
+		expect(response).toMatchObject({ success: true, data: { status: "applied" } });
+		expect(session.setModel).toHaveBeenCalledWith(targetModel, {
+			waitForExtensions: false,
+			persistDefaults: false,
+			persistProfileAtomically: true,
+			thinkingLevel: "xhigh",
+			requireExactThinkingLevel: true,
+		});
+		expect(session.pauseRelease).toHaveBeenCalledOnce();
+	});
+
+	it("acknowledges an exact target profile after a lost response without writing twice", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp/project" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const { state, session, targetModel } = makeConditionalProfileState("active-1");
+		session.model = targetModel;
+		session.thinkingLevel = "xhigh";
+		session.modelRegistry.refreshAvailableModels.mockRejectedValue(new Error("catalog unavailable"));
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+
+		const response = await internals.handleCommand(
+			makeClient("client-1", state.activeSessionId),
+			conditionalProfileCommand(state.activeSessionId),
+		);
+
+		expect(response).toMatchObject({ success: true, data: { status: "already_applied" } });
+		expect(session.setModel).not.toHaveBeenCalled();
+		expect(session.pauseRelease).toHaveBeenCalledOnce();
+	});
+
+	it("repairs the single legacy model-first intermediate profile", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp/project" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const { state, session, targetModel } = makeConditionalProfileState("active-1");
+		session.model = targetModel;
+		session.thinkingLevel = "max";
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+
+		const response = await internals.handleCommand(
+			makeClient("client-1", state.activeSessionId),
+			conditionalProfileCommand(state.activeSessionId),
+		);
+
+		expect(response).toMatchObject({ success: true, data: { status: "applied" } });
+		expect(session.setModel).toHaveBeenCalledOnce();
+		expect(session.pauseRelease).toHaveBeenCalledOnce();
+	});
+
+	it("serializes concurrent conditional profile changes for one session", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp/project" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const { state, session, targetModel } = makeConditionalProfileState("active-1");
+		let releaseCatalog!: (models: Model<Api>[]) => void;
+		const catalog = new Promise<Model<Api>[]>((resolve) => {
+			releaseCatalog = resolve;
+		});
+		session.modelRegistry.refreshAvailableModels.mockImplementationOnce(() => catalog);
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+		const firstCommand = conditionalProfileCommand(state.activeSessionId);
+		const secondCommand = {
+			...conditionalProfileCommand(state.activeSessionId),
+			id: "profile-transition-2",
+			transitionId: "transition-2",
+		};
+
+		const first = internals.handleCommand(makeClient("client-1", state.activeSessionId), firstCommand);
+		await vi.waitFor(() => expect(session.modelRegistry.refreshAvailableModels).toHaveBeenCalledOnce());
+		const second = internals.handleCommand(makeClient("client-2", state.activeSessionId), secondCommand);
+		await Promise.resolve();
+		expect(session.acquireSessionInputPause).toHaveBeenCalledOnce();
+
+		releaseCatalog([session.model, targetModel]);
+		await expect(first).resolves.toMatchObject({ success: true, data: { status: "applied" } });
+		await expect(second).resolves.toMatchObject({ success: true, data: { status: "already_applied" } });
+		expect(session.setModel).toHaveBeenCalledOnce();
+	});
+
+	it("rejects a conditional profile change after a concurrent kill wins the lifecycle fence", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp/project" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const { state, session } = makeConditionalProfileState("active-1");
+		let markCloseStarted!: () => void;
+		let releaseClose!: () => void;
+		const closeStarted = new Promise<void>((resolve) => {
+			markCloseStarted = resolve;
+		});
+		const closeBlocked = new Promise<void>((resolve) => {
+			releaseClose = resolve;
+		});
+		const closeSessionOnce = vi.fn(async () => {
+			markCloseStarted();
+			await closeBlocked;
+			internals.sessions.delete(state.activeSessionId);
+		});
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			closeSessionOnce: typeof closeSessionOnce;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+		internals.closeSessionOnce = closeSessionOnce;
+
+		const killing = internals.handleCommand(makeClient("killer", state.activeSessionId), {
+			id: "kill-1",
+			type: "kill",
+			activeSessionId: state.activeSessionId,
+		});
+		await closeStarted;
+		const transition = internals.handleCommand(
+			makeClient("profile-client", state.activeSessionId),
+			conditionalProfileCommand(state.activeSessionId),
+		);
+		releaseClose();
+
+		await expect(killing).resolves.toMatchObject({ success: true, command: "kill" });
+		await expect(transition).rejects.toThrow(/session.*(closing|initializing)/i);
+		expect(session.modelRegistry.refreshAvailableModels).not.toHaveBeenCalled();
+		expect(session.setModel).not.toHaveBeenCalled();
+	});
+
+	it("waits to close a session until its conditional profile transition commits", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp/project" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const { state, session, targetModel } = makeConditionalProfileState("active-1");
+		let releaseCatalog!: (models: Model<Api>[]) => void;
+		const catalog = new Promise<Model<Api>[]>((resolve) => {
+			releaseCatalog = resolve;
+		});
+		session.modelRegistry.refreshAvailableModels.mockImplementationOnce(() => catalog);
+		const closeSessionOnce = vi.fn(async () => {
+			internals.sessions.delete(state.activeSessionId);
+		});
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			closeSessionOnce: typeof closeSessionOnce;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+		internals.closeSessionOnce = closeSessionOnce;
+
+		const transition = internals.handleCommand(
+			makeClient("profile-client", state.activeSessionId),
+			conditionalProfileCommand(state.activeSessionId),
+		);
+		await vi.waitFor(() => expect(session.modelRegistry.refreshAvailableModels).toHaveBeenCalledOnce());
+		const killing = internals.handleCommand(makeClient("killer", state.activeSessionId), {
+			id: "kill-1",
+			type: "kill",
+			activeSessionId: state.activeSessionId,
+		});
+		await Promise.resolve();
+		expect(closeSessionOnce).not.toHaveBeenCalled();
+
+		releaseCatalog([session.model, targetModel]);
+		await expect(transition).resolves.toMatchObject({ success: true, data: { status: "applied" } });
+		await expect(killing).resolves.toMatchObject({ success: true, command: "kill" });
+		expect(session.setModel.mock.invocationCallOrder[0]).toBeLessThan(closeSessionOnce.mock.invocationCallOrder[0]);
+	});
+
+	it("serializes a legacy thinking mutation behind a conditional profile change", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp/project" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const { state, session, targetModel } = makeConditionalProfileState("active-1");
+		let releaseCatalog!: (models: Model<Api>[]) => void;
+		const catalog = new Promise<Model<Api>[]>((resolve) => {
+			releaseCatalog = resolve;
+		});
+		session.modelRegistry.refreshAvailableModels.mockImplementationOnce(() => catalog);
+		session.setThinkingLevel = vi.fn((level: string) => {
+			session.thinkingLevel = level;
+		});
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+
+		const conditional = internals.handleCommand(
+			makeClient("client-1", state.activeSessionId),
+			conditionalProfileCommand(state.activeSessionId),
+		);
+		await vi.waitFor(() => expect(session.modelRegistry.refreshAvailableModels).toHaveBeenCalledOnce());
+		const legacy = internals.handleCommand(makeClient("client-2", state.activeSessionId), {
+			id: "legacy-thinking-1",
+			type: "set_thinking_level",
+			activeSessionId: state.activeSessionId,
+			level: "low",
+		});
+		await Promise.resolve();
+		expect(session.setThinkingLevel).not.toHaveBeenCalled();
+
+		releaseCatalog([session.model, targetModel]);
+		await expect(conditional).resolves.toMatchObject({ success: true, data: { status: "applied" } });
+		await expect(legacy).resolves.toMatchObject({ success: true, command: "set_thinking_level" });
+		expect(session.setModel.mock.invocationCallOrder[0]).toBeLessThan(
+			session.setThinkingLevel.mock.invocationCallOrder[0],
+		);
+		expect(session.thinkingLevel).toBe("low");
+	});
+
 	it("waits for model_select extension handlers when setting models while idle", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
@@ -9296,6 +9925,91 @@ function makeState(activeSessionId: string, parentActiveSessionId?: string): Act
 			},
 		},
 	} as unknown as ActiveSessionState;
+}
+
+function conditionalProfileCommand(activeSessionId: string): DaemonCommand {
+	return {
+		id: "profile-transition-1",
+		type: "set_profile_if_idle",
+		activeSessionId,
+		transitionId: "transition-1",
+		precondition: {
+			sessionId: "session-1",
+			sessionFile: "/tmp/session-1.jsonl",
+			sessionName: "leblon",
+			cwd: "/tmp/project",
+			provider: "source",
+			modelId: "source-1",
+			thinkingLevel: "max",
+			messageCount: 1,
+			lastActivityAt: "1970-01-01T00:00:00.000Z",
+			taskState: "needs_input",
+			goal: null,
+		},
+		target: { provider: "target", modelId: "target-1", thinkingLevel: "xhigh" },
+	} as DaemonCommand;
+}
+
+function makeConditionalProfileState(activeSessionId: string): {
+	state: ActiveSessionState;
+	session: Record<string, any>;
+	targetModel: Model<Api>;
+} {
+	const sourceModel: Model<Api> = {
+		provider: "source",
+		id: "source-1",
+		name: "Source",
+		api: "openai-completions",
+		baseUrl: "https://example.com",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128000,
+		maxTokens: 4096,
+	};
+	const targetModel: Model<Api> = { ...sourceModel, provider: "target", id: "target-1", name: "Target" };
+	const pauseRelease = vi.fn();
+	const inputPauseRelease = vi.fn();
+	const session: Record<string, any> = {
+		sessionId: "session-1",
+		sessionFile: "/tmp/session-1.jsonl",
+		sessionName: "leblon",
+		rlmDepth: 0,
+		model: sourceModel,
+		thinkingLevel: "max",
+		isStreaming: false,
+		isCompacting: false,
+		isBashRunning: false,
+		isRetrying: false,
+		isSessionActive: false,
+		unfinishedActionCount: 0,
+		messages: [{ timestamp: 0 }],
+		state: { pendingToolCalls: new Set(), streamingMessage: undefined },
+		sessionManager: {
+			getCwd: () => "/tmp/project",
+			getHeader: () => ({ timestamp: "1970-01-01T00:00:00.000Z" }),
+		},
+		hasRunningRlmChildren: () => false,
+		getSessionActionSnapshot: () => ({ queuedCount: 0, steering: [], followUps: [] }),
+		acquireQueuedWorkPause: vi.fn(() => ({ release: pauseRelease })),
+		acquireSessionInputPause: vi.fn(() => ({ release: inputPauseRelease })),
+		waitForSessionInputCheckpoint: vi.fn(async () => {}),
+		modelRegistry: { refreshAvailableModels: vi.fn(async () => [sourceModel, targetModel]) },
+		setModel: vi.fn(async (model: Model<Api>) => {
+			session.model = model;
+			session.thinkingLevel = "xhigh";
+		}),
+		pauseRelease,
+		inputPauseRelease,
+	};
+	const state = makeState(activeSessionId);
+	state.runtime = {
+		metadata: { kind: "top-level" },
+		session,
+		diagnostics: [],
+	} as never;
+	state.summaryState = { basedOnMessageCount: 1, taskState: "needs_input", summary: "idle" } as never;
+	return { state, session, targetModel };
 }
 
 function makeClient(id: string, activeSessionId: string, supportsExtensionUi = false): DaemonSocketClient {

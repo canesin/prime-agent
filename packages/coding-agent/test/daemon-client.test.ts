@@ -250,6 +250,64 @@ describe("DaemonClient", () => {
 		client.close();
 	});
 
+	it("does not send a conditional profile switch to an older daemon", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, ["session_input_admission"], DAEMON_SCHEMA_REVISION - 1);
+
+		await expect(
+			client.request({
+				type: "set_profile_if_idle",
+				activeSessionId: "active-1",
+				transitionId: "transition-1",
+				precondition: {
+					sessionId: "session-1",
+					sessionFile: "/tmp/session-1.jsonl",
+					sessionName: "leblon",
+					cwd: "/tmp/project",
+					provider: "source",
+					modelId: "source-1",
+					thinkingLevel: "max",
+					messageCount: 1,
+					lastActivityAt: "1970-01-01T00:00:00.000Z",
+					taskState: "needs_input",
+					goal: null,
+				},
+				target: { provider: "target", modelId: "target-1", thinkingLevel: "xhigh" },
+			}),
+		).rejects.toThrow("does not support conditional_session_profile");
+		expect(socket.writes).toEqual([]);
+		client.close();
+	});
+
+	it("keeps legacy profile commands compatible with a conditional-profile daemon", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, ["conditional_session_profile"], DAEMON_SCHEMA_REVISION);
+
+		const response = client.request({
+			type: "set_model",
+			activeSessionId: "active-1",
+			provider: "legacy",
+			modelId: "legacy-1",
+		});
+		await vi.waitFor(() => expect(socket.writes).toHaveLength(1));
+		const envelope = JSON.parse(socket.writes[0]!.trim()) as { id: string; command: { type: string } };
+		expect(envelope.command.type).toBe("set_model");
+		socket.emit(
+			"data",
+			`${JSON.stringify({ id: envelope.id, type: "response", command: "set_model", success: true })}\n`,
+		);
+		await expect(response).resolves.toMatchObject({ success: true, command: "set_model" });
+		client.close();
+	});
+
 	it("sends subagent deletion to a capable daemon without requiring a schema bump", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 		const connect = client.connect();
@@ -262,6 +320,57 @@ describe("DaemonClient", () => {
 			type: "delete_rlm_subagent",
 			activeSessionId: "active-1",
 			childId: "child-1",
+		});
+		await vi.waitFor(() => expect(socket.writes).toHaveLength(1));
+		client.close();
+		await expect(request).rejects.toThrow("closed before the operation completed");
+	});
+
+	it("does not send a guarded cron job to a daemon without conditional delivery", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, [], DAEMON_SCHEMA_REVISION - 1);
+
+		await expect(
+			client.request({
+				type: "cron_add",
+				activeSessionId: "active-1",
+				schedule: "in 1m",
+				prompt: "/goal guarded work",
+				deliveryFence: {
+					version: 1,
+					activeSessionId: "active-1",
+					sessionName: "project-root",
+					cwd: "/tmp/project",
+					model: { provider: "test", id: "planner" },
+					thinkingLevel: "xhigh",
+					messageCount: 4,
+					lastActivityAt: "2026-08-31T12:00:00.000Z",
+					taskState: "needs_input",
+					goal: null,
+				},
+			}),
+		).rejects.toThrow("does not support conditional_cron_delivery");
+		expect(socket.writes).toEqual([]);
+		client.close();
+	});
+
+	it("keeps legacy cron requests compatible with a new daemon", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, ["conditional_cron_delivery"], DAEMON_SCHEMA_REVISION);
+
+		const request = client.request({
+			type: "cron_add",
+			activeSessionId: "active-1",
+			schedule: "in 1m",
+			prompt: "legacy work",
 		});
 		await vi.waitFor(() => expect(socket.writes).toHaveLength(1));
 		client.close();

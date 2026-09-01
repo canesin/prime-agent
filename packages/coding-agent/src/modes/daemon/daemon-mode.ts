@@ -11,7 +11,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { type Api, getLogger, type Model } from "@earendil-works/pi-ai";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import {
@@ -73,6 +73,7 @@ import {
 	createAgentSessionRuntime,
 } from "../../core/agent-session-runtime.js";
 import {
+	type AgentCronDeliveryFence,
 	type AgentCronJob,
 	AgentCronJobStore,
 	AgentCronScheduler,
@@ -124,6 +125,13 @@ import {
 	type DaemonSocketClient,
 	resolveActiveSessionState,
 } from "./active-session-state.js";
+import {
+	passivatedWorkerRosterEntry,
+	type RosterSessionSummary,
+	rosterAgentIdForSummary,
+	type WorkerRosterEntry,
+	workerRosterEntryFromSummary,
+} from "./agent-roster.js";
 import { createCompactAssistantDelta } from "./compact-session-stream.js";
 import { DaemonClient } from "./daemon-client.js";
 import { filterClientEnv, withClientEnv } from "./daemon-client-env.js";
@@ -146,6 +154,7 @@ import {
 	type DaemonOutbound,
 	type DaemonResponse,
 	type DaemonSessionClosedReason,
+	type DaemonSessionProfilePrecondition,
 	type DaemonSessionSnapshot,
 	type DaemonUpdateRestartManifest,
 	type DaemonUpdateRestartSession,
@@ -165,6 +174,7 @@ import {
 	inactiveLifecycleForSession,
 	isActiveSessionBusy,
 	type SessionSummary,
+	scheduledJobRegistrations,
 	summaryForActiveSession,
 } from "./daemon-session-list.js";
 import { DaemonSessionSummarizer } from "./daemon-session-summarizer.js";
@@ -182,11 +192,14 @@ import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
 	DAEMON_WORKER_ROLE_ENV,
+	DAEMON_WORKER_ROSTER_CAPABILITY,
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 	DAEMON_WORKER_TOKEN_ENV,
 	type DaemonWorkerCommand,
 	type DaemonWorkerFrameHeader,
+	type DaemonWorkerRosterOutbound,
 	isDaemonWorkerFrameHeader,
+	ROSTER_HEARTBEAT_INTERVAL_MS,
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 } from "./daemon-worker-protocol.js";
@@ -198,6 +211,7 @@ import {
 	type RlmLedgerEdge,
 	RlmSpawnLedger,
 	readLegacyRlmSubagentRegistry as readLegacyRlmSubagentRegistryFile,
+	tombstoneSavedSessionDelete,
 } from "./rlm-ledger.js";
 import {
 	readRlmSubagentDisplayEntry,
@@ -238,6 +252,98 @@ const structuredLog = getLogger("coding-agent.daemon");
 const WORKER_SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS = 1_000;
 const UPDATE_RESTART_PREPARE_TIMEOUT_MS = 90_000;
 const MAX_SESSION_SNAPSHOT_STABILIZATION_RETRIES = 3;
+const MAX_CONDITIONAL_GOAL_RECOVERY_ATTEMPTS = 5;
+
+function matchesGoalFence(expected: AgentCronDeliveryFence["goal"], actual: SessionSummary["goal"]): boolean {
+	const normalizedActual = actual ?? null;
+	return expected === null
+		? normalizedActual === null
+		: normalizedActual !== null &&
+				normalizedActual.active === expected.active &&
+				normalizedActual.status === expected.status &&
+				normalizedActual.goalId === expected.goalId &&
+				normalizedActual.dispatchReceiptId === expected.dispatchReceiptId &&
+				normalizedActual.dispatchPhase === expected.dispatchPhase &&
+				normalizedActual.updatedAt === expected.updatedAt;
+}
+
+function isExactIdleSessionSummary(summary: SessionSummary, state: ActiveSessionState): boolean {
+	return (
+		summary.runtimeKind === "top-level" &&
+		summary.rlmDepth === 0 &&
+		!isActiveSessionBusy(state) &&
+		!state.runtime.session.isRetrying &&
+		summary.isStreaming === false &&
+		summary.isCompacting === false &&
+		summary.isBashRunning === false &&
+		summary.hasRunningRlmChildren === false &&
+		summary.isRunningTools === false &&
+		summary.unfinishedActionCount === 0 &&
+		summary.sessionActions.queuedCount === 0
+	);
+}
+
+function matchesSessionProfile(
+	summary: SessionSummary,
+	profile: Pick<DaemonSessionProfilePrecondition, "provider" | "modelId" | "thinkingLevel">,
+): boolean {
+	return (
+		summary.model?.provider === profile.provider &&
+		summary.model.id === profile.modelId &&
+		summary.thinkingLevel === profile.thinkingLevel
+	);
+}
+
+function matchesSessionProfileSourceOrIntermediate(
+	summary: SessionSummary,
+	source: Pick<DaemonSessionProfilePrecondition, "provider" | "modelId" | "thinkingLevel">,
+	target: Pick<DaemonSessionProfilePrecondition, "provider" | "modelId" | "thinkingLevel">,
+): boolean {
+	return (
+		matchesSessionProfile(summary, source) ||
+		(summary.model?.provider === target.provider &&
+			summary.model.id === target.modelId &&
+			summary.thinkingLevel === source.thinkingLevel)
+	);
+}
+
+function matchesSessionProfileActivityPrecondition(
+	summary: SessionSummary,
+	state: ActiveSessionState,
+	precondition: DaemonSessionProfilePrecondition,
+): boolean {
+	return (
+		summary.activeSessionId === state.activeSessionId &&
+		summary.sessionId === precondition.sessionId &&
+		summary.sessionFile === precondition.sessionFile &&
+		summary.sessionName === precondition.sessionName &&
+		summary.cwd === precondition.cwd &&
+		summary.messageCount === precondition.messageCount &&
+		(summary.lastActivityAt ?? null) === precondition.lastActivityAt &&
+		(summary.taskState ?? null) === precondition.taskState &&
+		matchesGoalFence(precondition.goal, summary.goal) &&
+		isExactIdleSessionSummary(summary, state)
+	);
+}
+
+function matchesCronDeliveryFence(fence: AgentCronDeliveryFence, state: ActiveSessionState): boolean {
+	const summary = summaryForActiveSession(state);
+	return (
+		summary.activeSessionId === fence.activeSessionId &&
+		summary.runtimeKind === "top-level" &&
+		summary.rlmDepth === 0 &&
+		summary.sessionName === fence.sessionName &&
+		summary.cwd === fence.cwd &&
+		summary.model?.provider === fence.model.provider &&
+		summary.model.id === fence.model.id &&
+		summary.thinkingLevel === fence.thinkingLevel &&
+		summary.messageCount === fence.messageCount &&
+		summary.lastActivityAt === fence.lastActivityAt &&
+		summary.taskState === fence.taskState &&
+		matchesGoalFence(fence.goal, summary.goal) &&
+		isExactIdleSessionSummary(summary, state)
+	);
+}
 
 const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"ack_result",
@@ -299,6 +405,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"heartbeat_set",
 	"heartbeat_update",
 	"set_model",
+	"set_profile_if_idle",
 	"cycle_model",
 	"set_scoped_models",
 	"set_thinking_level",
@@ -446,6 +553,7 @@ export class AgentDaemon {
 	private server?: Server;
 	private shuttingDown = false;
 	private readonly updateRestartQueuePauses = new Map<string, { release(): void }>();
+	private readonly sessionProfileTransitions = new Map<string, Promise<void>>();
 	private readonly sessionInputPauses = new Map<
 		string,
 		{ activeSessionId: string; owner: DaemonSocketClient; leaseKey: string; pause: { release(): void } }
@@ -541,9 +649,19 @@ export class AgentDaemon {
 		},
 	);
 	private readonly recoveryJournal?: WorkerRecoveryJournal;
+	private readonly rosterReporter: WorkerRosterReporterState = {
+		lastComposed: new Map(),
+		lastComposedJson: new Map(),
+		queuedChildren: new Map(),
+		removedAgentIds: new Map(),
+		snapshotPending: false,
+	};
+	private rosterFlushScheduled = false;
+	private rosterHeartbeatTimer?: ReturnType<typeof setInterval>;
 	private rlmSpawnLedgerInstance?: RlmSpawnLedger;
 	/** In-flight admission spawn appends, awaited (and consumed) by createRlmSubagentRuntime. */
 	private readonly pendingRlmSpawnAppends = new Map<string, Promise<void>>();
+	private readonly recoveredConditionalCronJobs = new Map<string, AgentCronJob>();
 
 	constructor(
 		private readonly socketPath: string,
@@ -570,8 +688,12 @@ export class AgentDaemon {
 			onError: (job, error) => {
 				this.log(`Cron job ${job.id} failed: ${error instanceof Error ? error.message : String(error)}`);
 			},
+			onRecovered: (jobs) => this.rememberRecoveredConditionalCronJobs(jobs),
 		});
-		this.cronStore.onHeartbeatChange(() => this.broadcastGlobal({ type: "heartbeats_changed" }));
+		this.cronStore.onHeartbeatChange(() => {
+			this.broadcastGlobal({ type: "heartbeats_changed" });
+			this.scheduleRosterFlush();
+		});
 	}
 
 	// The daemon runs detached with no terminal, so route its diagnostics to its
@@ -645,6 +767,13 @@ export class AgentDaemon {
 		// No startup restore: on-disk sessions return only via --resume or the agents view.
 		if (!this.shuttingDown) {
 			this.cronScheduler.start();
+		}
+		if (this.options.worker) {
+			this.rosterHeartbeatTimer = setInterval(
+				() => this.broadcastRosterFrame({ type: "roster_heartbeat" }),
+				ROSTER_HEARTBEAT_INTERVAL_MS,
+			);
+			this.rosterHeartbeatTimer.unref();
 		}
 		this.startSupervisorMonitor();
 	}
@@ -998,7 +1127,8 @@ export class AgentDaemon {
 			// Mark handled so an early rejection cannot surface as an
 			// unhandled-rejection crash before the admission path awaits it.
 			spawnAppend.catch(() => undefined);
-			this.pendingRlmSpawnAppends.set(input.childId, spawnAppend);
+			// Child ids are only unique per parent; the parent scopes the pending-append key.
+			this.pendingRlmSpawnAppends.set(`${parentState.activeSessionId}#${input.childId}`, spawnAppend);
 		}
 		try {
 			writeRlmSubagentDisplayEntry({
@@ -1103,6 +1233,13 @@ export class AgentDaemon {
 		// dual-write era it has no other writer to fall back on, so a failed
 		// append is a failed deletion.
 		await this.rlmSpawnLedger().appendDelete({ childId, child: entry.sessionFile, reason });
+		if (this.options.worker) {
+			this.rosterReporter.removedAgentIds.set(
+				this.rosterAgentIdForRlmChild(childId, entry.parentSessionFile),
+				basename(entry.sessionFile, ".jsonl"),
+			);
+			this.scheduleRosterFlush();
+		}
 		// Deletion boundary: transcript + display tombstone are the durable
 		// record and stay; the nested artifact dir is a runtime cache and goes.
 		await this.deleteRlmSubagentArtifacts(childId, entry.sessionFile);
@@ -1410,6 +1547,7 @@ export class AgentDaemon {
 				}
 			}
 			onStateBound?.(state);
+			this.scheduleRosterFlush();
 		} catch (error) {
 			state.unsubscribe?.();
 			this.sessions.delete(state.activeSessionId);
@@ -1422,6 +1560,7 @@ export class AgentDaemon {
 		}
 		this.registerCronStoreForState(state);
 		this.rebindCronJobsToState(state);
+		this.recoverConditionalCronDeliveryForState(state);
 		if (runtime.metadata.kind !== "subagent") {
 			// Mark the session as daemon-resident so a restarted daemon can
 			// restore it. Closes for kill/completed/replaced flip this back to
@@ -1453,6 +1592,69 @@ export class AgentDaemon {
 		}
 		this.registerCronStoreForState(state);
 		this.rebindCronJobsToState(state);
+		this.recoverConditionalCronDeliveryForState(state);
+	}
+
+	private rememberRecoveredConditionalCronJobs(jobs: readonly AgentCronJob[]): void {
+		for (const job of jobs) {
+			if (
+				job.source === "conditional_cron" &&
+				job.status === "cancelled" &&
+				job.lastError === "Interrupted before scheduled operation completion"
+			) {
+				this.recoveredConditionalCronJobs.set(job.id, job);
+			}
+		}
+		for (const state of this.sessions.values()) this.recoverConditionalCronDeliveryForState(state);
+	}
+
+	private recoverConditionalCronDeliveryForState(state: ActiveSessionState): void {
+		const goalState = state.runtime.session.goalState;
+		const receiptId = goalState?.dispatchReceiptId;
+		if (!receiptId) return;
+		const job =
+			this.recoveredConditionalCronJobs.get(receiptId) ??
+			this.cronStore
+				.list()
+				.find(
+					(candidate) =>
+						candidate.id === receiptId &&
+						candidate.source === "conditional_cron" &&
+						candidate.status === "cancelled" &&
+						candidate.lastError !== "Delivery fence changed before prompt admission",
+				);
+		if (!job || job.sessionId !== state.runtime.session.sessionId) return;
+		if (goalState.dispatchPhase !== "receipt") {
+			this.recoveredConditionalCronJobs.delete(receiptId);
+			return;
+		}
+		if ((job.deliveryRecoveryCount ?? 0) >= MAX_CONDITIONAL_GOAL_RECOVERY_ATTEMPTS) {
+			const alreadyFailed =
+				goalState.status === "error" && goalState.lastError === "Conditional goal delivery recovery exhausted";
+			try {
+				if (alreadyFailed || state.runtime.session.failConditionalGoalDelivery(receiptId)) {
+					this.cronStore.recordDeliveryRecoveryExhausted(receiptId);
+					this.recoveredConditionalCronJobs.delete(receiptId);
+				}
+			} catch (error) {
+				this.log(`Conditional cron recovery exhaustion ${receiptId} failed: ${String(error)}`);
+			}
+			return;
+		}
+		const recover = state.runtime.session.recoverConditionalGoalDelivery;
+		if (typeof recover !== "function") return;
+		try {
+			recover.call(state.runtime.session, receiptId, {
+				recoveryCommitted: () => {
+					if (!this.cronStore.recordDeliveryRecoveryAttempt(receiptId)) {
+						throw new Error(`Conditional cron recovery receipt ${receiptId} disappeared`);
+					}
+				},
+			});
+			this.recoveredConditionalCronJobs.delete(receiptId);
+		} catch (error) {
+			this.log(`Conditional cron recovery ${receiptId} failed: ${String(error)}`);
+		}
 	}
 
 	private registerCronStoreForState(state: ActiveSessionState): void {
@@ -1465,7 +1667,7 @@ export class AgentDaemon {
 			return;
 		}
 		if (this.cronStore.registerSessionArtifact(session.sessionId, artifactDir)) {
-			this.cronStore.recoverSessionArtifact(session.sessionId);
+			this.rememberRecoveredConditionalCronJobs(this.cronStore.recoverSessionArtifact(session.sessionId));
 			this.cronScheduler.wake();
 		}
 	}
@@ -1732,6 +1934,10 @@ export class AgentDaemon {
 		if (!state || !runnableJob || !this.isCronJobRunnableForState(runnableJob, state, requirePersistedJob)) {
 			return "skipped";
 		}
+		if (runnableJob.deliveryFence && !matchesCronDeliveryFence(runnableJob.deliveryFence, state)) {
+			this.cronStore.rejectDelivery(runnableJob.id, "Delivery fence changed before prompt admission");
+			return "skipped";
+		}
 		const session = state.runtime.session;
 		if (shouldDeferHeartbeatCronJob(runnableJob, session)) {
 			return "skipped";
@@ -1742,6 +1948,10 @@ export class AgentDaemon {
 			session.isRetrying ||
 			session.isBashRunning ||
 			session.unfinishedActionCount > 0;
+		if (runnableJob.deliveryFence && shouldQueueCronPrompt) {
+			this.cronStore.rejectDelivery(runnableJob.id, "Delivery fence changed before prompt admission");
+			return "skipped";
+		}
 		if (!isHeartbeatCronJob(runnableJob) && shouldQueueCronPrompt) {
 			if (!this.isCronJobRunnableForState(runnableJob, state, requirePersistedJob)) {
 				return "skipped";
@@ -1761,10 +1971,15 @@ export class AgentDaemon {
 		}
 		// Re-check after the session admission fence wait: the job may have been cancelled, completed, or updated meanwhile.
 		const unrunnableAtAdmission = new Error("Cron job became unrunnable before admission");
+		const deliveryFenceChangedAtAdmission = new Error("Cron delivery fence changed before admission");
 		const admissionCommitted = () => {
 			const refreshed = getRunnableJob();
 			if (!refreshed || refreshed.prompt !== current.prompt || refreshed.deliveryMode !== current.deliveryMode) {
 				throw unrunnableAtAdmission;
+			}
+			if (refreshed.deliveryFence && !matchesCronDeliveryFence(refreshed.deliveryFence, state)) {
+				this.cronStore.rejectDelivery(refreshed.id, "Delivery fence changed before prompt admission");
+				throw deliveryFenceChangedAtAdmission;
 			}
 		};
 		try {
@@ -1777,6 +1992,13 @@ export class AgentDaemon {
 				});
 				return;
 			}
+			if (current.deliveryFence) {
+				await session.startGoalFromConditionalPrompt(current.prompt, {
+					admissionCommitted,
+					receiptId: current.id,
+				});
+				return;
+			}
 			await session.promptUntilAccepted(current.prompt, {
 				streamingBehavior: "followUp",
 				source: "rpc",
@@ -1784,6 +2006,26 @@ export class AgentDaemon {
 			});
 		} catch (error) {
 			if (error === unrunnableAtAdmission) {
+				if (current.deliveryFence) {
+					this.cronStore.rejectDelivery(current.id, "Conditional goal admission invalidated");
+				}
+				return "skipped";
+			}
+			if (error === deliveryFenceChangedAtAdmission) {
+				return "skipped";
+			}
+			if (current.deliveryFence) {
+				const reason = error instanceof Error ? error.message : String(error);
+				const receiptPersisted = session.goalState.dispatchReceiptId === current.id;
+				this.cronStore.rejectDelivery(
+					current.id,
+					`${
+						receiptPersisted
+							? "Conditional goal receipt persisted before delivery error"
+							: "Conditional goal delivery retryable"
+					}: ${reason.slice(0, 500)}`,
+				);
+				if (receiptPersisted) this.recoverConditionalCronDeliveryForState(state);
 				return "skipped";
 			}
 			throw error;
@@ -1794,7 +2036,12 @@ export class AgentDaemon {
 		return this.cronStore.getClaimedJob(jobId) ?? this.cronStore.getDueJob(jobId);
 	}
 
-	private createCronJobForState(state: ActiveSessionState, schedule: string, prompt: string): AgentCronJob {
+	private createCronJobForState(
+		state: ActiveSessionState,
+		schedule: string,
+		prompt: string,
+		deliveryFence?: AgentCronDeliveryFence,
+	): AgentCronJob {
 		const session = state.runtime.session;
 		const sessionFile = session.sessionFile;
 		if (!sessionFile) {
@@ -1808,6 +2055,7 @@ export class AgentDaemon {
 			runtimeKind: state.runtime.metadata.kind,
 			scheduleText: schedule,
 			prompt,
+			deliveryFence,
 		});
 		this.cronScheduler.wake();
 		return job;
@@ -2518,7 +2766,7 @@ export class AgentDaemon {
 				},
 			);
 		} catch (error) {
-			this.pendingRlmSpawnAppends.delete(options.id);
+			this.pendingRlmSpawnAppends.delete(`${parentState.activeSessionId}#${options.id}`);
 			throw error;
 		}
 		// Admission is complete only once the spawn record is durably in the
@@ -2527,8 +2775,8 @@ export class AgentDaemon {
 		// failed append therefore FAILS admission — the just-added child is
 		// closed like any other admission failure rather than admitted as a
 		// ghost the ledger-driven listing and hydration could never find.
-		const spawnAppend = this.pendingRlmSpawnAppends.get(options.id);
-		this.pendingRlmSpawnAppends.delete(options.id);
+		const spawnAppend = this.pendingRlmSpawnAppends.get(`${parentState.activeSessionId}#${options.id}`);
+		this.pendingRlmSpawnAppends.delete(`${parentState.activeSessionId}#${options.id}`);
 		try {
 			await spawnAppend;
 		} catch (error) {
@@ -3327,7 +3575,10 @@ export class AgentDaemon {
 					type: "response",
 					command: "worker_auth",
 					success: true,
+					data: { capabilities: [DAEMON_WORKER_ROSTER_CAPABILITY] },
 				});
+				this.rosterReporter.snapshotPending = true;
+				this.scheduleRosterFlush();
 				return;
 			}
 			if (this.options.worker) {
@@ -3565,6 +3816,35 @@ export class AgentDaemon {
 			}
 		} catch (error) {
 			this.write(client, failure(command.id, command.type, error, serializeDaemonError(error)));
+		}
+	}
+
+	private async withSessionProfileTransition<T>(
+		state: ActiveSessionState,
+		action: () => Promise<T>,
+		allowClosing = false,
+	): Promise<T> {
+		const { activeSessionId } = state;
+		const previousTransition = this.sessionProfileTransitions.get(activeSessionId) ?? Promise.resolve();
+		let releaseTransition!: () => void;
+		const transition = new Promise<void>((resolve) => {
+			releaseTransition = resolve;
+		});
+		this.sessionProfileTransitions.set(activeSessionId, transition);
+		await previousTransition;
+		try {
+			if (
+				!allowClosing &&
+				(this.sessions.get(activeSessionId) !== state || this.closingSessions.has(activeSessionId))
+			) {
+				throw new BoundSessionUnavailableError(`Active session ${activeSessionId} is closing`);
+			}
+			return await action();
+		} finally {
+			releaseTransition();
+			if (this.sessionProfileTransitions.get(activeSessionId) === transition) {
+				this.sessionProfileTransitions.delete(activeSessionId);
+			}
 		}
 	}
 
@@ -3875,11 +4155,29 @@ export class AgentDaemon {
 				if (this.findActiveSessionByFile(command.sessionPath)) {
 					throw new Error("Cannot delete the currently active session");
 				}
+				const composedEntry = this.rosterEntryForSessionPath(canonicalSessionPath(command.sessionPath));
+				const { deletedInfo, ledgerEdge } = await tombstoneSavedSessionDelete(
+					this.rlmSpawnLedger(),
+					command.sessionPath,
+					composedEntry?.summary,
+				);
 				const result = await this.deleteSavedSessionFile(command.sessionPath, {
 					afterFileRemoved: () => {
 						this.cancelScheduledJobsForSessionFile(command.sessionPath);
 					},
 				});
+				if (result.ok && this.options.worker) {
+					const removedAgentId =
+						composedEntry?.agentId ??
+						(ledgerEdge ? this.rosterAgentIdForRlmChild(ledgerEdge.childId, ledgerEdge.parent) : deletedInfo?.id);
+					if (removedAgentId) {
+						this.rosterReporter.removedAgentIds.set(
+							removedAgentId,
+							composedEntry?.summary.sessionId ?? deletedInfo?.id,
+						);
+						this.scheduleRosterFlush();
+					}
+				}
 				return success(command.id, "delete_saved_session", result);
 			}
 
@@ -4197,7 +4495,11 @@ export class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				const bash = state.runtime.session.executeBash(command.command);
 				state.inFlightBash = Promise.allSettled([state.inFlightBash, bash]).then(() => undefined);
-				return success(command.id, "execute_bash_and_wait", await bash);
+				try {
+					return success(command.id, "execute_bash_and_wait", await bash);
+				} finally {
+					this.scheduleRosterFlush();
+				}
 			}
 
 			case "abort_bash": {
@@ -4478,6 +4780,10 @@ export class AgentDaemon {
 			}
 
 			case "cron_list": {
+				if (command.activeSessionId) {
+					const state = this.sessions.get(command.activeSessionId);
+					if (state) this.recoverConditionalCronDeliveryForState(state);
+				}
 				const jobs = this.cronStore.list().filter((job) => {
 					if (!command.includeInactive && job.status !== "active" && job.status !== "paused") {
 						return false;
@@ -4505,7 +4811,8 @@ export class AgentDaemon {
 
 			case "cron_add": {
 				const state = this.getSessionState(command.activeSessionId);
-				const job = this.createCronJobForState(state, command.schedule, command.prompt);
+				const job = this.createCronJobForState(state, command.schedule, command.prompt, command.deliveryFence);
+				this.scheduleRosterFlush();
 				return success(command.id, "cron_add", { job });
 			}
 
@@ -4519,6 +4826,7 @@ export class AgentDaemon {
 					this.removeQueuedHeartbeatFollowUp(state, job);
 				}
 				this.cronScheduler.wake();
+				this.scheduleRosterFlush();
 				return success(command.id, "cron_cancel", { job });
 			}
 
@@ -4547,51 +4855,137 @@ export class AgentDaemon {
 
 			case "set_model": {
 				const state = this.getSessionState(command.activeSessionId);
+				return this.withSessionProfileTransition(state, async () => {
+					const session = state.runtime.session;
+					const availableModels = await session.modelRegistry.refreshAvailableModels();
+					const model = availableModels.find((candidate) => {
+						return candidate.provider === command.provider && candidate.id === command.modelId;
+					});
+					if (!model) {
+						throw new Error(`Model not found: ${command.provider}/${command.modelId}`);
+					}
+					await session.setModel(model, {
+						waitForExtensions: !(session.isStreaming || session.isCompacting),
+					});
+					this.scheduleRosterFlush();
+					return success(command.id, "set_model", model);
+				});
+			}
+
+			case "set_profile_if_idle": {
+				const state = this.getSessionState(command.activeSessionId);
 				const session = state.runtime.session;
-				const availableModels = await session.modelRegistry.refreshAvailableModels();
-				const model = availableModels.find((candidate) => {
-					return candidate.provider === command.provider && candidate.id === command.modelId;
+				return this.withSessionProfileTransition(state, async () => {
+					const sessionInputPause = session.acquireSessionInputPause();
+					const queuedWorkPause = session.acquireQueuedWorkPause();
+					try {
+						await session.waitForSessionInputCheckpoint();
+						let summary = summaryForActiveSession(state);
+						if (!matchesSessionProfileActivityPrecondition(summary, state, command.precondition)) {
+							return success(command.id, "set_profile_if_idle", {
+								status: "precondition_changed",
+								transitionId: command.transitionId,
+							});
+						}
+						if (matchesSessionProfile(summary, command.target)) {
+							return success(command.id, "set_profile_if_idle", {
+								status: "already_applied",
+								transitionId: command.transitionId,
+							});
+						}
+						if (!matchesSessionProfileSourceOrIntermediate(summary, command.precondition, command.target)) {
+							return success(command.id, "set_profile_if_idle", {
+								status: "precondition_changed",
+								transitionId: command.transitionId,
+							});
+						}
+
+						const availableModels = await session.modelRegistry.refreshAvailableModels();
+						const targetModel = availableModels.find(
+							(candidate) =>
+								candidate.provider === command.target.provider && candidate.id === command.target.modelId,
+						);
+						if (!targetModel) {
+							throw new Error(`Model not found: ${command.target.provider}/${command.target.modelId}`);
+						}
+						summary = summaryForActiveSession(state);
+						if (matchesSessionProfile(summary, command.target)) {
+							return success(command.id, "set_profile_if_idle", {
+								status: "already_applied",
+								transitionId: command.transitionId,
+							});
+						}
+						if (
+							!matchesSessionProfileActivityPrecondition(summary, state, command.precondition) ||
+							!matchesSessionProfileSourceOrIntermediate(summary, command.precondition, command.target)
+						) {
+							return success(command.id, "set_profile_if_idle", {
+								status: "precondition_changed",
+								transitionId: command.transitionId,
+							});
+						}
+
+						await session.setModel(targetModel, {
+							waitForExtensions: false,
+							persistDefaults: false,
+							persistProfileAtomically: true,
+							thinkingLevel: command.target.thinkingLevel,
+							requireExactThinkingLevel: true,
+						});
+						this.scheduleRosterFlush();
+						return success(command.id, "set_profile_if_idle", {
+							status: "applied",
+							transitionId: command.transitionId,
+						});
+					} finally {
+						queuedWorkPause.release();
+						sessionInputPause.release();
+					}
 				});
-				if (!model) {
-					throw new Error(`Model not found: ${command.provider}/${command.modelId}`);
-				}
-				await session.setModel(model, {
-					waitForExtensions: !(session.isStreaming || session.isCompacting),
-				});
-				return success(command.id, "set_model", model);
 			}
 
 			case "cycle_model": {
 				const state = this.getSessionState(command.activeSessionId);
-				const session = state.runtime.session;
-				const result = await session.cycleModel(command.direction, {
-					waitForExtensions: !(session.isStreaming || session.isCompacting),
+				return this.withSessionProfileTransition(state, async () => {
+					const session = state.runtime.session;
+					const result = await session.cycleModel(command.direction, {
+						waitForExtensions: !(session.isStreaming || session.isCompacting),
+					});
+					this.scheduleRosterFlush();
+					return success(command.id, "cycle_model", result ?? null);
 				});
-				return success(command.id, "cycle_model", result ?? null);
 			}
 
 			case "set_scoped_models": {
 				const state = this.getSessionState(command.activeSessionId);
-				state.runtime.session.setScopedModels(command.scopedModels);
-				return success(command.id, "set_scoped_models");
+				return this.withSessionProfileTransition(state, async () => {
+					state.runtime.session.setScopedModels(command.scopedModels);
+					return success(command.id, "set_scoped_models");
+				});
 			}
 
 			case "set_thinking_level": {
 				const state = this.getSessionState(command.activeSessionId);
-				state.runtime.session.setThinkingLevel(command.level);
-				return success(command.id, "set_thinking_level");
+				return this.withSessionProfileTransition(state, async () => {
+					state.runtime.session.setThinkingLevel(command.level);
+					return success(command.id, "set_thinking_level");
+				});
 			}
 
 			case "set_service_tier": {
 				const state = this.getSessionState(command.activeSessionId);
-				state.runtime.session.setServiceTier(command.serviceTier);
-				return success(command.id, "set_service_tier");
+				return this.withSessionProfileTransition(state, async () => {
+					state.runtime.session.setServiceTier(command.serviceTier);
+					return success(command.id, "set_service_tier");
+				});
 			}
 
 			case "cycle_thinking_level": {
 				const state = this.getSessionState(command.activeSessionId);
-				const level = state.runtime.session.cycleThinkingLevel();
-				return success(command.id, "cycle_thinking_level", level ? { level } : null);
+				return this.withSessionProfileTransition(state, async () => {
+					const level = state.runtime.session.cycleThinkingLevel();
+					return success(command.id, "cycle_thinking_level", level ? { level } : null);
+				});
 			}
 
 			case "set_transport": {
@@ -6117,10 +6511,10 @@ export class AgentDaemon {
 	}
 
 	private findActiveSessionByFile(sessionPath: string): ActiveSessionState | undefined {
-		const resolvedSessionPath = resolve(sessionPath);
+		const canonicalPath = canonicalSessionPath(sessionPath);
 		for (const state of this.sessions.values()) {
 			const sessionFile = state.runtime.session.sessionFile;
-			if (sessionFile && resolve(sessionFile) === resolvedSessionPath) {
+			if (sessionFile && canonicalSessionPath(sessionFile) === canonicalPath) {
 				return state;
 			}
 		}
@@ -6179,8 +6573,10 @@ export class AgentDaemon {
 			return;
 		}
 		const descendants = new Set<ActiveSessionState>();
-		const closePromise = Promise.resolve().then(() =>
-			this.closeSessionOnce(state, reason, waitForAbort, cascadeChildren, descendants),
+		const closePromise = this.withSessionProfileTransition(
+			state,
+			() => this.closeSessionOnce(state, reason, waitForAbort, cascadeChildren, descendants),
+			true,
 		);
 		const close = { promise: closePromise, reason, descendants };
 		this.closingSessions.set(state.activeSessionId, close);
@@ -6316,6 +6712,11 @@ export class AgentDaemon {
 		state.clients.clear();
 		this.acpMcpOwners.delete(state.activeSessionId);
 		this.sessions.delete(state.activeSessionId);
+		// Archived top-level sessions leave the worker's list; subagent rows mirror the registry and stay.
+		if (!keepsResumeEntry && state.runtime.metadata.kind !== "subagent" && this.options.worker) {
+			this.rosterReporter.removedAgentIds.set(this.rosterAgentIdForState(state), state.runtime.session.sessionId);
+		}
+		this.scheduleRosterFlush();
 		if (isEmptyDraftSession) {
 			const sessionFile = state.runtime.session.sessionFile;
 			if (sessionFile) {
@@ -6375,6 +6776,7 @@ export class AgentDaemon {
 			}
 		}
 		this.stampRlmChildActiveSessionId(message);
+		this.observeRosterEvent(state, message);
 		const sequencedMessage = this.addSessionEventMeta(state, message);
 		let serialized: string | undefined;
 		for (const client of state.clients) {
@@ -6523,6 +6925,237 @@ export class AgentDaemon {
 		for (const client of this.clients) {
 			this.write(client, message);
 		}
+	}
+
+	private rosterEntryForSessionPath(canonicalPath: string): WorkerRosterEntry | undefined {
+		for (const entry of this.rosterReporter.lastComposed.values()) {
+			if (entry.summary.sessionFile && canonicalSessionPath(entry.summary.sessionFile) === canonicalPath) {
+				return entry;
+			}
+		}
+		return undefined;
+	}
+
+	private rosterAgentIdForState(state: ActiveSessionState): string {
+		const session = state.runtime.session;
+		const metadata = state.runtime.metadata;
+		if (metadata.kind === "subagent" && metadata.rlmChildId) {
+			return rosterAgentIdForSummary({
+				runtimeKind: "subagent",
+				rlmChildId: metadata.rlmChildId,
+				sessionId: metadata.rlmChildId,
+				parentSessionPath: metadata.parentSessionFile,
+				parentActiveSessionId: metadata.parentActiveSessionId,
+			});
+		}
+		return session.sessionId;
+	}
+
+	private rosterAgentIdForRlmChild(childId: string, parentSessionPath: string | undefined): string {
+		return rosterAgentIdForSummary({
+			runtimeKind: "subagent",
+			rlmChildId: childId,
+			sessionId: childId,
+			parentSessionPath,
+		});
+	}
+
+	private observeRosterEvent(state: ActiveSessionState, message: DaemonOutbound): void {
+		if (!this.options.worker) return;
+		if (message.type === "session_event") {
+			if (message.event.type === "rlm_child_update") {
+				this.observeRosterChildUpdate(state, message.event.child);
+				return;
+			}
+			if (!ROSTER_SESSION_EVENT_TRIGGERS.has(message.event.type)) return;
+		} else if (
+			message.type !== "session_status" &&
+			message.type !== "session_closed" &&
+			message.type !== "session_replaced"
+		) {
+			return;
+		}
+		this.scheduleRosterFlush();
+	}
+
+	private observeRosterChildUpdate(state: ActiveSessionState, child: AgentConnectionRlmChildAgentSnapshot): void {
+		const bound = child.activeSessionId !== undefined || this.hasSessionForRlmChild(state, child.id);
+		const entry = this.queuedChildRosterEntry(state, child);
+		if (!bound && (child.status === "queued" || child.status === "running")) {
+			this.rosterReporter.queuedChildren.set(entry.agentId, entry);
+		} else {
+			this.rosterReporter.queuedChildren.delete(entry.agentId);
+		}
+		this.scheduleRosterFlush();
+	}
+
+	private hasSessionForRlmChild(parentState: ActiveSessionState, childId: string): boolean {
+		for (const candidate of this.sessions.values()) {
+			const metadata = candidate.runtime.metadata;
+			if (metadata.rlmChildId === childId && metadata.parentActiveSessionId === parentState.activeSessionId) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private queuedChildRosterEntry(
+		state: ActiveSessionState,
+		child: AgentConnectionRlmChildAgentSnapshot,
+	): WorkerRosterEntry {
+		const parentSession = state.runtime.session;
+		const summary: RosterSessionSummary = {
+			id: child.id,
+			lifecycle: "live",
+			activity: "idle",
+			isSessionActive: false,
+			runtimeKind: "subagent",
+			rlmDepth: (parentSession.rlmDepth ?? 0) + 1,
+			sessionId: child.id,
+			sessionName: child.sessionName,
+			cwd: parentSession.sessionManager.getCwd(),
+			isStreaming: false,
+			isCompacting: false,
+			attachedClients: 0,
+			messageCount: 0,
+			firstMessage: child.label,
+			parentActiveSessionId: state.activeSessionId,
+			parentSessionId: parentSession.sessionId,
+			parentSessionPath: parentSession.sessionFile,
+			rlmChildId: child.id,
+		};
+		return { agentId: rosterAgentIdForSummary(summary), queuedChild: true, summary };
+	}
+
+	private scheduleRosterFlush(): void {
+		if (!this.options.worker || this.rosterFlushScheduled || this.shuttingDown) return;
+		this.rosterFlushScheduled = true;
+		setImmediate(() => {
+			this.rosterFlushScheduled = false;
+			try {
+				this.flushRoster();
+			} catch (error) {
+				this.log(`could not publish roster delta: ${String(error)}`);
+			}
+		});
+	}
+
+	private flushRoster(): void {
+		const reporter = this.rosterReporter;
+		const entries = new Map<string, WorkerRosterEntry>();
+		const scheduledJobs = this.cronStore.list();
+		for (const summary of buildSessionList([...this.sessions.values()], [], scheduledJobs)) {
+			const entry = workerRosterEntryFromSummary(summary);
+			entries.set(entry.agentId, entry);
+		}
+		for (const [agentId, queued] of reporter.queuedChildren) {
+			if (entries.has(agentId)) {
+				reporter.queuedChildren.delete(agentId);
+				continue;
+			}
+			entries.set(agentId, queued);
+		}
+		// A terminal unbound child run owns no transcript: it is a removal, never a passivated row.
+		// A vanished row whose state lives on under a new sessionId was swapped in place
+		// (new_session/switch/fork): also a removal — plain list never served the old transcript.
+		const composedActiveIds = new Set<string>();
+		for (const entry of entries.values()) {
+			if (entry.summary.activeSessionId !== undefined) composedActiveIds.add(entry.summary.activeSessionId);
+		}
+		for (const [agentId, previous] of reporter.lastComposed) {
+			if (entries.has(agentId)) continue;
+			const swapped =
+				previous.summary.activeSessionId !== undefined && composedActiveIds.has(previous.summary.activeSessionId);
+			if (previous.queuedChild === true || swapped) {
+				reporter.removedAgentIds.set(agentId, previous.summary.sessionId);
+			}
+		}
+		for (const [agentId, targetSessionId] of reporter.removedAgentIds) {
+			const composed = entries.get(agentId);
+			// A new incarnation cancels the stale removal, as does a revived resident top-level row
+			// (switch-back, resume-after-archive); a resident subagent row with the removed sessionId
+			// is the mid-teardown race and stays suppressed.
+			const revived = composed?.summary.activeSessionId !== undefined && composed.summary.runtimeKind !== "subagent";
+			if (composed && (composed.queuedChild === true || composed.summary.sessionId !== targetSessionId || revived)) {
+				reporter.removedAgentIds.delete(agentId);
+				continue;
+			}
+			entries.delete(agentId);
+			reporter.queuedChildren.delete(agentId);
+		}
+		const registrations = scheduledJobRegistrations(scheduledJobs);
+		for (const [agentId, previous] of reporter.lastComposed) {
+			if (!entries.has(agentId) && !reporter.removedAgentIds.has(agentId)) {
+				const file = previous.summary.sessionFile ? resolve(previous.summary.sessionFile) : undefined;
+				entries.set(
+					agentId,
+					passivatedWorkerRosterEntry(previous, {
+						hasRegisteredHeartbeat: file !== undefined && registrations.heartbeatSessionFiles.has(file),
+						hasRegisteredCronJob: file !== undefined && registrations.cronSessionFiles.has(file),
+					}),
+				);
+			}
+		}
+		const changed: WorkerRosterEntry[] = [];
+		const nextJson = new Map<string, string>();
+		for (const entry of entries.values()) {
+			const json = JSON.stringify(entry);
+			nextJson.set(entry.agentId, json);
+			if (reporter.lastComposedJson.get(entry.agentId) !== json) changed.push(entry);
+		}
+		const removedAgentIds = [...reporter.removedAgentIds.keys()];
+		reporter.lastComposed = new Map(entries);
+		reporter.lastComposedJson = nextJson;
+		if (!this.hasAuthenticatedSupervisorClient()) {
+			if (changed.length > 0 || removedAgentIds.length > 0) reporter.snapshotPending = true;
+			return;
+		}
+		if (reporter.snapshotPending) {
+			const delivered = this.broadcastRosterFrame({
+				type: "roster_delta",
+				snapshot: true,
+				entries: [...entries.values()],
+				...(removedAgentIds.length > 0 ? { removedAgentIds } : {}),
+			});
+			if (delivered) {
+				reporter.snapshotPending = false;
+				reporter.removedAgentIds.clear();
+			}
+			return;
+		}
+		if (changed.length === 0 && removedAgentIds.length === 0) return;
+		const delivered = this.broadcastRosterFrame({
+			type: "roster_delta",
+			entries: changed,
+			...(removedAgentIds.length > 0 ? { removedAgentIds } : {}),
+		});
+		if (delivered) reporter.removedAgentIds.clear();
+		else reporter.snapshotPending = true;
+	}
+
+	private hasAuthenticatedSupervisorClient(): boolean {
+		for (const client of this.clients) {
+			if (this.supervisorClaims.has(client) && !client.socket.destroyed) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private broadcastRosterFrame(message: DaemonWorkerRosterOutbound): boolean {
+		const payload = Buffer.from(serializeJsonLine(message));
+		let delivered = false;
+		for (const client of this.clients) {
+			if (!this.supervisorClaims.has(client) || client.socket.destroyed) {
+				continue;
+			}
+			// socket.write queues under backpressure, so a queued frame is delivered, never a loss gap.
+			client.socket.write(
+				encodePrivateFrame<DaemonWorkerFrameHeader>({ kind: "outbound", outboundType: message.type }, payload),
+			);
+			delivered = true;
+		}
+		return delivered;
 	}
 
 	private recordWorkerRecoveryState(state: ActiveSessionState, operation: string, busyOverride?: boolean): void {
@@ -6860,6 +7493,10 @@ export class AgentDaemon {
 			clearTimeout(this.supervisorFenceTimer);
 			this.supervisorFenceTimer = undefined;
 		}
+		if (this.rosterHeartbeatTimer) {
+			clearInterval(this.rosterHeartbeatTimer);
+			this.rosterHeartbeatTimer = undefined;
+		}
 		this.log(`shutting down (exit ${exitCode}); closing ${this.sessions.size} active session(s)`);
 		const closingReason = this.getShutdownClosingReason();
 		for (const client of this.clients) {
@@ -6890,6 +7527,32 @@ export class AgentDaemon {
 		process.exit(exitCode);
 	}
 }
+
+interface WorkerRosterReporterState {
+	lastComposed: Map<string, WorkerRosterEntry>;
+	lastComposedJson: Map<string, string>;
+	queuedChildren: Map<string, WorkerRosterEntry>;
+	/** Pending removals: agentId -> removed sessionId; a new incarnation of the id cancels it. */
+	removedAgentIds: Map<string, string | undefined>;
+	snapshotPending: boolean;
+}
+
+const ROSTER_SESSION_EVENT_TRIGGERS = new Set([
+	"turn_start",
+	"turn_end",
+	"bash_start",
+	"bash_end",
+	"compaction_start",
+	"compaction_end",
+	"auto_retry_start",
+	"auto_retry_end",
+	"tool_execution_start",
+	"tool_execution_end",
+	"message_end",
+	"session_action_update",
+	"session_info_changed",
+	"thinking_level_changed",
+]);
 
 function hasDaemonOutboundActiveSessionId(
 	message: DaemonOutbound,
