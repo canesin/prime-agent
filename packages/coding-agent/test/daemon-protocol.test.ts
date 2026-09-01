@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
+import { isDaemonSessionSummary } from "../src/cli/daemon-launch.js";
 import {
 	createDaemonCommandEnvelope,
 	createDaemonEventEnvelope,
@@ -131,7 +132,7 @@ describe("daemon protocol helpers", () => {
 		const legacy = { type: "cancel_rlm_child", activeSessionId: "active-1", childId: "child-1" } as const;
 		expect(getDaemonCommandCompatibilities(legacy)).toEqual([DAEMON_COMMAND_COMPATIBILITY.cancel_rlm_child]);
 		expect(getDaemonCommandCompatibilities({ ...legacy, expectedRosterToken: "a".repeat(64) })).toEqual([
-			{ minProtocol: 7, minSchemaRevision: 24, capability: "conditional_rlm_child_cancel" },
+			{ minProtocol: 7, minSchemaRevision: 25, capability: "conditional_rlm_child_cancel" },
 			DAEMON_COMMAND_COMPATIBILITY.cancel_rlm_child,
 		]);
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("conditional_rlm_child_cancel");
@@ -167,7 +168,7 @@ describe("daemon protocol helpers", () => {
 
 		expect(getDaemonCommandCompatibilities(legacyCron)).toEqual([{ minProtocol: 7 }]);
 		expect(getDaemonCommandCompatibilities(guardedCron)).toEqual([
-			{ minProtocol: 7, minSchemaRevision: 24, capability: "conditional_cron_delivery" },
+			{ minProtocol: 7, minSchemaRevision: 25, capability: "conditional_cron_delivery" },
 			{ minProtocol: 7 },
 		]);
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("conditional_cron_delivery");
@@ -176,7 +177,7 @@ describe("daemon protocol helpers", () => {
 	it("capability- and schema-gates conditional session profile changes", () => {
 		expect((DAEMON_COMMAND_COMPATIBILITY as Record<string, unknown>).set_profile_if_idle).toEqual({
 			minProtocol: 7,
-			minSchemaRevision: 25,
+			minSchemaRevision: 26,
 			capability: "conditional_session_profile",
 		});
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("conditional_session_profile");
@@ -399,8 +400,30 @@ describe("daemon protocol helpers", () => {
 	it("keeps attachment routing out of the durable mutation journal", () => {
 		expect(isDaemonMutatingCommand({ type: "attach" })).toBe(false);
 		expect(isDaemonMutatingCommand({ type: "reattach" })).toBe(false);
+		// Journal replays after a reconnect would skip re-subscribing the new socket.
+		expect(isDaemonMutatingCommand({ type: "roster_subscribe" })).toBe(false);
+		expect(isDaemonMutatingCommand({ type: "roster_unsubscribe" })).toBe(false);
 		expect(isDaemonMutatingCommand({ type: "wait_for_headless_completion" })).toBe(true);
 		expect(isDaemonMutatingCommand({ type: "switch_session" })).toBe(true);
+	});
+
+	it("keeps the roster push additive for pre-roster clients", () => {
+		// Subscription commands and the push are capability-gated; a client that
+		// never sends roster_subscribe is never written a roster_update.
+		expect(DAEMON_COMMAND_COMPATIBILITY.roster_subscribe).toEqual({ minProtocol: 7, capability: "agent_roster" });
+		expect(DAEMON_COMMAND_COMPATIBILITY.roster_unsubscribe).toEqual({ minProtocol: 7, capability: "agent_roster" });
+		expect(DAEMON_OUTBOUND_COMPATIBILITY.roster_update).toEqual({ minProtocol: 7, capability: "agent_roster" });
+		// list responses now carry rosterStatus/statusLabel/lastHeardFromAt; the
+		// summary validator pre-roster clients shipped stays open to additive fields.
+		expect(
+			isDaemonSessionSummary({
+				id: "session-1",
+				activeSessionId: "active-1",
+				rosterStatus: "running",
+				statusLabel: "queued",
+				lastHeardFromAt: "2026-08-01T12:00:00.000Z",
+			}),
+		).toBe(true);
 	});
 
 	it("reports replay availability from resume cursors", () => {
