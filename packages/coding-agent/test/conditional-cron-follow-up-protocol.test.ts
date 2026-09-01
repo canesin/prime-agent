@@ -34,12 +34,12 @@ describe("conditional cron follow-up protocol", () => {
 		const followUp = { ...base, deliveryMode: "follow_up" } as DaemonCommand;
 
 		expect(getDaemonCommandCompatibilities(goalStart)).toEqual([
-			{ minProtocol: 7, minSchemaRevision: 25, capability: "conditional_cron_delivery" },
+			{ minProtocol: 7, minSchemaRevision: 26, capability: "conditional_cron_delivery" },
 			{ minProtocol: 7 },
 		]);
 		expect(getDaemonCommandCompatibilities(followUp)).toEqual([
-			{ minProtocol: 7, minSchemaRevision: 25, capability: "conditional_cron_delivery" },
-			{ minProtocol: 7, minSchemaRevision: 27, capability: "conditional_cron_follow_up" },
+			{ minProtocol: 7, minSchemaRevision: 26, capability: "conditional_cron_delivery" },
+			{ minProtocol: 7, minSchemaRevision: 28, capability: "conditional_cron_follow_up" },
 			{ minProtocol: 7 },
 		]);
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("conditional_cron_follow_up");
