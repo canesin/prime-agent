@@ -111,7 +111,7 @@ import {
 	isDaemonShutdownAdmissionActive,
 	waitForDaemonStartupFence,
 } from "./daemon-supervisor-ownership.js";
-import { DaemonWorkerClient } from "./daemon-worker-client.js";
+import { DaemonWorkerAuthenticationError, DaemonWorkerClient } from "./daemon-worker-client.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
@@ -384,6 +384,7 @@ function isSupervisorRecoveryCancelled(error: unknown): boolean {
 }
 
 function isDaemonWorkerProbeTimeout(error: unknown): boolean {
+	if (error instanceof DaemonWorkerAuthenticationError) return false;
 	const message = error instanceof Error ? error.message : String(error);
 	return (
 		message.startsWith("Timed out connecting to daemon session worker") ||
@@ -623,6 +624,7 @@ export class DaemonSupervisor {
 	private ownsSocketPath = false;
 	private socketIdentity?: DaemonSocketIdentity;
 	private socketLease?: DaemonSocketPathLease;
+	private socketLeaseCompromise?: Error;
 	private ownership?: Awaited<ReturnType<typeof acquireDaemonSupervisorOwnership>>;
 	private cleanupPromise?: Promise<void>;
 	private shuttingDown = false;
@@ -735,6 +737,7 @@ export class DaemonSupervisor {
 				this.log(`Migrated ${migratedJobs} scheduled jobs into session artifacts`);
 			}
 			await this.catalog.start().catch((error) => this.log(`Could not start daemon catalog: ${String(error)}`));
+			this.assertSocketLeaseHeld();
 			let adoptionFailure: unknown;
 			let adoptionFailed = false;
 			await Promise.all(
@@ -1007,6 +1010,7 @@ export class DaemonSupervisor {
 	}
 
 	private async assertCurrentOwnership(): Promise<void> {
+		this.assertSupervisorServing();
 		const ownership = this.ownership;
 		if (!ownership) {
 			const error = new Error(
@@ -1017,6 +1021,7 @@ export class DaemonSupervisor {
 			throw error;
 		}
 		await ownership.assertCurrent();
+		this.assertSupervisorServing();
 	}
 
 	private async assertRecoveryAllowed(): Promise<void> {
@@ -1437,6 +1442,12 @@ export class DaemonSupervisor {
 	}
 
 	private async handleLine(client: DaemonSocketClient, line: string): Promise<void> {
+		try {
+			this.assertSupervisorServing();
+		} catch (error) {
+			this.write(client, failure(salvageDaemonCommandId(line), "dispatch", error, serializeDaemonError(error)));
+			return;
+		}
 		let preParsed: ReturnType<DaemonSupervisor["parseCommandAndRegisterPromptAdmission"]>;
 		try {
 			preParsed = this.parseCommandAndRegisterPromptAdmission(client, line);
@@ -1554,6 +1565,13 @@ export class DaemonSupervisor {
 		if (mutation && !UPDATE_RESTART_DRAIN_COMMANDS.has(command.type)) {
 			const idleEvictionFence = this.idleEvictionFence;
 			if (idleEvictionFence) await idleEvictionFence;
+		}
+		try {
+			await this.assertCurrentOwnership();
+		} catch (error) {
+			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
+			this.write(client, failure(command.id, command.type, error, serializeDaemonError(error)));
+			return;
 		}
 		// Attach is intentionally read-only and is not fence-gated. If eviction wins
 		// the race, attach fails cleanly with "Session worker is not connected" and
@@ -2851,7 +2869,7 @@ export class DaemonSupervisor {
 			} catch (error) {
 				lastError = error;
 				client.close();
-				if (isSupervisorRecoveryCancelled(error)) {
+				if (isSupervisorRecoveryCancelled(error) || error instanceof DaemonWorkerAuthenticationError) {
 					throw error;
 				}
 				await delay(25);
@@ -2940,8 +2958,9 @@ export class DaemonSupervisor {
 			if (
 				isDaemonWorkerProbeTimeout(error) &&
 				processAlive &&
-				worker.descriptor.processStartId !== undefined &&
-				observedProcessStartId === worker.descriptor.processStartId
+				(worker.descriptor.processStartId === undefined ||
+					observedProcessStartId === undefined ||
+					observedProcessStartId === worker.descriptor.processStartId)
 			) {
 				worker.descriptor.lifecycle = "recovering";
 				worker.descriptor.lastError = error instanceof Error ? error.message : String(error);
@@ -3441,13 +3460,14 @@ export class DaemonSupervisor {
 		const orphanProcessJournalPath = worker.descriptor.orphanProcessJournalPath;
 		if (orphanProcessJournalPath) {
 			try {
+				let reapFailed = false;
 				for (const orphan of readActiveOrphanProcesses(orphanProcessJournalPath, worker.descriptor.pid)) {
 					if (!shouldReapOrphanProcess(orphan)) {
 						continue;
 					}
-					killOrphanProcess(orphan.pid);
+					if (!killOrphanProcess(orphan.pid)) reapFailed = true;
 				}
-				clearOrphanProcessJournal(orphanProcessJournalPath);
+				if (!reapFailed) clearOrphanProcessJournal(orphanProcessJournalPath);
 			} catch (error) {
 				this.log(`Could not reap orphaned worker resources: ${String(error)}`);
 			}
@@ -5527,13 +5547,36 @@ export class DaemonSupervisor {
 	}
 
 	private assertSocketLeaseHeld(): void {
-		const compromise = this.socketLease?.compromise;
+		const compromise = this.socketLeaseCompromise ?? this.socketLease?.compromise;
 		if (compromise) throw new Error(`Daemon socket lease was compromised: ${compromise.message}`);
 	}
 
+	private assertSupervisorServing(): void {
+		this.assertSocketLeaseHeld();
+		if (this.shuttingDown) {
+			const error = new Error(`Daemon supervisor generation ${this.generation} is shutting down; retry the command`);
+			Object.assign(error, { code: "supervisor_generation_stale" as const });
+			throw error;
+		}
+	}
+
+	private fenceSupervisorSocket(): void {
+		try {
+			this.server?.close();
+		} catch {
+			// The server may already be closed by a concurrent shutdown.
+		}
+		for (const client of this.clients) {
+			client.detachInput();
+			client.socket.destroy();
+		}
+	}
+
 	private handleSocketLeaseCompromised(error: Error): void {
-		if (this.shuttingDown) return;
+		if (this.socketLeaseCompromise) return;
+		this.socketLeaseCompromise = error;
 		this.shuttingDown = true;
+		this.fenceSupervisorSocket();
 		const message = `Daemon socket lease was compromised; relinquishing supervisor ownership: ${error.message}`;
 		try {
 			this.log(message);

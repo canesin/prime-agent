@@ -19,6 +19,8 @@ export type DaemonWorkerFrameListener = (frame: PrivateFrame<DaemonWorkerFrameHe
 export type DaemonWorkerCloseListener = (error: Error) => void;
 type DaemonHello = Extract<DaemonOutbound, { type: "daemon_hello" }>;
 
+export class DaemonWorkerAuthenticationError extends Error {}
+
 export class DaemonWorkerClient {
 	private socket?: Socket;
 	private channel?: PrivateFramedChannel<DaemonWorkerFrameHeader>;
@@ -119,7 +121,7 @@ export class DaemonWorkerClient {
 	async authenticateWorker(token: string, owner: DaemonWorkerAuthentication, timeoutMs = 3000): Promise<void> {
 		const response = await this.requestWorker({ type: "worker_auth", token, ...owner }, timeoutMs);
 		if (!response.success) {
-			throw new Error(response.error);
+			throw new DaemonWorkerAuthenticationError(response.error);
 		}
 	}
 
