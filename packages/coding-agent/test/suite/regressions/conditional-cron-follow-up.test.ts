@@ -94,6 +94,25 @@ describe("conditional cron follow-up regression", () => {
 		expect(getUserTexts(harness)).toEqual([]);
 	});
 
+	it("rejects slash commands before persisting a follow-up receipt", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const session = harness.session as unknown as ConditionalFollowUpSession;
+		session._setGoalState(activeGoal());
+		const admissionCommitted = vi.fn();
+
+		await expect(
+			session.startGoalFollowUpFromConditionalPrompt("/goal replace the active goal", {
+				receiptId: "conditional-follow-up-slash",
+				admissionCommitted,
+			}),
+		).rejects.toThrow("must not be a slash command");
+
+		expect(admissionCommitted).not.toHaveBeenCalled();
+		expect(harness.session.goalState).not.toHaveProperty("followUpDispatchReceiptId");
+		expect(getUserTexts(harness)).toEqual([]);
+	});
+
 	it("rebuilds a receipt-phase follow-up once and never replays a provider-committed receipt", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

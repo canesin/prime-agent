@@ -4662,6 +4662,9 @@ export class AgentSession {
 		const receiptId = validateGoalDispatchReceiptId(options.receiptId);
 		if (!receiptId) throw new Error("Conditional goal follow-up requires a dispatch receipt");
 		if (!text.trim()) throw new Error("Conditional goal follow-up cannot be empty");
+		if (text.trimStart().startsWith("/")) {
+			throw new Error("Conditional goal follow-up must not be a slash command");
+		}
 		if (this.isStreaming) throw new Error("Conditional goal follow-up requires an idle session");
 		if (this._goalState.status !== "active" || !this._goalState.objective || !this._goalState.goalId) {
 			throw new Error("Conditional goal follow-up requires an active goal");
