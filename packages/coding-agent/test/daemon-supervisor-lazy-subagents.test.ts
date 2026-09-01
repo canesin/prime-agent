@@ -10,7 +10,12 @@ import {
 import { readSessionInfo, SessionManager } from "../src/core/session-manager.js";
 import { DaemonCatalogClient } from "../src/modes/daemon/daemon-catalog-process.js";
 import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
-import { success } from "../src/modes/daemon/daemon-protocol.js";
+import {
+	DAEMON_DEFAULT_SERVER_CAPABILITIES,
+	DAEMON_PROTOCOL_INFO,
+	DAEMON_SCHEMA_REVISION,
+	success,
+} from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import { seedSupervisorRoster } from "./fixtures/roster-seed.js";
@@ -48,6 +53,11 @@ interface WorkerFixture {
 		createCommand: { config: { cwd: string }; sessionPath?: string };
 	};
 	client: {
+		hello: {
+			protocol: typeof DAEMON_PROTOCOL_INFO;
+			schemaRevision: number;
+			serverCapabilities: typeof DAEMON_DEFAULT_SERVER_CAPABILITIES;
+		};
 		request: ReturnType<typeof vi.fn>;
 		requestWorker: ReturnType<typeof vi.fn>;
 	};
@@ -87,6 +97,11 @@ function worker(workerId: string, summaries: SessionSummary[] = []): WorkerFixtu
 			createCommand: { config: { cwd: "/tmp/project" } },
 		},
 		client: {
+			hello: {
+				protocol: DAEMON_PROTOCOL_INFO,
+				schemaRevision: DAEMON_SCHEMA_REVISION,
+				serverCapabilities: DAEMON_DEFAULT_SERVER_CAPABILITIES,
+			},
 			request: vi.fn(),
 			requestWorker: vi.fn(),
 		},
