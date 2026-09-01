@@ -1,0 +1,1 @@
+- Added capability-gated conditional cron follow-ups for unchanged active goals, including mixed-version worker fencing.

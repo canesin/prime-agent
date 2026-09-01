@@ -7,7 +7,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
@@ -162,6 +162,7 @@ import {
 	isDaemonCommandEnvelope,
 	isDaemonDialogExtensionUiRequest,
 	isDaemonMutatingCommand,
+	isSessionPlaneDaemonCommand,
 	salvageDaemonCommandId,
 	success,
 	UPDATE_RESTART_DRAIN_COMMANDS,
@@ -190,6 +191,7 @@ import {
 import { assertDaemonSupervisorOwnerCurrent, isDaemonShutdownAdmissionActive } from "./daemon-supervisor-ownership.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
+	DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
 	DAEMON_WORKER_ROLE_ENV,
 	DAEMON_WORKER_ROSTER_CAPABILITY,
@@ -197,6 +199,7 @@ import {
 	DAEMON_WORKER_TOKEN_ENV,
 	type DaemonWorkerCommand,
 	type DaemonWorkerFrameHeader,
+	type DaemonWorkerPeerGrant,
 	type DaemonWorkerRosterOutbound,
 	isDaemonWorkerFrameHeader,
 	ROSTER_HEARTBEAT_INTERVAL_MS,
@@ -232,6 +235,7 @@ export interface DaemonModeOptions {
 	createRuntime: CreateAgentSessionRuntimeFactory;
 	worker?: {
 		authenticationToken: string;
+		workerInstanceId?: string;
 		restoreActiveSessionId?: string;
 	};
 }
@@ -252,7 +256,7 @@ const structuredLog = getLogger("coding-agent.daemon");
 const WORKER_SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS = 1_000;
 const UPDATE_RESTART_PREPARE_TIMEOUT_MS = 90_000;
 const MAX_SESSION_SNAPSHOT_STABILIZATION_RETRIES = 3;
-const MAX_CONDITIONAL_GOAL_RECOVERY_ATTEMPTS = 5;
+const MAX_CONDITIONAL_CRON_RECOVERY_ATTEMPTS = 5;
 
 function matchesGoalFence(expected: AgentCronDeliveryFence["goal"], actual: SessionSummary["goal"]): boolean {
 	const normalizedActual = actual ?? null;
@@ -264,6 +268,8 @@ function matchesGoalFence(expected: AgentCronDeliveryFence["goal"], actual: Sess
 				normalizedActual.goalId === expected.goalId &&
 				normalizedActual.dispatchReceiptId === expected.dispatchReceiptId &&
 				normalizedActual.dispatchPhase === expected.dispatchPhase &&
+				normalizedActual.followUpDispatchReceiptId === expected.followUpDispatchReceiptId &&
+				normalizedActual.followUpDispatchPhase === expected.followUpDispatchPhase &&
 				normalizedActual.updatedAt === expected.updatedAt;
 }
 
@@ -487,6 +493,10 @@ interface BoundSupervisorGenerationClaim {
 	ownerFingerprint: string;
 }
 
+const PEER_GRANT_TTL_LIMIT_MS = 30_000;
+// Only the supervisor registers grants, so the cap is a tripwire, never an eviction policy.
+const PEER_GRANT_LIMIT = 1024;
+
 const RLM_SUBAGENT_REGISTRY_FILE = "rlm-subagents.jsonl";
 
 /**
@@ -632,6 +642,9 @@ export class AgentDaemon {
 	private supervisorFenceTimer?: ReturnType<typeof setTimeout>;
 	private supervisorLaunchInProgress = false;
 	private readonly supervisorClaims = new Map<DaemonSocketClient, BoundSupervisorGenerationClaim>();
+	private readonly peerGrants = new Map<string, DaemonWorkerPeerGrant>();
+	private readonly peerClaims = new Map<DaemonSocketClient, DaemonWorkerPeerGrant>();
+	private peerAdmissionsFenced = false;
 	private agentMessagesPaused = false;
 	private readonly summarizer = new DaemonSessionSummarizer(
 		() => [...this.sessions.values()],
@@ -836,6 +849,18 @@ export class AgentDaemon {
 			this.cancelPreparedUpdateRestart(this.updateRestart.id);
 		}
 		return true;
+	}
+
+	/** Burn every outstanding grant and end direct peers; admissions stay fenced until an update cancel. */
+	private fencePeerTransports(closingReason?: DaemonClosingReason): void {
+		this.peerAdmissionsFenced = true;
+		this.peerGrants.clear();
+		for (const client of [...this.peerClaims.keys()]) {
+			this.peerClaims.delete(client);
+			// The reason reaches the client before FIN so its close maps to shutdown/update, not a transport loss.
+			if (closingReason) this.write(client, { type: "daemon_closing", reason: closingReason });
+			client.socket.end();
+		}
 	}
 
 	private clearSupervisorAvailabilityCheck(): void {
@@ -1611,7 +1636,12 @@ export class AgentDaemon {
 	private recoverConditionalCronDeliveryForState(state: ActiveSessionState): void {
 		const goalState = state.runtime.session.goalState;
 		const receiptId = goalState?.dispatchReceiptId;
-		if (!receiptId) return;
+		if (receiptId) this.recoverConditionalGoalStartForState(state, receiptId);
+		const followUpReceiptId = goalState?.followUpDispatchReceiptId;
+		if (followUpReceiptId) this.recoverConditionalGoalFollowUpForState(state, followUpReceiptId);
+	}
+
+	private conditionalRecoveryJob(state: ActiveSessionState, receiptId: string): AgentCronJob | undefined {
 		const job =
 			this.recoveredConditionalCronJobs.get(receiptId) ??
 			this.cronStore
@@ -1623,12 +1653,18 @@ export class AgentDaemon {
 						candidate.status === "cancelled" &&
 						candidate.lastError !== "Delivery fence changed before prompt admission",
 				);
-		if (!job || job.sessionId !== state.runtime.session.sessionId) return;
-		if (goalState.dispatchPhase !== "receipt") {
+		return job?.sessionId === state.runtime.session.sessionId ? job : undefined;
+	}
+
+	private recoverConditionalGoalStartForState(state: ActiveSessionState, receiptId: string): void {
+		const goalState = state.runtime.session.goalState;
+		if (goalState?.dispatchReceiptId !== receiptId || goalState.dispatchPhase !== "receipt") {
 			this.recoveredConditionalCronJobs.delete(receiptId);
 			return;
 		}
-		if ((job.deliveryRecoveryCount ?? 0) >= MAX_CONDITIONAL_GOAL_RECOVERY_ATTEMPTS) {
+		const job = this.conditionalRecoveryJob(state, receiptId);
+		if (!job || job.deliveryMode === "follow_up") return;
+		if ((job.deliveryRecoveryCount ?? 0) >= MAX_CONDITIONAL_CRON_RECOVERY_ATTEMPTS) {
 			const alreadyFailed =
 				goalState.status === "error" && goalState.lastError === "Conditional goal delivery recovery exhausted";
 			try {
@@ -1654,6 +1690,43 @@ export class AgentDaemon {
 			this.recoveredConditionalCronJobs.delete(receiptId);
 		} catch (error) {
 			this.log(`Conditional cron recovery ${receiptId} failed: ${String(error)}`);
+		}
+	}
+
+	private recoverConditionalGoalFollowUpForState(state: ActiveSessionState, receiptId: string): void {
+		const goalState = state.runtime.session.goalState;
+		if (goalState?.followUpDispatchReceiptId !== receiptId || goalState.followUpDispatchPhase !== "receipt") {
+			this.recoveredConditionalCronJobs.delete(receiptId);
+			return;
+		}
+		const job = this.conditionalRecoveryJob(state, receiptId);
+		if (!job || job.deliveryMode !== "follow_up") return;
+		if ((job.deliveryRecoveryCount ?? 0) >= MAX_CONDITIONAL_CRON_RECOVERY_ATTEMPTS) {
+			const fail = state.runtime.session.failConditionalGoalFollowUpDelivery;
+			if (typeof fail !== "function") return;
+			try {
+				if (fail.call(state.runtime.session, receiptId)) {
+					this.cronStore.recordDeliveryRecoveryExhausted(receiptId);
+					this.recoveredConditionalCronJobs.delete(receiptId);
+				}
+			} catch (error) {
+				this.log(`Conditional cron follow-up recovery exhaustion ${receiptId} failed: ${String(error)}`);
+			}
+			return;
+		}
+		const recover = state.runtime.session.recoverConditionalGoalFollowUpDelivery;
+		if (typeof recover !== "function") return;
+		try {
+			recover.call(state.runtime.session, receiptId, job.prompt, {
+				recoveryCommitted: () => {
+					if (!this.cronStore.recordDeliveryRecoveryAttempt(receiptId)) {
+						throw new Error(`Conditional cron follow-up recovery receipt ${receiptId} disappeared`);
+					}
+				},
+			});
+			this.recoveredConditionalCronJobs.delete(receiptId);
+		} catch (error) {
+			this.log(`Conditional cron follow-up recovery ${receiptId} failed: ${String(error)}`);
 		}
 	}
 
@@ -1934,6 +2007,21 @@ export class AgentDaemon {
 		if (!state || !runnableJob || !this.isCronJobRunnableForState(runnableJob, state, requirePersistedJob)) {
 			return "skipped";
 		}
+		if (
+			runnableJob.source === "conditional_cron" &&
+			runnableJob.deliveryMode === "follow_up" &&
+			state.runtime.session.goalState.followUpDispatchReceiptId === runnableJob.id
+		) {
+			if (state.runtime.session.goalState.followUpDispatchPhase === "provider_committed") return;
+			if (state.runtime.session.goalState.followUpDispatchPhase === "receipt") {
+				this.cronStore.rejectDelivery(
+					runnableJob.id,
+					"Conditional goal follow-up receipt persisted before interrupted delivery",
+				);
+				this.recoverConditionalCronDeliveryForState(state);
+				return "skipped";
+			}
+		}
 		if (runnableJob.deliveryFence && !matchesCronDeliveryFence(runnableJob.deliveryFence, state)) {
 			this.cronStore.rejectDelivery(runnableJob.id, "Delivery fence changed before prompt admission");
 			return "skipped";
@@ -1993,10 +2081,17 @@ export class AgentDaemon {
 				return;
 			}
 			if (current.deliveryFence) {
-				await session.startGoalFromConditionalPrompt(current.prompt, {
-					admissionCommitted,
-					receiptId: current.id,
-				});
+				if (current.deliveryMode === "follow_up") {
+					await session.startGoalFollowUpFromConditionalPrompt(current.prompt, {
+						admissionCommitted,
+						receiptId: current.id,
+					});
+				} else {
+					await session.startGoalFromConditionalPrompt(current.prompt, {
+						admissionCommitted,
+						receiptId: current.id,
+					});
+				}
 				return;
 			}
 			await session.promptUntilAccepted(current.prompt, {
@@ -2016,13 +2111,20 @@ export class AgentDaemon {
 			}
 			if (current.deliveryFence) {
 				const reason = error instanceof Error ? error.message : String(error);
-				const receiptPersisted = session.goalState.dispatchReceiptId === current.id;
+				const followUpDelivery = current.deliveryMode === "follow_up";
+				const receiptPersisted = followUpDelivery
+					? session.goalState.followUpDispatchReceiptId === current.id
+					: session.goalState.dispatchReceiptId === current.id;
 				this.cronStore.rejectDelivery(
 					current.id,
 					`${
 						receiptPersisted
-							? "Conditional goal receipt persisted before delivery error"
-							: "Conditional goal delivery retryable"
+							? followUpDelivery
+								? "Conditional goal follow-up receipt persisted before delivery error"
+								: "Conditional goal receipt persisted before delivery error"
+							: followUpDelivery
+								? "Conditional goal follow-up delivery retryable"
+								: "Conditional goal delivery retryable"
 					}: ${reason.slice(0, 500)}`,
 				);
 				if (receiptPersisted) this.recoverConditionalCronDeliveryForState(state);
@@ -2041,6 +2143,7 @@ export class AgentDaemon {
 		schedule: string,
 		prompt: string,
 		deliveryFence?: AgentCronDeliveryFence,
+		deliveryMode?: "follow_up",
 	): AgentCronJob {
 		const session = state.runtime.session;
 		const sessionFile = session.sessionFile;
@@ -2056,6 +2159,7 @@ export class AgentDaemon {
 			scheduleText: schedule,
 			prompt,
 			deliveryFence,
+			deliveryMode,
 		});
 		this.cronScheduler.wake();
 		return job;
@@ -3436,10 +3540,12 @@ export class AgentDaemon {
 			this.detachClient(client);
 			client.detachInput();
 			this.clients.delete(client);
-			const wasAuthenticated = client.authenticated === true;
+			this.peerClaims.delete(client);
+			// The fence check revokes a stale claim before ending the socket; the role survives.
+			const wasSupervisor = client.authenticationRole === "supervisor";
 			this.revokeSupervisorClaim(client);
 			const supervisorSocketPath = this.supervisorSocketPathFromEnv();
-			if (this.options.worker && wasAuthenticated && supervisorSocketPath) {
+			if (this.options.worker && wasSupervisor && supervisorSocketPath) {
 				this.scheduleSupervisorAvailabilityCheck(supervisorSocketPath, 100);
 			}
 		};
@@ -3501,6 +3607,9 @@ export class AgentDaemon {
 				id?: unknown;
 				type?: unknown;
 				token?: unknown;
+				grantId?: unknown;
+				workerInstanceId?: unknown;
+				purpose?: unknown;
 				supervisorGeneration?: unknown;
 				supervisorPid?: unknown;
 				supervisorProcessStartId?: unknown;
@@ -3530,9 +3639,52 @@ export class AgentDaemon {
 			// Public supervisor authentication has already bound this socket's identity.
 			if (this.options.worker && client.authenticated !== true) {
 				const commandId = typeof parsed.id === "string" ? parsed.id : undefined;
+				if (parsed.type === "peer_auth") {
+					// Single use: the grant is burned before its token is checked.
+					const grant = typeof parsed.grantId === "string" ? this.peerGrants.get(parsed.grantId) : undefined;
+					if (typeof parsed.grantId === "string") this.peerGrants.delete(parsed.grantId);
+					const presentedTokenHash =
+						typeof parsed.token === "string" ? createHash("sha256").update(parsed.token).digest() : undefined;
+					const expectedTokenHash = grant ? createHash("sha256").update(grant.token).digest() : undefined;
+					const expiresAt = grant ? Date.parse(grant.expiresAt) : Number.NaN;
+					if (
+						this.peerAdmissionsFenced ||
+						!grant ||
+						!presentedTokenHash ||
+						!expectedTokenHash ||
+						!timingSafeEqual(presentedTokenHash, expectedTokenHash) ||
+						parsed.workerInstanceId !== grant.workerInstanceId ||
+						parsed.purpose !== grant.purpose ||
+						!Number.isFinite(expiresAt) ||
+						expiresAt <= Date.now()
+					) {
+						clearParsedAdmission();
+						this.write(client, failure(commandId, "peer_auth", "Peer authentication failed"));
+						client.socket.end();
+						return;
+					}
+					client.authenticated = true;
+					client.authenticationRole = "session_client";
+					this.peerClaims.set(client, grant);
+					this.write(client, {
+						id: commandId,
+						type: "response",
+						command: "peer_auth",
+						success: true,
+						data: {
+							workerInstanceId: grant.workerInstanceId,
+							activeSessionId: grant.activeSessionId,
+							purpose: grant.purpose,
+						},
+					});
+					return;
+				}
 				if (
 					parsed.type !== "worker_auth" ||
 					parsed.token !== this.options.worker.authenticationToken ||
+					// Enforced only when presented: a downgraded (pre-instance-id) supervisor must still adopt live workers.
+					(parsed.workerInstanceId !== undefined &&
+						parsed.workerInstanceId !== this.options.worker.workerInstanceId) ||
 					typeof parsed.supervisorGeneration !== "string" ||
 					!Number.isInteger(parsed.supervisorPid) ||
 					(parsed.supervisorPid as number) <= 0 ||
@@ -3567,6 +3719,7 @@ export class AgentDaemon {
 					}
 				}
 				client.authenticated = true;
+				client.authenticationRole = "supervisor";
 				this.supervisorClaims.set(client, { claim, ownerFingerprint });
 				this.clearSupervisorAvailabilityCheck();
 				this.scheduleSupervisorFenceCheck();
@@ -3575,13 +3728,42 @@ export class AgentDaemon {
 					type: "response",
 					command: "worker_auth",
 					success: true,
-					data: { capabilities: [DAEMON_WORKER_ROSTER_CAPABILITY] },
+					data: {
+						capabilities: [
+							DAEMON_WORKER_ROSTER_CAPABILITY,
+							...(this.options.worker.workerInstanceId !== undefined
+								? [DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY]
+								: []),
+						],
+					},
 				});
 				this.rosterReporter.snapshotPending = true;
 				this.scheduleRosterFlush();
 				return;
 			}
-			if (this.options.worker) {
+			const peerClaim = this.options.worker ? this.peerClaims.get(client) : undefined;
+			if (peerClaim) {
+				const commandId = typeof parsed.id === "string" ? parsed.id : undefined;
+				const commandName = typeof parsed.type === "string" ? parsed.type : "unknown";
+				// Reachable only through shutdown, which fences admissions without ending live peers.
+				if (this.peerAdmissionsFenced) {
+					clearParsedAdmission();
+					this.write(client, failure(commandId, commandName, "Direct peer transport is fenced"));
+					return;
+				}
+				if (
+					typeof parsed.type !== "string" ||
+					!isSessionPlaneDaemonCommand(parsed.type) ||
+					parsed.activeSessionId !== peerClaim.activeSessionId
+				) {
+					clearParsedAdmission();
+					this.write(
+						client,
+						failure(commandId, commandName, "Command is not allowed on this direct peer transport"),
+					);
+					return;
+				}
+			} else if (this.options.worker) {
 				const boundClaim = this.supervisorClaims.get(client);
 				if (!boundClaim) {
 					clearParsedAdmission();
@@ -3720,6 +3902,35 @@ export class AgentDaemon {
 				case "worker_auth":
 					this.write(client, failure(command.id, command.type, "Worker is already authenticated"));
 					return;
+				case "worker_register_peer_transport": {
+					const grant = command.grant;
+					const boundClaim = this.supervisorClaims.get(client);
+					const expiresAt = Date.parse(grant.expiresAt);
+					const now = Date.now();
+					for (const [grantId, pending] of this.peerGrants) {
+						if (Date.parse(pending.expiresAt) < now) this.peerGrants.delete(grantId);
+					}
+					if (
+						this.peerAdmissionsFenced ||
+						!boundClaim ||
+						grant.issuerGeneration !== boundClaim.claim.supervisorGeneration ||
+						grant.purpose !== "session_client" ||
+						!grant.grantId ||
+						!grant.token ||
+						grant.workerInstanceId !== this.options.worker?.workerInstanceId ||
+						!this.sessions.has(grant.activeSessionId) ||
+						this.peerGrants.size >= PEER_GRANT_LIMIT ||
+						!Number.isFinite(expiresAt) ||
+						expiresAt <= now ||
+						expiresAt - now > PEER_GRANT_TTL_LIMIT_MS
+					) {
+						this.write(client, failure(command.id, command.type, "Peer transport grant is invalid"));
+						return;
+					}
+					this.peerGrants.set(grant.grantId, grant);
+					this.writeWorkerSuccess(client, command);
+					return;
+				}
 				case "worker_subscribe": {
 					const state = this.getBoundSessionState(command.activeSessionId);
 					setDaemonClientSessionCapabilities(
@@ -3739,9 +3950,11 @@ export class AgentDaemon {
 					return;
 				}
 				case "worker_archive_and_shutdown": {
+					// Close sessions first so direct peers read session_closed "killed", not a daemon shutdown.
 					for (const state of [...this.sessions.values()]) {
 						await this.closeSession(state, "killed");
 					}
+					this.fencePeerTransports();
 					this.writeWorkerSuccess(client, command);
 					setImmediate(() => void this.shutdown(0));
 					return;
@@ -3763,6 +3976,7 @@ export class AgentDaemon {
 					return;
 				}
 				case "worker_prepare_update": {
+					this.fencePeerTransports("update");
 					const transaction = this.beginUpdateRestartTransaction(client);
 					const manifest = await this.runUpdateRestartPreparation(transaction);
 					this.writeWorkerSuccess(client, command, manifest);
@@ -3804,6 +4018,7 @@ export class AgentDaemon {
 						throw new Error("Daemon update checkpoint is already committing");
 					}
 					if (transaction) this.cancelPreparedUpdateRestart(transaction.id);
+					this.peerAdmissionsFenced = false;
 					this.writeWorkerSuccess(client, command);
 					return;
 				}
@@ -4000,6 +4215,8 @@ export class AgentDaemon {
 				}
 				state.clients.add(client);
 				client.attachedActiveSessionIds.add(state.activeSessionId);
+				// Carrier-less mutation: a direct viewer changes directAttachedClients with no session event.
+				if (client.authenticationRole === "session_client") this.scheduleRosterFlush();
 				if (deferClientEnv && clientEnv) {
 					this.updateRestart?.deferredClientEnv.push({
 						client,
@@ -4811,7 +5028,13 @@ export class AgentDaemon {
 
 			case "cron_add": {
 				const state = this.getSessionState(command.activeSessionId);
-				const job = this.createCronJobForState(state, command.schedule, command.prompt, command.deliveryFence);
+				const job = this.createCronJobForState(
+					state,
+					command.schedule,
+					command.prompt,
+					command.deliveryFence,
+					command.deliveryMode,
+				);
 				this.scheduleRosterFlush();
 				return success(command.id, "cron_add", { job });
 			}
@@ -6189,6 +6412,7 @@ export class AgentDaemon {
 		this.abortSideQuestionsFor(client, state.activeSessionId);
 		abortClientSnapshotStreaming(client, state.activeSessionId);
 		detachClientFromActiveSession(client, state);
+		if (client.authenticationRole === "session_client") this.scheduleRosterFlush();
 		this.write(client, {
 			type: "session_detached",
 			activeSessionId: state.activeSessionId,
@@ -6470,7 +6694,10 @@ export class AgentDaemon {
 		transaction.deferredClientEnv.length = 0;
 		for (const pause of this.updateRestartQueuePauses.values()) pause.release();
 		this.updateRestartQueuePauses.clear();
-		if (!this.shuttingDown) this.cronScheduler.start();
+		if (!this.shuttingDown) {
+			this.peerAdmissionsFenced = false;
+			this.cronScheduler.start();
+		}
 	}
 
 	private async prepareUpdateRestart(): Promise<DaemonUpdateRestartManifest> {
@@ -7394,7 +7621,11 @@ export class AgentDaemon {
 	}
 
 	private write(client: DaemonSocketClient, message: DaemonOutbound): boolean {
-		const compactDelta = client.transport === "private-framed" ? createCompactAssistantDelta(message) : undefined;
+		// Direct session peers decode plain jsonl payloads only; compact deltas are a supervisor optimization.
+		const compactDelta =
+			client.transport === "private-framed" && client.authenticationRole !== "session_client"
+				? createCompactAssistantDelta(message)
+				: undefined;
 		return this.writeSerialized(
 			client,
 			serializeJsonLine(compactDelta ?? message),
@@ -7485,6 +7716,8 @@ export class AgentDaemon {
 			process.exit(exitCode);
 		}
 		this.shuttingDown = true;
+		this.peerAdmissionsFenced = true;
+		this.peerGrants.clear();
 		if (this.supervisorMonitorTimer) {
 			clearTimeout(this.supervisorMonitorTimer);
 			this.supervisorMonitorTimer = undefined;

@@ -11,6 +11,11 @@ import {
 	workerRosterEntryFromSummary,
 } from "../src/modes/daemon/agent-roster.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
+import {
+	DAEMON_DEFAULT_SERVER_CAPABILITIES,
+	DAEMON_PROTOCOL_INFO,
+	DAEMON_SCHEMA_REVISION,
+} from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import type { DaemonWorkerRosterOutbound } from "../src/modes/daemon/daemon-worker-protocol.js";
@@ -489,7 +494,14 @@ interface WorkerFixture {
 		rootSessionId?: string;
 		sessionFile?: string;
 	};
-	client?: { request: ReturnType<typeof vi.fn> };
+	client?: {
+		hello: {
+			protocol: typeof DAEMON_PROTOCOL_INFO;
+			schemaRevision: number;
+			serverCapabilities: typeof DAEMON_DEFAULT_SERVER_CAPABILITIES;
+		};
+		request: ReturnType<typeof vi.fn>;
+	};
 	summaries: Map<string, SessionSummary>;
 	intentionalStop: boolean;
 	snapshotCache: Map<string, unknown>;
@@ -501,7 +513,14 @@ interface WorkerFixture {
 function makeWorker(workerId: string, overrides: Partial<WorkerFixture> = {}): WorkerFixture {
 	return {
 		descriptor: { workerId, pid: 1234, rootActiveSessionId: `${workerId}-root-active`, lifecycle: "ready" },
-		client: { request: vi.fn() },
+		client: {
+			hello: {
+				protocol: DAEMON_PROTOCOL_INFO,
+				schemaRevision: DAEMON_SCHEMA_REVISION,
+				serverCapabilities: DAEMON_DEFAULT_SERVER_CAPABILITIES,
+			},
+			request: vi.fn(),
+		},
 		summaries: new Map(),
 		intentionalStop: false,
 		snapshotCache: new Map(),
@@ -539,6 +558,10 @@ function makeSupervisor(workers: WorkerFixture[], extra: Record<string, unknown>
 		clients: new Set(),
 		defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
 		catalog: { list: vi.fn(async () => []) },
+		pendingRosterChanged: new Set(),
+		publishedRosterIds: new Set(),
+		pendingRosterRemoved: new Set(),
+		rosterPushScheduled: false,
 		refreshWorkerSummaries: vi.fn(async () => {}),
 		persistWorker: vi.fn(),
 		invalidateWorkerSessionInputPauses: vi.fn(),
@@ -1041,6 +1064,11 @@ describe("saved-session delete paths", () => {
 		const reachableRoster = makeWorker("w-roster");
 		Object.assign(reachableRoster.descriptor, { createCommand: { type: "create" } });
 		reachableRoster.client = {
+			hello: {
+				protocol: DAEMON_PROTOCOL_INFO,
+				schemaRevision: DAEMON_SCHEMA_REVISION,
+				serverCapabilities: DAEMON_DEFAULT_SERVER_CAPABILITIES,
+			},
 			request: vi.fn(async () => ({ type: "response", command: "delete_saved_session", success: true })),
 		};
 		const unreachable = makeWorker("w-down");
@@ -1113,6 +1141,11 @@ describe("saved-session delete paths", () => {
 			createCommand: { type: "create" },
 		});
 		owned.client = {
+			hello: {
+				protocol: DAEMON_PROTOCOL_INFO,
+				schemaRevision: DAEMON_SCHEMA_REVISION,
+				serverCapabilities: DAEMON_DEFAULT_SERVER_CAPABILITIES,
+			},
 			request: vi.fn(async () => ({ type: "response", command: "delete_saved_session", success: true })),
 		};
 		const catalogDelete = vi.fn(async () => ({ ok: true, method: "unlink" }));
@@ -1370,6 +1403,11 @@ describe("review-round regressions", () => {
 		supervisor.writeRosterEntry(childEntry, worker);
 		const root = summary({ id: "worker-1-root-active", sessionId: "root", activeSessionId: "worker-1-root-active" });
 		worker.client = {
+			hello: {
+				protocol: DAEMON_PROTOCOL_INFO,
+				schemaRevision: DAEMON_SCHEMA_REVISION,
+				serverCapabilities: DAEMON_DEFAULT_SERVER_CAPABILITIES,
+			},
 			request: vi.fn(async () => ({
 				type: "response",
 				command: "list",

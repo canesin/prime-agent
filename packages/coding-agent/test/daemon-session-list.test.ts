@@ -5,6 +5,7 @@ import type { RlmChildAgentSnapshot } from "../src/core/agent-session.js";
 import type { AgentCronJob } from "../src/core/cron-jobs.js";
 import type { SessionInfo } from "../src/core/session-manager.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
+import { passivatedWorkerRosterEntry, workerRosterEntryFromSummary } from "../src/modes/daemon/agent-roster.js";
 import {
 	buildRlmChildSnapshots,
 	buildSessionList,
@@ -57,6 +58,20 @@ describe("buildSessionList", () => {
 		]);
 	});
 
+	it("counts direct peers separately so the supervisor can add them to its own attachment count", () => {
+		const state = makeState({ activeSessionId: "direct", sessionFile: "/tmp/direct.jsonl" });
+		state.clients.add({ id: "supervisor", authenticationRole: "supervisor" } as unknown as DaemonSocketClient);
+		state.clients.add({ id: "peer", authenticationRole: "session_client" } as unknown as DaemonSocketClient);
+
+		const [summary] = buildSessionList([state], []);
+
+		expect(summary).toMatchObject({ attachedClients: 2, directAttachedClients: 1 });
+		// Passivated roster rows describe a session without a runtime; the live-only count must not survive.
+		expect(
+			passivatedWorkerRosterEntry(workerRosterEntryFromSummary(summary!)).summary.directAttachedClients,
+		).toBeUndefined();
+	});
+
 	it("uses the stable session header time for active rows without a saved catalog entry", () => {
 		const state = makeState({ activeSessionId: "active", sessionFile: "/tmp/active.jsonl" });
 		const first = summaryForActiveSession(state);
@@ -64,6 +79,35 @@ describe("buildSessionList", () => {
 		expect(first.created).toBe("2026-05-01T00:00:00.000Z");
 		expect(first.lastActivityAt).toBe("2026-05-01T00:00:00.000Z");
 		expect(second.created).toBe(first.created);
+	});
+
+	it("exposes the durable conditional follow-up receipt in the goal fence", () => {
+		const summary = summaryForActiveSession(
+			makeState({
+				activeSessionId: "active-follow-up",
+				goalState: {
+					active: true,
+					status: "active",
+					goalId: "goal-1",
+					objective: "finish kene",
+					tokensUsed: 0,
+					timeUsedSeconds: 0,
+					continuationsUsed: 0,
+					updatedAt: 7,
+					followUpDispatchReceiptId: "follow-up-1",
+					followUpDispatchPhase: "receipt",
+				},
+			}),
+		);
+
+		expect(summary.goal).toEqual({
+			active: true,
+			status: "active",
+			goalId: "goal-1",
+			updatedAt: 7,
+			followUpDispatchReceiptId: "follow-up-1",
+			followUpDispatchPhase: "receipt",
+		});
 	});
 
 	it("takes last activity from custom messages and tool results", () => {

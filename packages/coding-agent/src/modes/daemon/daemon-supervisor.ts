@@ -59,6 +59,7 @@ import { createActiveSessionId, type DaemonSocketClient } from "./active-session
 import {
 	AgentRoster,
 	type AgentRosterEntry,
+	type AgentRosterMutation,
 	passivatedWorkerRosterEntry,
 	rosterAgentIdForSummary,
 	sessionSummaryFromRosterEntry,
@@ -68,6 +69,7 @@ import {
 import { CommandRecoveryJournal, createCommandIdempotencyKey } from "./command-recovery-journal.js";
 import { CompactAssistantStreamReconstructor, isCompactAssistantDelta } from "./compact-session-stream.js";
 import { DAEMON_CATALOG_ROLE_ENV, DaemonCatalogClient } from "./daemon-catalog-process.js";
+import { DaemonCapabilityUnavailableError } from "./daemon-client.js";
 import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
 import {
 	collectDaemonClientEnv,
@@ -85,11 +87,15 @@ import {
 	type DaemonClosingReason,
 	type DaemonCommand,
 	type DaemonOutbound,
+	type DaemonPeerTransportTicket,
 	type DaemonResponse,
+	type DaemonServerCapability,
 	type DaemonUpdateRestartManifest,
 	failure,
+	getDaemonCommandCompatibilities,
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
+	meetsDaemonCommandCompatibility,
 	salvageDaemonCommandId,
 	success,
 	UPDATE_RESTART_DRAIN_COMMANDS,
@@ -123,6 +129,8 @@ import {
 import { DaemonWorkerClient } from "./daemon-worker-client.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
+	DAEMON_WORKER_INSTANCE_ID_ENV,
+	DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
 	DAEMON_WORKER_ROLE_ENV,
 	DAEMON_WORKER_ROSTER_CAPABILITY,
@@ -159,6 +167,12 @@ const structuredLog = getLogger("coding-agent.daemon-supervisor");
 const WORKER_CONNECT_TIMEOUT_MS = 30_000;
 const ROSTER_WATCHDOG_INTERVAL_MS = 15_000;
 const ROSTER_STALE_AFTER_MS = 3 * ROSTER_HEARTBEAT_INTERVAL_MS;
+const SUPERVISOR_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
+	...DAEMON_DEFAULT_SERVER_CAPABILITIES,
+	"agent_roster",
+	"direct_peer_transport",
+];
+const PEER_TRANSPORT_GRANT_TTL_MS = 10_000;
 const WORKER_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const INPUT_PAUSE_CLEANUP_TIMEOUT_MS = 5_000;
 const UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS = 80_000;
@@ -189,6 +203,9 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"ack_result",
 	"list",
 	"list_agent_peers",
+	"get_direct_worker_transport",
+	"roster_subscribe",
+	"roster_unsubscribe",
 	"list_saved_sessions",
 	"create",
 	"attach",
@@ -315,6 +332,8 @@ interface ResidentWorker {
 	updateRestartPrepareClient?: DaemonWorkerClient;
 	lastFrameAt?: number;
 	rosterStale?: boolean;
+	/** worker_auth advertised peer-transport support; absent on workers from older builds. */
+	peerTransportCapable?: boolean;
 	/** In-flight replacement connection during authentication; an allowed frame source alongside client. */
 	pendingClient?: DaemonWorkerClient;
 	/** Bumped per applied roster frame; a summaries pull that straddles a frame must not gap-fill. */
@@ -490,6 +509,7 @@ function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is 
 		(descriptor.ownerClientId === undefined || typeof descriptor.ownerClientId === "string") &&
 		typeof descriptor.socketPath === "string" &&
 		typeof descriptor.authenticationToken === "string" &&
+		(descriptor.workerInstanceId === undefined || typeof descriptor.workerInstanceId === "string") &&
 		typeof descriptor.rootActiveSessionId === "string" &&
 		typeof descriptor.createdAt === "string" &&
 		typeof descriptor.updatedAt === "string" &&
@@ -506,6 +526,12 @@ function workerAuthAdvertisesRoster(data: unknown): boolean {
 	if (typeof data !== "object" || data === null) return false;
 	const capabilities = (data as { capabilities?: unknown }).capabilities;
 	return Array.isArray(capabilities) && capabilities.includes(DAEMON_WORKER_ROSTER_CAPABILITY);
+}
+
+function workerAuthAdvertisesPeerTransport(data: unknown): boolean {
+	if (typeof data !== "object" || data === null) return false;
+	const capabilities = (data as { capabilities?: unknown }).capabilities;
+	return Array.isArray(capabilities) && capabilities.includes(DAEMON_WORKER_PEER_TRANSPORT_CAPABILITY);
 }
 
 function sessionSummariesFromResponse(response: DaemonResponse): SessionSummary[] {
@@ -649,6 +675,11 @@ export class DaemonSupervisor {
 	private readonly catalog: DaemonCatalogClient;
 	private readonly settingsManager: SettingsManager;
 	private rosterStore?: AgentRoster;
+	private readonly pendingRosterChanged = new Set<string>();
+	private readonly pendingRosterRemoved = new Set<string>();
+	/** Ids declared to subscribers: gates removals to once and keeps owned-only row ids private. */
+	private readonly publishedRosterIds = new Set<string>();
+	private rosterPushScheduled = false;
 	private rosterWatchdogTimer?: ReturnType<typeof setInterval>;
 	private rlmSpawnLedgerInstance?: RlmSpawnLedger;
 	private idleEvictionTimer?: ReturnType<typeof setTimeout>;
@@ -829,9 +860,7 @@ export class DaemonSupervisor {
 					const activeSessionId = summary.activeSessionId ?? summary.id;
 					return {
 						isSessionActive: isSessionSummaryBusy(summary),
-						attachedClients: [...this.clients].filter((client) =>
-							client.attachedActiveSessionIds.has(activeSessionId),
-						).length,
+						attachedClients: this.attachedClientCount(summary, activeSessionId),
 						hasRegisteredHeartbeat: summary.hasRegisteredHeartbeat === true,
 						hasRegisteredCronJob: summary.hasRegisteredCronJob === true,
 						lastActivityAt: Date.parse(summary.lastActivityAt ?? ""),
@@ -1174,7 +1203,7 @@ export class DaemonSupervisor {
 						supervisorProcessStartId: this.ownership?.record.processStartId,
 						supervisorSocketPath: this.ownership?.record.socketPath,
 						clientId: client.id,
-						serverCapabilities: DAEMON_DEFAULT_SERVER_CAPABILITIES,
+						serverCapabilities: SUPERVISOR_SERVER_CAPABILITIES,
 					});
 				}
 			},
@@ -1207,6 +1236,11 @@ export class DaemonSupervisor {
 		socket.on("error", cleanup);
 		socket.on("drain", () => {
 			client.backpressured = false;
+			if (client.rosterResyncPending && client.rosterSubscribed === true) {
+				// socket.write queues even when it reports backpressure: one resync per loss gap.
+				client.rosterResyncPending = false;
+				this.write(client, { type: "roster_update", changed: this.rosterEntriesForClient(), resync: true });
+			}
 			if (!client.snapshotStreaming) {
 				void this.catchUpClient(client).catch((error) =>
 					this.log(`Failed to catch up client ${client.id}: ${String(error)}`),
@@ -1627,6 +1661,13 @@ export class DaemonSupervisor {
 				return undefined;
 			case "list":
 				return this.handleList(client, command);
+			case "roster_subscribe":
+				client.rosterSubscribed = true;
+				return success(command.id, command.type, { roster: this.rosterEntriesForClient() });
+			case "roster_unsubscribe":
+				client.rosterSubscribed = false;
+				client.rosterResyncPending = false;
+				return success(command.id, command.type);
 			case "list_agent_peers": {
 				const requester = [...this.workers.values()].find(
 					(worker) => worker.descriptor.authenticationToken === command.workerToken,
@@ -1645,6 +1686,14 @@ export class DaemonSupervisor {
 						return root ? [this.agentPeerSummary(sessionSummaryFromRosterEntry(root))] : [];
 					});
 				return success(command.id, command.type, { peers });
+			}
+			case "get_direct_worker_transport": {
+				const match = await this.findWorkerForClient(client, command.activeSessionId);
+				if (match.worker.descriptor.ownerClientId !== undefined) {
+					throw new Error("Direct transport is unavailable for client-owned workers");
+				}
+				const ticket = await this.issuePeerTransport(match.worker, match.summary);
+				return success(command.id, command.type, ticket);
 			}
 			case "list_saved_sessions":
 				return this.handleSavedSessionList(client, command);
@@ -2653,6 +2702,9 @@ export class DaemonSupervisor {
 			throw error;
 		}
 		worker.promotedOwnerClientId = clientId;
+		for (const entry of this.workerRosterEntries(worker)) {
+			this.roster().amend(entry.agentId, {});
+		}
 		if (worker.ownerCleanupTimer) {
 			clearTimeout(worker.ownerCleanupTimer);
 			worker.ownerCleanupTimer = undefined;
@@ -2689,6 +2741,8 @@ export class DaemonSupervisor {
 		const rootActiveSessionId = existing?.descriptor.rootActiveSessionId ?? createActiveSessionId();
 		const socketPath = existing?.descriptor.socketPath ?? workerSocketPath(this.socketPath, workerId);
 		const token = existing?.descriptor.authenticationToken ?? randomBytes(32).toString("base64url");
+		// Fresh per incarnation: peer transport grants must never survive a worker restart.
+		const workerInstanceId = randomUUID();
 		const now = new Date().toISOString();
 		const descriptorPath = existing?.descriptorPath ?? join(this.descriptorDir, `${workerId}.json`);
 		const recoveryJournalPath =
@@ -2701,6 +2755,7 @@ export class DaemonSupervisor {
 			...launchEnv,
 			[DAEMON_WORKER_ROLE_ENV]: "1",
 			[DAEMON_WORKER_TOKEN_ENV]: token,
+			[DAEMON_WORKER_INSTANCE_ID_ENV]: workerInstanceId,
 			[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV]: rootActiveSessionId,
 			[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV]: this.socketPath,
 			[DAEMON_WORKER_RECOVERY_JOURNAL_ENV]: recoveryJournalPath,
@@ -2771,6 +2826,7 @@ export class DaemonSupervisor {
 				orphanProcessJournalPath,
 				supervisorSocketPath: this.socketPath,
 				authenticationToken: token,
+				workerInstanceId,
 				rootActiveSessionId,
 				ownerClientId: existing?.descriptor.ownerClientId ?? ownerClientId,
 				sessionDir: createCommand.config?.sessionDir,
@@ -2942,13 +2998,19 @@ export class DaemonSupervisor {
 				try {
 					const authResponse = await client.authenticateWorker(
 						worker.descriptor.authenticationToken,
-						this.supervisorAuthenticationClaim(),
+						{
+							...this.supervisorAuthenticationClaim(),
+							...(worker.descriptor.workerInstanceId !== undefined
+								? { workerInstanceId: worker.descriptor.workerInstanceId }
+								: {}),
+						},
 						1000,
 					);
 					await this.assertRecoveryAllowed();
 					if (!workerAuthAdvertisesRoster(authResponse.data)) {
 						throw new PreRosterWorkerError("Session worker predates the roster protocol and must be restarted");
 					}
+					worker.peerTransportCapable = workerAuthAdvertisesPeerTransport(authResponse.data);
 					worker.lastFrameAt = Date.now();
 					worker.client?.close();
 					worker.client = client;
@@ -3683,8 +3745,72 @@ export class DaemonSupervisor {
 	}
 
 	private roster(): AgentRoster {
-		this.rosterStore ??= new AgentRoster(canonicalSessionPath);
+		this.rosterStore ??= new AgentRoster(canonicalSessionPath, (mutation) => this.onRosterMutation(mutation));
 		return this.rosterStore;
+	}
+
+	private onRosterMutation(mutation: AgentRosterMutation): void {
+		if (mutation.type === "delete") {
+			this.pendingRosterChanged.delete(mutation.agentId);
+			this.pendingRosterRemoved.add(mutation.agentId);
+		} else {
+			this.pendingRosterRemoved.delete(mutation.agentId);
+			this.pendingRosterChanged.add(mutation.agentId);
+		}
+		this.scheduleRosterPush();
+	}
+
+	private scheduleRosterPush(): void {
+		if (this.rosterPushScheduled || this.shuttingDown) return;
+		this.rosterPushScheduled = true;
+		setImmediate(() => {
+			this.rosterPushScheduled = false;
+			this.flushRosterUpdates();
+		});
+	}
+
+	private flushRosterUpdates(): void {
+		const changed: AgentRosterEntry[] = [];
+		const removed: string[] = [];
+		for (const agentId of this.pendingRosterRemoved) {
+			if (this.publishedRosterIds.delete(agentId)) removed.push(agentId);
+		}
+		for (const agentId of this.pendingRosterChanged) {
+			const entry = this.roster().get(agentId);
+			if (!entry) continue;
+			if (this.isRosterEntryVisibleToClients(entry)) {
+				changed.push(entry);
+				this.publishedRosterIds.add(agentId);
+			} else if (this.publishedRosterIds.delete(agentId)) {
+				removed.push(agentId);
+			}
+		}
+		this.pendingRosterChanged.clear();
+		this.pendingRosterRemoved.clear();
+		if (changed.length === 0 && removed.length === 0) return;
+		for (const client of this.clients) {
+			if (client.rosterSubscribed !== true) continue;
+			if (client.backpressured === true) {
+				client.rosterResyncPending = true;
+				continue;
+			}
+			this.write(client, {
+				type: "roster_update",
+				changed,
+				...(removed.length > 0 ? { removed } : {}),
+			});
+		}
+	}
+
+	private rosterEntriesForClient(): AgentRosterEntry[] {
+		const entries = [...this.roster().values()].filter((entry) => this.isRosterEntryVisibleToClients(entry));
+		for (const entry of entries) this.publishedRosterIds.add(entry.agentId);
+		return entries;
+	}
+
+	private isRosterEntryVisibleToClients(entry: AgentRosterEntry): boolean {
+		const worker = entry.workerId !== undefined ? this.workers.get(entry.workerId) : undefined;
+		return worker === undefined || this.isVisibleWorker(worker);
 	}
 
 	private writeRosterEntry(
@@ -3720,7 +3846,10 @@ export class DaemonSupervisor {
 				const entry = this.rosterEntryForSpawnLedgerEdge(edge);
 				if (this.roster().has(entry.agentId)) continue;
 				if (this.roster().hasSessionFile(canonicalSessionPath(edge.child))) continue;
-				this.roster().write({ ...entry, seededCwd: true });
+				const info = await readSessionInfo(edge.child).catch(() => undefined);
+				this.roster().write(
+					info ? { ...entry, summary: { ...entry.summary, cwd: info.cwd } } : { ...entry, seededCwd: true },
+				);
 			}
 		} catch (error) {
 			this.log(`Could not seed the agent roster from the spawn ledger: ${String(error)}`);
@@ -3841,27 +3970,16 @@ export class DaemonSupervisor {
 				edgesFailed = true;
 				return [] as RlmLedgerEdge[];
 			});
-		if (!this.isWorkerRosterApplyCurrent(worker, source ?? worker.client ?? worker.pendingClient)) return;
-		// Unreadable edges: skip the absentee sweep (it cannot tell registry children from stale rows) and repair by pull.
+		const applySource = source ?? worker.client ?? worker.pendingClient;
+		if (!this.isWorkerRosterApplyCurrent(worker, applySource)) return;
 		const sent = new Set(delta.entries.map((entry) => entry.agentId));
+		const removed = new Set(delta.removedAgentIds ?? []);
 		const unclaimed = new Map<string, AgentRosterEntry>();
 		if (!edgesFailed) {
 			for (const entry of this.workerRosterEntries(worker)) {
 				if (sent.has(entry.agentId)) continue;
 				unclaimed.set(entry.agentId, entry);
-				this.roster().delete(entry.agentId);
 			}
-		}
-		for (const entry of delta.entries) {
-			this.writeRosterEntry(entry, worker);
-			this.syncRootDescriptorFromRosterEntry(worker, entry);
-		}
-		for (const agentId of delta.removedAgentIds ?? []) {
-			this.roster().delete(agentId);
-		}
-		if (edgesFailed) {
-			this.scheduleRosterRepairPull(worker);
-			return;
 		}
 		// A reseed keeps the previous claim and hydrated summary; a synthetic seed would drop
 		// lastActivityAt (pinning canEvictWorker on NaN) and flap the claim off on every snapshot.
@@ -3883,8 +4001,43 @@ export class DaemonSupervisor {
 			}
 			return current;
 		};
-		for (const edge of edges) {
-			if (rootPath === undefined || familyRoot(canonicalSessionPath(edge.child)) !== rootPath) continue;
+		const familyEdges = edges.filter(
+			(edge) => rootPath !== undefined && familyRoot(canonicalSessionPath(edge.child)) === rootPath,
+		);
+		const seedInfo = new Map<string, SessionInfo | null | undefined>();
+		for (const edge of familyEdges) {
+			const entry = this.rosterEntryForSpawnLedgerEdge(edge);
+			const childPath = canonicalSessionPath(edge.child);
+			const currentById = this.roster().get(entry.agentId);
+			const currentByFile = this.roster().bySessionFile(childPath);
+			const currentIdSurvives =
+				currentById !== undefined && !unclaimed.has(currentById.agentId) && !removed.has(currentById.agentId);
+			const currentFileSurvives =
+				currentByFile !== undefined && !unclaimed.has(currentByFile.agentId) && !removed.has(currentByFile.agentId);
+			if (
+				unclaimed.has(entry.agentId) ||
+				(sent.has(entry.agentId) && !removed.has(entry.agentId)) ||
+				currentIdSurvives ||
+				currentFileSurvives
+			) {
+				continue;
+			}
+			seedInfo.set(entry.agentId, await readSessionInfo(edge.child).catch(() => undefined));
+			if (!this.isWorkerRosterApplyCurrent(worker, applySource)) return;
+		}
+
+		// Unreadable edges skip the absentee sweep: it cannot tell registry children from stale rows.
+		for (const entry of unclaimed.values()) this.roster().delete(entry.agentId);
+		for (const entry of delta.entries) {
+			this.writeRosterEntry(entry, worker);
+			this.syncRootDescriptorFromRosterEntry(worker, entry);
+		}
+		for (const agentId of removed) this.roster().delete(agentId);
+		if (edgesFailed) {
+			this.scheduleRosterRepairPull(worker);
+			return;
+		}
+		for (const edge of familyEdges) {
 			const entry = this.rosterEntryForSpawnLedgerEdge(edge);
 			if (this.roster().has(entry.agentId)) continue;
 			if (this.roster().hasSessionFile(canonicalSessionPath(edge.child))) continue;
@@ -3894,7 +4047,10 @@ export class DaemonSupervisor {
 				this.writeRosterEntry(rest, worker);
 				continue;
 			}
-			this.roster().write({ ...entry, seededCwd: true });
+			const info = seedInfo.get(entry.agentId);
+			this.roster().write(
+				info ? { ...entry, summary: { ...entry.summary, cwd: info.cwd } } : { ...entry, seededCwd: true },
+			);
 		}
 	}
 
@@ -3930,8 +4086,7 @@ export class DaemonSupervisor {
 	private markWorkerRosterEntries(worker: ResidentWorker, statusLabel: "recovering" | "failed" | undefined): void {
 		for (const entry of this.workerRosterEntries(worker)) {
 			if (!entry.queuedChild && entry.summary.activeSessionId === undefined) continue;
-			if (statusLabel === undefined) delete entry.statusLabel;
-			else entry.statusLabel = statusLabel;
+			this.roster().amend(entry.agentId, { statusLabel });
 		}
 	}
 
@@ -3955,7 +4110,8 @@ export class DaemonSupervisor {
 			if (now - worker.lastFrameAt > ROSTER_STALE_AFTER_MS) {
 				const lastHeardFromAt = new Date(worker.lastFrameAt).toISOString();
 				for (const entry of this.workerRosterEntries(worker)) {
-					entry.lastHeardFromAt = lastHeardFromAt;
+					// write() rebuilds rows without the mark; the sweep owns it and restamps only those.
+					if (entry.lastHeardFromAt !== lastHeardFromAt) this.roster().amend(entry.agentId, { lastHeardFromAt });
 				}
 				worker.rosterStale = true;
 			} else if (worker.rosterStale) {
@@ -3968,7 +4124,7 @@ export class DaemonSupervisor {
 		if (!worker.rosterStale) return;
 		worker.rosterStale = false;
 		for (const entry of this.workerRosterEntries(worker)) {
-			delete entry.lastHeardFromAt;
+			this.roster().amend(entry.agentId, { lastHeardFromAt: undefined });
 		}
 	}
 
@@ -4049,11 +4205,12 @@ export class DaemonSupervisor {
 		assertAgentSessionNameAvailable(
 			siblings.map((info) => {
 				const summary = summaryForInactiveSession(info);
+				const ledgerRow = this.roster().bySessionFile(canonicalSessionPath(info.path));
 				return {
 					id: summary.sessionId,
 					...(summary.sessionName ? { name: summary.sessionName } : {}),
 					depth: setDepth,
-					status: classifySessionRosterStatus(summary),
+					status: ledgerRow?.status ?? classifySessionRosterStatus(summary),
 					...(summary.parentSessionPath
 						? { parentSessionPath: canonicalSessionPath(summary.parentSessionPath) }
 						: {}),
@@ -4107,13 +4264,79 @@ export class DaemonSupervisor {
 		return worker.client;
 	}
 
+	private async issuePeerTransport(
+		worker: ResidentWorker,
+		summary: SessionSummary,
+	): Promise<DaemonPeerTransportTicket> {
+		await this.assertCurrentOwnership();
+		if (!worker.peerTransportCapable) {
+			throw new Error("Session worker does not support direct peer transport");
+		}
+		await this.refreshWorkerSummaries(worker);
+		const workerClient = this.requireAvailableWorkerClient(worker);
+		const activeSessionId = summary.activeSessionId ?? summary.id;
+		const currentSummary = this.findSummaryInWorker(worker, activeSessionId);
+		if (!currentSummary) {
+			throw new Error("Direct transport target changed during admission");
+		}
+		const workerInstanceId = worker.descriptor.workerInstanceId;
+		const workerProcessStartId = worker.descriptor.processStartId;
+		if (!workerInstanceId || !workerProcessStartId) {
+			throw new Error("Direct transport requires an exact worker process identity");
+		}
+		if (this.processIdentity(worker.descriptor.pid, workerProcessStartId) !== "current") {
+			throw new Error("Direct transport worker process identity is not current");
+		}
+		let socketIdentity: DaemonSocketIdentity | undefined;
+		try {
+			socketIdentity = getDaemonSocketIdentity(worker.descriptor.socketPath);
+		} catch {
+			socketIdentity = undefined;
+		}
+		if (!socketIdentity) {
+			throw new Error("Direct transport requires an exact worker socket identity");
+		}
+		const grantId = randomUUID();
+		const token = randomBytes(32).toString("base64url");
+		const expiresAt = new Date(Date.now() + PEER_TRANSPORT_GRANT_TTL_MS).toISOString();
+		const resolvedActiveSessionId = currentSummary.activeSessionId ?? currentSummary.id;
+		const registration = await workerClient.requestWorker(
+			{
+				type: "worker_register_peer_transport",
+				grant: {
+					grantId,
+					token,
+					expiresAt,
+					purpose: "session_client",
+					workerInstanceId,
+					activeSessionId: resolvedActiveSessionId,
+					issuerGeneration: this.generation,
+				},
+			},
+			3000,
+		);
+		if (!registration.success) {
+			throw deserializeDaemonError(registration);
+		}
+		return {
+			purpose: "session_client",
+			socketPath: worker.descriptor.socketPath,
+			socketIdentity,
+			workerInstanceId,
+			activeSessionId: resolvedActiveSessionId,
+			grantId,
+			token,
+			expiresAt,
+		};
+	}
+
 	private familyCatalogEntry(summary: SessionSummary): AgentFamilyCatalogEntry {
 		const depth = summary.rlmDepth ?? (summary.parentSessionPath ? 1 : 0);
 		return {
 			id: summary.sessionId,
 			...(summary.sessionName ? { name: summary.sessionName } : {}),
 			depth,
-			status: classifySessionRosterStatus(summary),
+			status: summary.rosterStatus ?? classifySessionRosterStatus(summary),
 			...(depth > 0 && summary.parentSessionId ? { parentSessionId: summary.parentSessionId } : {}),
 			...(depth > 0 && summary.parentSessionPath
 				? { parentSessionPath: canonicalSessionPath(summary.parentSessionPath) }
@@ -4140,17 +4363,23 @@ export class DaemonSupervisor {
 			...(summary.parentSessionPath ? { parentSessionPath: summary.parentSessionPath } : {}),
 			...(summary.sessionFile ? { sessionPath: summary.sessionFile } : {}),
 			...(summary.rlmDepth !== undefined ? { rlmDepth: summary.rlmDepth } : {}),
-			status: classifySessionRosterStatus(summary),
+			status: summary.rosterStatus ?? classifySessionRosterStatus(summary),
 			...(summary.rlmChildId ? { rlmChildId: summary.rlmChildId } : {}),
 		};
+	}
+
+	private attachedClientCount(summary: SessionSummary, activeSessionId: string): number {
+		return (
+			(summary.directAttachedClients ?? 0) +
+			[...this.clients].filter((client) => client.attachedActiveSessionIds.has(activeSessionId)).length
+		);
 	}
 
 	private publicSummary(worker: ResidentWorker, summary: SessionSummary): SessionSummary {
 		const activeSessionId = summary.activeSessionId ?? summary.id;
 		return {
 			...summary,
-			attachedClients: [...this.clients].filter((client) => client.attachedActiveSessionIds.has(activeSessionId))
-				.length,
+			attachedClients: this.attachedClientCount(summary, activeSessionId),
 			workerState: this.effectiveWorkerState(worker),
 			workerPid: worker.descriptor.pid,
 		};
@@ -4275,6 +4504,13 @@ export class DaemonSupervisor {
 		timeoutMs = WORKER_REQUEST_TIMEOUT_MS,
 	): Promise<DaemonResponse> {
 		const client = this.requireAvailableWorkerClient(worker, command.type === "kill");
+		const workerHello = client.hello;
+		const missingCompatibility = getDaemonCommandCompatibilities(command).find(
+			(compatibility) => workerHello === undefined || !meetsDaemonCommandCompatibility(workerHello, compatibility),
+		);
+		if (missingCompatibility) {
+			throw new DaemonCapabilityUnavailableError(command.type, missingCompatibility.capability);
+		}
 		const response = await client.request(withoutCommandId(command), timeoutMs);
 		if (command.type === "get_state" && response.success && isSessionSummary(response.data)) {
 			return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };

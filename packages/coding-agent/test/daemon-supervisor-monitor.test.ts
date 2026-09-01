@@ -14,8 +14,12 @@ import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
 import {
 	createDaemonCommandEnvelope,
+	DAEMON_DEFAULT_SERVER_CAPABILITIES,
+	DAEMON_PROTOCOL_INFO,
 	DAEMON_UPDATE_RESTART_FORMAT_VERSION,
 	type DaemonAttachResult,
+	type DaemonCommand,
+	type DaemonServerCapability,
 	success,
 } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
@@ -241,6 +245,10 @@ function createSupervisorSnapshotState() {
 		clients: new Set<object>(),
 		sessionInputPauses: new Map(),
 		pendingReplacementSnapshots: new WeakMap<object, Map<string, unknown>>(),
+		pendingRosterChanged: new Set<string>(),
+		publishedRosterIds: new Set<string>(),
+		pendingRosterRemoved: new Set<string>(),
+		rosterPushScheduled: false,
 	};
 }
 
@@ -351,6 +359,7 @@ describe("daemon worker supervisor monitoring", () => {
 			internals.handleConnection(socket);
 			const client = [...internals.clients][0]!;
 			client.authenticated = true;
+			client.authenticationRole = "supervisor";
 			internals.supervisorClaims.set(client, {
 				claim: {},
 				ownerFingerprint: "old",
@@ -438,6 +447,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
 			options: { worker: { authenticationToken: "token" } },
 			supervisorClaims: new Map([[client, oldClaim]]),
+			peerClaims: new Map(),
 			updateRestart: transaction,
 			handleWorkerCommand: vi.fn(async () => undefined),
 			assertSupervisorClaimCurrent: vi.fn(async () => {
@@ -479,6 +489,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
 			options: { worker: { authenticationToken: "token" } },
 			supervisorClaims: new Map(),
+			peerClaims: new Map(),
 			clients: new Set(),
 			sessions: new Map(),
 			cronStore: { list: () => [] },
@@ -4036,5 +4047,84 @@ describe("daemon worker supervisor monitoring", () => {
 
 		await expect(supervisor.prepareUpdateRestartFenced()).rejects.toThrow(/resident-1.*recovering.*disconnected/);
 		expect(requestWorker).not.toHaveBeenCalled();
+	});
+
+	it("fences commands against the connected worker hello during mixed-version adoption", async () => {
+		const request = vi.fn(async (command: unknown) => success("worker-response", "cron_add", command));
+		const workerHello: {
+			protocol: typeof DAEMON_PROTOCOL_INFO;
+			schemaRevision: number;
+			serverCapabilities: readonly DaemonServerCapability[];
+		} = {
+			protocol: DAEMON_PROTOCOL_INFO,
+			schemaRevision: 25,
+			serverCapabilities: DAEMON_DEFAULT_SERVER_CAPABILITIES.filter(
+				(capability) => capability !== "conditional_cron_delivery" && capability !== "conditional_cron_follow_up",
+			),
+		};
+		const workerClient = {
+			hello: workerHello,
+			request,
+		};
+		const worker = { client: workerClient };
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			requireAvailableWorkerClient: vi.fn(() => workerClient),
+		}) as {
+			forwardToWorker(worker: unknown, command: DaemonCommand): Promise<unknown>;
+		};
+		const deliveryFence = {
+			version: 1 as const,
+			activeSessionId: "active-1",
+			sessionName: "leblon",
+			cwd: "/tmp/leblon",
+			model: { provider: "anthropic", id: "claude-sonnet-4-5" },
+			thinkingLevel: "high",
+			messageCount: 4,
+			lastActivityAt: "2026-09-01T12:00:00.000Z",
+			taskState: "needs_input" as const,
+			goal: { active: true as const, status: "active" as const, goalId: "goal-1", updatedAt: 1 },
+		};
+
+		await expect(
+			supervisor.forwardToWorker(worker, {
+				id: "follow-up",
+				type: "cron_add",
+				activeSessionId: "active-1",
+				schedule: "in 1m",
+				prompt: "Continue the active goal.",
+				deliveryFence,
+				deliveryMode: "follow_up",
+			}),
+		).rejects.toThrow("conditional_cron_delivery");
+		expect(request).not.toHaveBeenCalled();
+
+		workerHello.schemaRevision = 27;
+		workerHello.serverCapabilities = DAEMON_DEFAULT_SERVER_CAPABILITIES.filter(
+			(capability) => capability !== "conditional_cron_follow_up",
+		);
+		await expect(
+			supervisor.forwardToWorker(worker, {
+				id: "partial-upgrade-follow-up",
+				type: "cron_add",
+				activeSessionId: "active-1",
+				schedule: "in 1m",
+				prompt: "Continue the active goal.",
+				deliveryFence,
+				deliveryMode: "follow_up",
+			}),
+		).rejects.toThrow("conditional_cron_follow_up");
+		expect(request).not.toHaveBeenCalled();
+
+		await expect(
+			supervisor.forwardToWorker(worker, {
+				id: "legacy-conditional",
+				type: "cron_add",
+				activeSessionId: "active-1",
+				schedule: "in 1m",
+				prompt: "/goal Continue the terminal goal.",
+				deliveryFence,
+			}),
+		).resolves.toMatchObject({ success: true, id: "legacy-conditional" });
+		expect(request).toHaveBeenCalledOnce();
 	});
 });

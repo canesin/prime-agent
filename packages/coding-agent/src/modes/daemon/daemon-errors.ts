@@ -1,6 +1,7 @@
 import { MissingSessionCwdError } from "../../core/session-cwd.js";
 import { SessionImportFileNotFoundError } from "../../core/session-import-errors.js";
 import { SessionAlreadyActiveError } from "../../core/session-lease.js";
+import { DaemonCapabilityUnavailableError } from "./daemon-client.js";
 import type { DaemonErrorInfo, DaemonResponse } from "./daemon-protocol.js";
 
 export class RlmChildRosterChangedError extends Error {
@@ -25,6 +26,13 @@ export function serializeDaemonError(error: unknown): DaemonErrorInfo | undefine
 			code: "session_already_active",
 			sessionPath: error.sessionPath,
 			activeSessionId: error.activeSessionId,
+		};
+	}
+	if (error instanceof DaemonCapabilityUnavailableError) {
+		return {
+			code: "daemon_capability_unavailable",
+			command: error.command,
+			...(error.capability === undefined ? {} : { capability: error.capability }),
 		};
 	}
 	if (error instanceof RlmChildRosterChangedError) {
@@ -61,6 +69,9 @@ export function deserializeDaemonError(response: Extract<DaemonResponse, { succe
 	}
 	if (errorInfo?.code === "session_already_active") {
 		return new SessionAlreadyActiveError(errorInfo.sessionPath, errorInfo.activeSessionId);
+	}
+	if (errorInfo?.code === "daemon_capability_unavailable") {
+		return new DaemonCapabilityUnavailableError(errorInfo.command, errorInfo.capability);
 	}
 	if (errorInfo?.code === "rlm_child_roster_changed") {
 		return new RlmChildRosterChangedError(errorInfo.expectedRosterToken, errorInfo.actualRosterToken);

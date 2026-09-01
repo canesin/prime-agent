@@ -358,6 +358,21 @@ describe("DaemonClient", () => {
 		client.close();
 	});
 
+	it("does not send direct transport discovery to a daemon without the capability", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, [], DAEMON_SCHEMA_REVISION);
+
+		await expect(
+			client.request({ type: "get_direct_worker_transport", activeSessionId: "active-1" }),
+		).rejects.toThrow("does not support direct_peer_transport");
+		expect(socket.writes).toEqual([]);
+		client.close();
+	});
+
 	it("keeps legacy cron requests compatible with a new daemon", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 		const connect = client.connect();

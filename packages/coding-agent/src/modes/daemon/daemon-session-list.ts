@@ -10,7 +10,8 @@ import type { SessionActionSnapshot } from "../../core/session-action-store.js";
 import type { AgentTaskState, SessionInfo } from "../../core/session-manager.js";
 import type { AgentConnectionRlmChildAgentSnapshot } from "../agent-connection/types.js";
 import type { ActiveSessionState } from "./active-session-state.js";
-import { isSessionSummaryBusy } from "./agent-roster.js";
+
+import { type AgentRosterStatus, isSessionSummaryBusy } from "./agent-roster.js";
 
 export { classifySessionRosterStatus, isSessionSummaryBusy } from "./agent-roster.js";
 
@@ -24,7 +25,14 @@ export type SessionLifecycle = "draft" | "live" | "archived";
 export type SessionActivity = "working" | "idle";
 export type SessionGoalFence = Pick<
 	GoalState,
-	"active" | "status" | "goalId" | "updatedAt" | "dispatchReceiptId" | "dispatchPhase"
+	| "active"
+	| "status"
+	| "goalId"
+	| "updatedAt"
+	| "dispatchReceiptId"
+	| "dispatchPhase"
+	| "followUpDispatchReceiptId"
+	| "followUpDispatchPhase"
 >;
 
 // Upper bound on the spawn-code source carried in a session summary. Generous
@@ -62,6 +70,8 @@ export interface SessionSummary {
 	/** True while the agent is streaming with tool calls pending; drives the "running tools" label. */
 	isRunningTools?: boolean;
 	attachedClients: number;
+	/** Clients attached over the direct worker transport; the supervisor adds these to its own count. */
+	directAttachedClients?: number;
 	messageCount: number;
 	unfinishedActionCount?: number;
 	sessionActions: SessionActionSnapshot;
@@ -85,6 +95,10 @@ export interface SessionSummary {
 	taskState?: AgentTaskState;
 	/** Non-sensitive exact goal generation for deterministic resident-session fencing. */
 	goal?: SessionGoalFence | null;
+	rosterStatus?: AgentRosterStatus;
+	statusLabel?: "queued" | "recovering" | "failed";
+	/** Set while the owning worker has been silent past the staleness threshold. */
+	lastHeardFromAt?: string;
 	/** Resident session-host process state, populated by the global supervisor. */
 	workerState?: "starting" | "ready" | "recovering" | "stopping" | "failed";
 	/** Diagnostic process identity; clients must not use this as a stable session identifier. */
@@ -234,6 +248,9 @@ export function summaryForActiveSession(
 	}
 
 	const goalState = session.goalState;
+	const directAttachedClients = [...activeSession.clients].filter(
+		(client) => client.authenticationRole === "session_client",
+	).length;
 	return {
 		id: activeSession.activeSessionId,
 		lifecycle: activeLifecycleForSession(activeSession),
@@ -259,6 +276,7 @@ export function summaryForActiveSession(
 		hasRunningRlmChildren: session.hasRunningRlmChildren(),
 		isRunningTools: session.isStreaming && session.state.pendingToolCalls.size > 0,
 		attachedClients: activeSession.clients.size,
+		...(directAttachedClients > 0 ? { directAttachedClients } : {}),
 		messageCount: session.messages.length,
 		goal:
 			!goalState || goalState.status === "idle"
@@ -269,6 +287,12 @@ export function summaryForActiveSession(
 						...(goalState.goalId ? { goalId: goalState.goalId } : {}),
 						...(goalState.dispatchReceiptId ? { dispatchReceiptId: goalState.dispatchReceiptId } : {}),
 						...(goalState.dispatchPhase ? { dispatchPhase: goalState.dispatchPhase } : {}),
+						...(goalState.followUpDispatchReceiptId
+							? { followUpDispatchReceiptId: goalState.followUpDispatchReceiptId }
+							: {}),
+						...(goalState.followUpDispatchPhase
+							? { followUpDispatchPhase: goalState.followUpDispatchPhase }
+							: {}),
 						...(goalState.updatedAt !== undefined ? { updatedAt: goalState.updatedAt } : {}),
 					},
 		unfinishedActionCount: session.unfinishedActionCount,

@@ -720,6 +720,18 @@ function conditionalGoalReceiptForPreparedPayload(
 	return payload.kind === "turn" ? conditionalGoalReceiptForMessage(payload.customMessage) : undefined;
 }
 
+const CONDITIONAL_GOAL_FOLLOW_UP_AGENT_MESSAGE_PREFIX = "conditional-goal-follow-up:";
+
+function conditionalGoalFollowUpAgentMessageId(receiptId: string): string {
+	return `${CONDITIONAL_GOAL_FOLLOW_UP_AGENT_MESSAGE_PREFIX}${receiptId}`;
+}
+
+function conditionalGoalFollowUpReceiptForAgentMessageId(agentMessageId: string | undefined): string | undefined {
+	if (!agentMessageId?.startsWith(CONDITIONAL_GOAL_FOLLOW_UP_AGENT_MESSAGE_PREFIX)) return undefined;
+	const receiptId = agentMessageId.slice(CONDITIONAL_GOAL_FOLLOW_UP_AGENT_MESSAGE_PREFIX.length);
+	return receiptId || undefined;
+}
+
 function primaryDeliveryRecord(action: QueuedSessionAction): DeliveryRecord {
 	if (action.payload.kind !== "turn") throw new Error(`Session action ${action.id} is not a turn`);
 	const record = action.payload.records.find((candidate) => candidate.role === "primary");
@@ -4642,6 +4654,75 @@ export class AgentSession {
 		await ticket.delivered;
 	}
 
+	/** Atomically persist and deliver a fenced follow-up to an unchanged active goal. */
+	async startGoalFollowUpFromConditionalPrompt(
+		text: string,
+		options: { admissionCommitted: () => void; receiptId: string; signal?: AbortSignal },
+	): Promise<void> {
+		const receiptId = validateGoalDispatchReceiptId(options.receiptId);
+		if (!receiptId) throw new Error("Conditional goal follow-up requires a dispatch receipt");
+		if (!text.trim()) throw new Error("Conditional goal follow-up cannot be empty");
+		if (text.trimStart().startsWith("/")) {
+			throw new Error("Conditional goal follow-up must not be a slash command");
+		}
+		if (this.isStreaming) throw new Error("Conditional goal follow-up requires an idle session");
+		if (this._goalState.status !== "active" || !this._goalState.objective || !this._goalState.goalId) {
+			throw new Error("Conditional goal follow-up requires an active goal");
+		}
+		if (
+			this._goalState.followUpDispatchReceiptId === receiptId &&
+			this._goalState.followUpDispatchPhase === "provider_committed"
+		) {
+			return;
+		}
+		if (
+			this._goalState.followUpDispatchPhase === "receipt" &&
+			this._goalState.followUpDispatchReceiptId !== receiptId
+		) {
+			throw new Error("Another conditional goal follow-up is awaiting provider commit");
+		}
+		this._resumeSessionInputAdmission();
+		this._assertSessionActionAdmissionAvailable();
+		const expectedGoalId = this._goalState.goalId;
+		const expectedGoalUpdatedAt = this._goalState.updatedAt;
+		const admissionEpoch = this._sessionInputPumpEpoch;
+		const commitFence = await this._acquireDirectTurnAdmissionFence(options.signal).catch((error: unknown) => {
+			throwIfPromptAdmissionCancelled(options.signal);
+			throw error;
+		});
+		const run = async (): Promise<ActionTicket | undefined> => {
+			try {
+				throwIfPromptAdmissionCancelled(options.signal);
+				await this._validateCanStartAgentRun();
+				if (admissionEpoch !== this._sessionInputPumpEpoch) {
+					throw new Error("Session input was invalidated before conditional goal follow-up admission");
+				}
+				options.admissionCommitted();
+				if (
+					this._goalState.status !== "active" ||
+					this._goalState.goalId !== expectedGoalId ||
+					this._goalState.updatedAt !== expectedGoalUpdatedAt
+				) {
+					throw new Error("Active goal changed before conditional follow-up admission");
+				}
+				this._setGoalState({
+					...this._goalState,
+					followUpDispatchReceiptId: receiptId,
+					followUpDispatchPhase: "receipt",
+					lastError:
+						this._goalState.lastError === "Conditional goal follow-up recovery exhausted"
+							? undefined
+							: this._goalState.lastError,
+				});
+				return this._queueConditionalGoalFollowUp(text, receiptId);
+			} finally {
+				commitFence.release();
+			}
+		};
+		const ticket = await this._sessionActionCommitContext.run(commitFence.owner, run);
+		if (ticket) await ticket.delivered;
+	}
+
 	async promptAndWait(text: string, options?: PromptOptions): Promise<void> {
 		const agentMessageId = options?.agentMessageId ?? `prompt-wait:${randomUUID()}`;
 		if (this._agentMessageOutcomes.get(agentMessageId)?.completion) {
@@ -5277,6 +5358,15 @@ export class AgentSession {
 		const actionIds = new Set(this._actionStore.ownedActions().map((action) => action.id));
 		const actions = snapshot.actions
 			.filter((recovered) => {
+				const followUpReceiptId = conditionalGoalFollowUpReceiptForAgentMessageId(recovered.agentMessageId);
+				if (followUpReceiptId) {
+					return (
+						this._goalState.active === true &&
+						this._goalState.status === "active" &&
+						this._goalState.followUpDispatchReceiptId === followUpReceiptId &&
+						this._goalState.followUpDispatchPhase === "receipt"
+					);
+				}
 				const receiptId = conditionalGoalReceiptForRecoveryPayload(recovered.payload);
 				if (!receiptId) return true;
 				if (this._recoveredConditionalGoalReceipts.has(receiptId)) return false;
@@ -5377,6 +5467,56 @@ export class AgentSession {
 			}
 		}
 		return actions.length;
+	}
+
+	/** Rebuild a follow-up whose durable receipt was persisted before provider commit. */
+	recoverConditionalGoalFollowUpDelivery(
+		receiptValue: string,
+		text: string,
+		options: { recoveryCommitted?: () => void } = {},
+	): boolean {
+		const receiptId = validateGoalDispatchReceiptId(receiptValue);
+		if (
+			!receiptId ||
+			!text.trim() ||
+			this._goalState.status !== "active" ||
+			this._goalState.followUpDispatchReceiptId !== receiptId ||
+			this._goalState.followUpDispatchPhase !== "receipt"
+		) {
+			return false;
+		}
+		const alreadyQueued = this._actionStore
+			.unfinishedActions()
+			.some((action) => conditionalGoalFollowUpReceiptForAgentMessageId(action.agentMessageId) === receiptId);
+		if (alreadyQueued) return false;
+		options.recoveryCommitted?.();
+		return this._queueConditionalGoalFollowUp(text, receiptId) !== undefined;
+	}
+
+	/** Terminalize only the failed follow-up receipt; the enclosing goal stays active. */
+	failConditionalGoalFollowUpDelivery(receiptValue: string): boolean {
+		const receiptId = validateGoalDispatchReceiptId(receiptValue);
+		if (
+			!receiptId ||
+			this._goalState.status !== "active" ||
+			this._goalState.followUpDispatchReceiptId !== receiptId ||
+			this._goalState.followUpDispatchPhase !== "receipt"
+		) {
+			return false;
+		}
+		if (
+			this._actionStore
+				.unfinishedActions()
+				.some((action) => conditionalGoalFollowUpReceiptForAgentMessageId(action.agentMessageId) === receiptId)
+		) {
+			return false;
+		}
+		this._setGoalState({
+			...this._goalState,
+			followUpDispatchPhase: "failed",
+			lastError: "Conditional goal follow-up recovery exhausted",
+		});
+		return true;
 	}
 
 	/** Rebuild the goal turn lost with an interrupted conditional cron dispatch. */
@@ -5696,6 +5836,24 @@ export class AgentSession {
 			agentMessageId: options.agentMessageId,
 			suppressAutonomousContinuation: options.suppressAutonomousContinuation,
 		};
+	}
+
+	private _queueConditionalGoalFollowUp(text: string, receiptId: string): ActionTicket | undefined {
+		const existing = this._actionStore
+			.unfinishedActions()
+			.find((action) => conditionalGoalFollowUpReceiptForAgentMessageId(action.agentMessageId) === receiptId);
+		if (existing) return undefined;
+		const canStartImmediately =
+			this._actionStore.unfinishedActions().length === 0 && this._canStartSessionActionImmediately();
+		const action = this._createPreparedTurnAction("followUp", text, undefined, {
+			agentMessageId: conditionalGoalFollowUpAgentMessageId(receiptId),
+			queueKey: conditionalGoalFollowUpAgentMessageId(receiptId),
+			resumeIfIdle: true,
+			source: "rpc",
+			executionPolicy: this._turnExecutionPolicy(canStartImmediately ? "injected" : "queued"),
+			queueVisible: !canStartImmediately,
+		});
+		return this._admitSessionInput(action, { immediatelyEligible: canStartImmediately }).ticket;
 	}
 
 	private _createSessionCommandAction(
@@ -6164,6 +6322,22 @@ export class AgentSession {
 		this._setGoalState({ ...this._goalState, dispatchPhase: "provider_committed" });
 	}
 
+	private _commitConditionalGoalFollowUpProviderBoundary(actions: readonly QueuedSessionAction[]): void {
+		const receiptId = actions
+			.map((action) => conditionalGoalFollowUpReceiptForAgentMessageId(action.agentMessageId))
+			.find((candidate): candidate is string => candidate !== undefined);
+		if (!receiptId) return;
+		if (
+			this._goalState.active !== true ||
+			this._goalState.status !== "active" ||
+			this._goalState.followUpDispatchReceiptId !== receiptId ||
+			this._goalState.followUpDispatchPhase !== "receipt"
+		) {
+			throw new Error("Conditional goal follow-up state invalidated before provider commit");
+		}
+		this._setGoalState({ ...this._goalState, followUpDispatchPhase: "provider_committed" });
+	}
+
 	private async _startPreparedTurnActions(actions: QueuedSessionAction[], epoch: number): Promise<void> {
 		let nextTurnMessages: CustomMessage[] = [];
 		const activeTurns = () =>
@@ -6264,6 +6438,7 @@ export class AgentSession {
 					this._notifySessionInputCheckpointChange();
 					this._emitQueueUpdate();
 					this._commitConditionalGoalProviderBoundary(preparedMessages);
+					this._commitConditionalGoalFollowUpProviderBoundary(turns);
 					return turns.some((action) => action.suppressAutonomousContinuation)
 						? this._runWithAutonomousContinuationSuppressed(() => this.agent.prompt(preparedMessages))
 						: this.agent.prompt(preparedMessages);
@@ -10364,6 +10539,11 @@ export class AgentSession {
 		};
 	}
 
+	private _isUnboundTerminalRlmChildRun(run: RlmChildRun): boolean {
+		if (run.session !== undefined || this._rlmChildSessions.has(run.id)) return false;
+		return run.status === "done" || run.status === "error" || run.status === "cancelled";
+	}
+
 	/** Live recursive child roster from lifecycle state, including nested work under retained parents. */
 	getRlmChildSnapshots(): RlmChildAgentSnapshot[] {
 		const snapshots: RlmChildAgentSnapshot[] = [];
@@ -10371,7 +10551,10 @@ export class AgentSession {
 		const traversed = new Set<string>();
 		for (const run of this._activeRlmChildRuns.values()) {
 			const hidden =
-				run.detachedDeletion || this._deletingRlmChildren.has(run.id) || this._deletedRlmChildIds.has(run.id);
+				run.detachedDeletion ||
+				this._deletingRlmChildren.has(run.id) ||
+				this._deletedRlmChildIds.has(run.id) ||
+				this._isUnboundTerminalRlmChildRun(run);
 			const child = run.session;
 			if (!hidden) {
 				snapshots.push(this._rlmChildSnapshotForRun(run));
@@ -10892,7 +11075,15 @@ export class AgentSession {
 				}
 				run.durationMs = Date.now() - startedAt;
 				run.activity = undefined;
-				emitChildUpdate();
+				if (run.status === "error" && childSession === undefined) {
+					// A pre-bind failure leaves no row: "cancelled" is the wire's removal signal.
+					this._emit({
+						type: "rlm_child_update",
+						child: { ...this._rlmChildSnapshotForRun(run), status: "cancelled" },
+					});
+				} else {
+					emitChildUpdate();
+				}
 				if (!run.detachedDeletion && !run.suppressTerminalNotice) {
 					if (run.status === "error") {
 						await deliverTerminalMessageToParent(
