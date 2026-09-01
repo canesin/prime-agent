@@ -383,6 +383,14 @@ function isSupervisorRecoveryCancelled(error: unknown): boolean {
 	return isSupervisorShutdownAdmissionCancelled(error) || isSupervisorGenerationStale(error);
 }
 
+function isDaemonWorkerProbeTimeout(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return (
+		message.startsWith("Timed out connecting to daemon session worker") ||
+		message.startsWith("Timed out waiting for daemon worker")
+	);
+}
+
 function isSupervisorShutdownAdmissionCancelled(error: unknown): boolean {
 	return (
 		error instanceof SupervisorRecoveryCancelledError ||
@@ -618,6 +626,7 @@ export class DaemonSupervisor {
 	private ownership?: Awaited<ReturnType<typeof acquireDaemonSupervisorOwnership>>;
 	private cleanupPromise?: Promise<void>;
 	private shuttingDown = false;
+	private startupComplete = false;
 	private updateRestartPhase?: "draining" | "fencing" | "prepared";
 	private readonly mutationDrain = new MutationDrainLatch();
 	private readonly clients = new Set<DaemonSocketClient>();
@@ -679,7 +688,10 @@ export class DaemonSupervisor {
 				throw new Error("Daemon supervisor config is missing agentDir");
 			}
 			this.socketLease = await acquireDaemonSocketPathLease(this.socketPath);
+			this.socketLease?.onCompromised((error) => this.handleSocketLeaseCompromised(error));
+			this.assertSocketLeaseHeld();
 			await waitForDaemonStartupFence(this.socketPath);
+			this.assertSocketLeaseHeld();
 			this.ownership = await acquireDaemonSupervisorOwnership({
 				socketPath: this.socketPath,
 				descriptorDir: this.descriptorDir,
@@ -687,6 +699,7 @@ export class DaemonSupervisor {
 				generation: this.generation,
 				appVersion: VERSION,
 			});
+			this.assertSocketLeaseHeld();
 			await prepareDaemonSocketPath(this.socketPath, this.socketLease);
 
 			mkdirSync(this.descriptorDir, { recursive: true, mode: 0o700 });
@@ -700,6 +713,7 @@ export class DaemonSupervisor {
 
 			this.server = createServer((socket) => this.handleConnection(socket));
 			await this.listen();
+			this.assertSocketLeaseHeld();
 			this.socketIdentity = getDaemonSocketIdentity(this.socketPath);
 			if (process.platform !== "win32" && !this.socketIdentity) {
 				throw new Error(`Could not capture daemon socket identity: ${this.socketPath}`);
@@ -742,7 +756,10 @@ export class DaemonSupervisor {
 				this.scheduleOwnedWorkerCleanup(worker);
 			}
 			this.scheduleIdleEvictionSweep();
+			this.assertSocketLeaseHeld();
 			await this.ownership.updatePhase("owner");
+			this.assertSocketLeaseHeld();
+			this.startupComplete = true;
 			this.log(`Prime Agent daemon supervisor ${this.generation} listening on ${this.socketPath}`);
 			this.markReady();
 		} catch (error) {
@@ -2489,7 +2506,7 @@ export class DaemonSupervisor {
 				return false;
 			}
 			worker.intentionalStop = true;
-			await this.recoverUncertainWorkerOperations(worker, false);
+			await this.recoverUncertainWorkerOperations(worker);
 			this.invalidateWorkerSessionInputPauses(worker, "Session worker stopped while input was paused");
 			this.workers.delete(worker.descriptor.workerId);
 			this.deleteWorkerDescriptor(worker);
@@ -2918,6 +2935,22 @@ export class DaemonSupervisor {
 				return;
 			}
 			this.log(`Could not adopt worker ${worker.descriptor.workerId}: ${String(error)}`);
+			const processAlive = isProcessAlive(worker.descriptor.pid);
+			const observedProcessStartId = processAlive ? getProcessStartId(worker.descriptor.pid) : undefined;
+			if (
+				isDaemonWorkerProbeTimeout(error) &&
+				processAlive &&
+				worker.descriptor.processStartId !== undefined &&
+				observedProcessStartId === worker.descriptor.processStartId
+			) {
+				worker.descriptor.lifecycle = "recovering";
+				worker.descriptor.lastError = error instanceof Error ? error.message : String(error);
+				this.persistWorker(worker);
+				void this.recoverWorker(worker).catch((recoveryError) =>
+					this.log(`Could not recover worker ${worker.descriptor.workerId}: ${String(recoveryError)}`),
+				);
+				return;
+			}
 			await this.recoverWorker(worker);
 		}
 	}
@@ -3225,8 +3258,10 @@ export class DaemonSupervisor {
 			return worker.recovery;
 		}
 		worker.recovery = (async () => {
-			for (const [retryIndex, retryDelay] of WORKER_RETRY_DELAYS_MS.entries()) {
+			let keepProbingLiveWorker = false;
+			for (const retryDelay of WORKER_RETRY_DELAYS_MS) {
 				await delay(retryDelay);
+				keepProbingLiveWorker = false;
 				if (this.isWorkerRecoveryCancelled(worker)) {
 					return;
 				}
@@ -3261,30 +3296,33 @@ export class DaemonSupervisor {
 							await this.assertRecoveryAllowed();
 							worker.client?.close();
 							worker.client = undefined;
-							if (retryIndex < WORKER_RETRY_DELAYS_MS.length - 1) {
-								throw error;
-							}
+							// A worker with the same durable process identity may be load-slow.
+							// Keep probing it instead of replacing live work after a timeout.
+							keepProbingLiveWorker =
+								isDaemonWorkerProbeTimeout(error) ||
+								worker.descriptor.processStartId === undefined ||
+								observedProcessStartId === undefined;
+							throw error;
 						}
 					}
 					if (
 						processAlive &&
 						(worker.descriptor.processStartId === undefined || observedProcessStartId === undefined)
 					) {
+						keepProbingLiveWorker = true;
 						throw new Error(
 							`Cannot safely replace live session worker ${worker.descriptor.workerId} without a verified process identity`,
 						);
 					}
 					const recoveryCommand = worker.descriptor.ownerClientId ? worker.transientCreateCommand : undefined;
 					if (!recoveryCommand || !worker.launchEnv) {
-						await this.recoverUncertainWorkerOperations(worker, false);
+						await this.recoverUncertainWorkerOperations(worker);
 						worker.descriptor.lifecycle = "failed";
 						worker.descriptor.lastError = "Waiting for a client with fresh runtime context";
 						this.persistWorker(worker);
 						return;
 					}
-					const safeToKillWorkerProcess =
-						processAlive && processIdentityMatches && worker.descriptor.processStartId !== undefined;
-					await this.recoverUncertainWorkerOperations(worker, safeToKillWorkerProcess);
+					await this.recoverUncertainWorkerOperations(worker);
 					if (this.isWorkerRecoveryCancelled(worker)) {
 						return;
 					}
@@ -3306,6 +3344,20 @@ export class DaemonSupervisor {
 					worker.descriptor.lastError = error instanceof Error ? error.message : String(error);
 					this.persistWorker(worker);
 				}
+			}
+			if (keepProbingLiveWorker) {
+				try {
+					await this.assertRecoveryAllowed();
+				} catch {
+					return;
+				}
+				worker.descriptor.lifecycle = "recovering";
+				this.persistWorker(worker);
+				this.deferWorkerRecovery(
+					worker,
+					new Error(worker.descriptor.lastError ?? "Live session worker did not answer recovery probes"),
+				);
+				return;
 			}
 			try {
 				await this.assertRecoveryAllowed();
@@ -3330,31 +3382,25 @@ export class DaemonSupervisor {
 		);
 	}
 
-	private async recoverUncertainWorkerOperations(worker: ResidentWorker, killWorkerProcess = true): Promise<void> {
+	private isWorkerCleanupCancelled(worker: ResidentWorker): boolean {
+		return (
+			this.shuttingDown ||
+			worker.descriptor.stopRequestedAt !== undefined ||
+			this.workers.get(worker.descriptor.workerId) !== worker
+		);
+	}
+
+	private async recoverUncertainWorkerOperations(worker: ResidentWorker): Promise<void> {
 		await this.assertRecoveryAllowed();
-		if (killWorkerProcess) {
-			signalProcessGroupOrProcess(worker.descriptor.pid, "SIGKILL");
+		await this.catalog.start();
+		await this.assertRecoveryAllowed();
+		if (this.isWorkerCleanupCancelled(worker)) {
+			throw new SupervisorRecoveryCancelledError("Worker recovery was cancelled before destructive cleanup");
 		}
-		const orphanProcessJournalPath = worker.descriptor.orphanProcessJournalPath;
-		if (orphanProcessJournalPath) {
-			try {
-				for (const orphan of readActiveOrphanProcesses(orphanProcessJournalPath, worker.descriptor.pid)) {
-					if (!shouldReapOrphanProcess(orphan)) {
-						continue;
-					}
-					killOrphanProcess(orphan.pid);
-				}
-				clearOrphanProcessJournal(orphanProcessJournalPath);
-			} catch (error) {
-				this.log(`Could not reap orphaned worker resources: ${String(error)}`);
-			}
-		}
+
 		const journal = new WorkerRecoveryJournal(worker.descriptor.recoveryJournalPath);
 		const latest = journal.getLatest();
 		const uncertain = latest.filter((record) => record.busy);
-		if (uncertain.length === 0) {
-			return;
-		}
 		const interruptedSessions = new Map<
 			string,
 			{ activeSessionId: string; sessionFile: string; operations: Set<string> }
@@ -3376,7 +3422,11 @@ export class DaemonSupervisor {
 			}
 			interrupted.operations.add(record.operation);
 		}
+
 		await this.assertRecoveryAllowed();
+		if (this.isWorkerCleanupCancelled(worker)) {
+			throw new SupervisorRecoveryCancelledError("Worker recovery was cancelled before interruption was recorded");
+		}
 		await Promise.all(
 			[...interruptedSessions.values()].map((interrupted) =>
 				this.catalog.markInterrupted(interrupted.sessionFile, interrupted.activeSessionId, [
@@ -3385,6 +3435,26 @@ export class DaemonSupervisor {
 			),
 		);
 		await this.assertRecoveryAllowed();
+		if (this.isWorkerCleanupCancelled(worker)) {
+			throw new SupervisorRecoveryCancelledError("Worker recovery was cancelled before process cleanup");
+		}
+		const orphanProcessJournalPath = worker.descriptor.orphanProcessJournalPath;
+		if (orphanProcessJournalPath) {
+			try {
+				for (const orphan of readActiveOrphanProcesses(orphanProcessJournalPath, worker.descriptor.pid)) {
+					if (!shouldReapOrphanProcess(orphan)) {
+						continue;
+					}
+					killOrphanProcess(orphan.pid);
+				}
+				clearOrphanProcessJournal(orphanProcessJournalPath);
+			} catch (error) {
+				this.log(`Could not reap orphaned worker resources: ${String(error)}`);
+			}
+		}
+		if (uncertain.length === 0) {
+			return;
+		}
 		for (const record of latest) {
 			journal.record({
 				activeSessionId: record.activeSessionId,
@@ -5454,6 +5524,26 @@ export class DaemonSupervisor {
 		const exitHandler = () => this.cleanupSocket();
 		process.on("exit", exitHandler);
 		this.signalCleanupHandlers.push(() => process.off("exit", exitHandler));
+	}
+
+	private assertSocketLeaseHeld(): void {
+		const compromise = this.socketLease?.compromise;
+		if (compromise) throw new Error(`Daemon socket lease was compromised: ${compromise.message}`);
+	}
+
+	private handleSocketLeaseCompromised(error: Error): void {
+		if (this.shuttingDown) return;
+		this.shuttingDown = true;
+		const message = `Daemon socket lease was compromised; relinquishing supervisor ownership: ${error.message}`;
+		try {
+			this.log(message);
+		} catch {
+			console.error(message);
+		}
+		if (!this.startupComplete) return;
+		void this.cleanupSupervisorResources().catch((cleanupError) =>
+			this.reportCleanupFailure("compromised daemon socket lease", cleanupError),
+		);
 	}
 
 	private cleanupSocket(): void {
