@@ -48,7 +48,7 @@ Edit directly or use `/settings` for common options.
 
 ### Update Checks
 
-Stable builds fetch the release manifest at `https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/latest.json`. Beta builds fetch `beta.json` and continue following beta updates. Override the base URL with `PRIME_AGENT_DOWNLOAD_BASE_URL`.
+Fork builds fetch the release manifest at `https://github.com/canesin/prime-agent/releases/latest/download/latest.json`. The package must be `prime-agent`, and the tarball must be the exact immutable `https://github.com/canesin/prime-agent/releases/download/v<version>/prime-agent-<version>.tgz` URL. Malformed, relative, or off-origin manifests fail closed.
 
 Set `PI_SKIP_VERSION_CHECK=1` to disable the Prime Agent version update check. Use `--offline` or `PI_OFFLINE=1` to disable startup network operations, including update checks and package update checks.
 
@@ -58,11 +58,11 @@ The stable `latest.json` and beta `beta.json` manifests use the same JSON shape:
 {
   "version": "0.73.1",
   "package": "prime-agent",
-  "tarball": "releases/v0.73.1/prime-agent-0.73.1.tgz"
+  "tarball": "https://github.com/canesin/prime-agent/releases/download/v0.73.1/prime-agent-0.73.1.tgz"
 }
 ```
 
-`version` is required. `package` is optional and may also be named `packageName`; it defaults to the current package name. `tarball` is optional; when present, Prime Agent installs that tarball instead of the package name. Relative tarball paths resolve against `PRIME_AGENT_DOWNLOAD_BASE_URL`.
+All three fields are required and must match the same fork release version.
 
 ### Pseudonymous usage analytics
 

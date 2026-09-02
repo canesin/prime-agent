@@ -1,14 +1,17 @@
 import { getPiUserAgent } from "./pi-user-agent.js";
 
-const DEFAULT_PRIME_AGENT_DOWNLOAD_BASE_URL = "https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev";
+const DEFAULT_PRIME_AGENT_DOWNLOAD_BASE_URL = "https://github.com/canesin/prime-agent/releases/latest/download";
+const PRIME_AGENT_PACKAGE_NAME = "prime-agent";
 const STABLE_VERSION_MANIFEST_PATH = "latest.json";
 const BETA_VERSION_MANIFEST_PATH = "beta.json";
 const DEFAULT_VERSION_CHECK_TIMEOUT_MS = 10000;
+const RELEASE_MANIFEST_VERSION_PATTERN =
+	/^v?((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)$/;
 
 export interface LatestPiRelease {
 	version: string;
-	packageName?: string;
-	installSpec?: string;
+	packageName: string;
+	installSpec: string;
 }
 
 interface ParsedVersion {
@@ -85,15 +88,8 @@ export function isNewerPackageVersion(candidateVersion: string, currentVersion: 
 	return candidateVersion.trim() !== currentVersion.trim();
 }
 
-function getPrimeAgentDownloadBaseUrl(): string {
-	return (process.env.PRIME_AGENT_DOWNLOAD_BASE_URL?.trim() || DEFAULT_PRIME_AGENT_DOWNLOAD_BASE_URL).replace(
-		/\/+$/,
-		"",
-	);
-}
-
-function normalizeReleaseVersion(version: string): string {
-	return version.trim().replace(/^v/, "");
+function parseReleaseManifestVersion(version: string): string | undefined {
+	return RELEASE_MANIFEST_VERSION_PATTERN.exec(version)?.[1];
 }
 
 function getReleaseManifestPath(currentVersion: string): string {
@@ -101,14 +97,8 @@ function getReleaseManifestPath(currentVersion: string): string {
 	return prerelease?.match(/^beta(?:\.|$)/) ? BETA_VERSION_MANIFEST_PATH : STABLE_VERSION_MANIFEST_PATH;
 }
 
-function resolveReleaseUrl(baseUrl: string, pathOrUrl: string): string | undefined {
-	const trimmed = pathOrUrl.trim();
-	if (!trimmed) return undefined;
-	try {
-		return new URL(trimmed).toString();
-	} catch {
-		return `${baseUrl}/${trimmed.replace(/^\/+/, "")}`;
-	}
+function canonicalForkTarball(version: string): string {
+	return `https://github.com/canesin/prime-agent/releases/download/v${version}/prime-agent-${version}.tgz`;
 }
 
 export async function getLatestPiRelease(
@@ -117,7 +107,7 @@ export async function getLatestPiRelease(
 ): Promise<LatestPiRelease | undefined> {
 	if (process.env.PI_SKIP_VERSION_CHECK || process.env.PI_OFFLINE) return undefined;
 
-	const baseUrl = getPrimeAgentDownloadBaseUrl();
+	const baseUrl = DEFAULT_PRIME_AGENT_DOWNLOAD_BASE_URL;
 	const response = await fetch(`${baseUrl}/${getReleaseManifestPath(currentVersion)}`, {
 		headers: {
 			"User-Agent": getPiUserAgent(currentVersion),
@@ -129,28 +119,17 @@ export async function getLatestPiRelease(
 
 	const data = (await response.json()) as {
 		package?: unknown;
-		packageName?: unknown;
 		tarball?: unknown;
 		version?: unknown;
 	};
-	if (typeof data.version !== "string" || !data.version.trim()) {
+	if (typeof data.version !== "string") {
 		return undefined;
 	}
-	const packageName =
-		typeof data.package === "string" && data.package.trim()
-			? data.package.trim()
-			: typeof data.packageName === "string" && data.packageName.trim()
-				? data.packageName.trim()
-				: undefined;
-	const installSpec = typeof data.tarball === "string" ? resolveReleaseUrl(baseUrl, data.tarball) : undefined;
-	const release: LatestPiRelease = { version: normalizeReleaseVersion(data.version) };
-	if (packageName) {
-		release.packageName = packageName;
-	}
-	if (installSpec) {
-		release.installSpec = installSpec;
-	}
-	return release;
+	const version = parseReleaseManifestVersion(data.version);
+	if (!version || data.package !== PRIME_AGENT_PACKAGE_NAME) return undefined;
+	const installSpec = canonicalForkTarball(version);
+	if (data.tarball !== installSpec) return undefined;
+	return { version, packageName: PRIME_AGENT_PACKAGE_NAME, installSpec };
 }
 
 export async function getLatestPiVersion(

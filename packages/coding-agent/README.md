@@ -258,7 +258,7 @@ See [docs/settings.md](docs/settings.md) for all options.
 
 ### Update checks
 
-Prime Agent stable builds fetch `https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/latest.json` to check whether a newer version exists. Beta builds fetch `beta.json` and remain on the beta channel. Override the base URL with `PRIME_AGENT_DOWNLOAD_BASE_URL`. Disable version checks with `PI_SKIP_VERSION_CHECK=1`.
+Prime Agent fork builds fetch `https://github.com/canesin/prime-agent/releases/latest/download/latest.json`. The manifest must name `prime-agent` and contain the exact immutable, version-qualified fork release tarball URL; every other source fails closed. Disable version checks with `PI_SKIP_VERSION_CHECK=1`.
 
 Use `--offline` or `PI_OFFLINE=1` to disable startup network operations, including update checks and package update checks.
 
@@ -679,7 +679,6 @@ prime-agent --thinking high "Solve this complex problem"
 | `PRIME_AGENT_TELEMETRY` | Override pseudonymous aggregate usage analytics with `1`/`true`/`yes` or `0`/`false`/`no` |
 | `PRIME_AGENT_TELEMETRY_ENDPOINT` | Override the aggregate analytics ingestion endpoint |
 | `DO_NOT_TRACK` | Disable aggregate usage analytics when set to `1`/`true`/`yes` |
-| `PRIME_AGENT_DOWNLOAD_BASE_URL` | Override the Prime Agent release manifest and tarball base URL |
 | `PI_CACHE_RETENTION` | Set to `long` for extended prompt cache (Anthropic: 1h, OpenAI: 24h) |
 | `PRIME_API_KEY` | Prime Inference API key; also used for trace sharing if it has `agent_traces` scope |
 | `PRIME_AGENT_TRACES_API_KEY` | Prime API key used only for opt-in trace sharing |

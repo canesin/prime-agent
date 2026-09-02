@@ -1,0 +1,87 @@
+name: Release canesin fork
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: release-canesin-fork
+  cancel-in-progress: false
+  queue: max
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: github.repository == 'canesin/prime-agent'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check
+        run: npm run check
+
+      - name: Build
+        run: npm run build
+
+      - name: Pack fork release
+        id: release
+        env:
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          base_version=$(node -p "require('./package.json').version.split('-')[0]")
+          version="${base_version}-cto.${RUN_NUMBER}.${RUN_ATTEMPT}"
+          base_url="https://github.com/${GITHUB_REPOSITORY}/releases/latest/download"
+          npm run release:pack -- \
+            --channel stable \
+            --version "$version" \
+            --base-url "$base_url" \
+            --out-dir packages/coding-agent/release/fork
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Require immutable releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          enabled=$(gh api "repos/${GITHUB_REPOSITORY}/immutable-releases" --jq .enabled)
+          if [ "$enabled" != "true" ]; then
+            echo "::error::Immutable releases are disabled for ${GITHUB_REPOSITORY}; refusing to publish."
+            exit 1
+          fi
+
+      - name: Select latest release
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          current_tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)
+          node scripts/release-latest-decision.mjs "$VERSION" "${current_tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish fork release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          gh release create "v${VERSION}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Prime Agent fork v${VERSION}" \
+            --notes "Automated canesin fork release from ${GITHUB_SHA}." \
+            ${{ steps.latest.outputs.flag }} \
+            packages/coding-agent/release/fork/artifacts/*
