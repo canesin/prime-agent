@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 
 interface WorkflowStep {
+	env?: Record<string, string>;
 	id?: string;
 	name?: string;
 	run?: string;
@@ -44,6 +45,7 @@ describe("canesin fork release workflow", () => {
 
 	it("checks immutability and latest precedence before publishing all artifacts", () => {
 		const steps = loadWorkflow().jobs.release.steps;
+		const adminTokenExpression = ["$", "{{ secrets.FORK_RELEASE_ADMIN_TOKEN }}"].join("");
 		const latestOutputExpression = ["$", "{{ steps.latest.outputs.flag }}"].join("");
 		const immutableIndex = steps.findIndex((step) => step.name === "Require immutable releases");
 		const latestIndex = steps.findIndex((step) => step.name === "Select latest release");
@@ -55,6 +57,10 @@ describe("canesin fork release workflow", () => {
 		expect(immutableIndex).toBeGreaterThan(-1);
 		expect(latestIndex).toBeGreaterThan(immutableIndex);
 		expect(publishIndex).toBeGreaterThan(latestIndex);
+		expect(immutableStep?.env).toEqual({
+			GH_TOKEN: adminTokenExpression,
+		});
+		expect(immutableStep?.run).toContain('if [ -z "$GH_TOKEN" ]');
 		expect(immutableStep?.run).toContain("immutable-releases");
 		expect(immutableStep?.run).toContain('if [ "$enabled" != "true" ]');
 		expect(latestStep?.id).toBe("latest");
