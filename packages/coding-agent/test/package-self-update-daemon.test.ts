@@ -524,6 +524,7 @@ describe("self-update daemon restart", () => {
 			"fetch",
 			vi.fn(async () =>
 				Response.json({
+					package: "prime-agent",
 					tarball: "https://github.com/canesin/prime-agent/releases/download/v999.0.0/prime-agent-999.0.0.tgz",
 					version: "999.0.0",
 				}),
@@ -576,6 +577,7 @@ describe("self-update daemon restart", () => {
 			"fetch",
 			vi.fn(async () =>
 				Response.json({
+					package: "prime-agent",
 					tarball: "https://github.com/canesin/prime-agent/releases/download/v0.2.6/prime-agent-0.2.6.tgz",
 					version: "0.2.6",
 				}),

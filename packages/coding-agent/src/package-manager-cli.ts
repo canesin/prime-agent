@@ -442,7 +442,7 @@ function setSelfUpdateNoChangeExitCode(): void {
 async function getSelfUpdatePlan(force: boolean): Promise<SelfUpdatePlan> {
 	try {
 		const latestRelease = await getLatestPiRelease(VERSION);
-		if (!latestRelease?.installSpec) {
+		if (!latestRelease) {
 			return {
 				failure: "Could not resolve an installable fork release; update cancelled.",
 				installSpec: PACKAGE_NAME,
@@ -450,10 +450,9 @@ async function getSelfUpdatePlan(force: boolean): Promise<SelfUpdatePlan> {
 				shouldRun: false,
 			};
 		}
-		const packageName = latestRelease?.packageName ?? PACKAGE_NAME;
-		const installSpec = latestRelease.installSpec;
-		if (force || isNewerPackageVersion(latestRelease.version, VERSION)) {
-			return { installSpec, packageName, shouldRun: true, targetVersion: latestRelease?.version };
+		const { installSpec, packageName, version } = latestRelease;
+		if (force || isNewerPackageVersion(version, VERSION)) {
+			return { installSpec, packageName, shouldRun: true, targetVersion: version };
 		}
 	} catch {
 		return {

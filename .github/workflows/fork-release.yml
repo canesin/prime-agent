@@ -9,6 +9,7 @@ on:
 concurrency:
   group: release-canesin-fork
   cancel-in-progress: false
+  queue: max
 
 permissions:
   contents: write
@@ -53,6 +54,25 @@ jobs:
             --out-dir packages/coding-agent/release/fork
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      - name: Require immutable releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          enabled=$(gh api "repos/${GITHUB_REPOSITORY}/immutable-releases" --jq .enabled)
+          if [ "$enabled" != "true" ]; then
+            echo "::error::Immutable releases are disabled for ${GITHUB_REPOSITORY}; refusing to publish."
+            exit 1
+          fi
+
+      - name: Select latest release
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          current_tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)
+          node scripts/release-latest-decision.mjs "$VERSION" "${current_tag#v}" >> "$GITHUB_OUTPUT"
+
       - name: Publish fork release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -63,5 +83,5 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "Prime Agent fork v${VERSION}" \
             --notes "Automated canesin fork release from ${GITHUB_SHA}." \
-            --latest \
+            ${{ steps.latest.outputs.flag }} \
             packages/coding-agent/release/fork/artifacts/*
