@@ -7,7 +7,7 @@ import {
 	isNewerPackageVersion,
 } from "../src/utils/version-check.js";
 
-const defaultPrimeAgentDownloadBaseUrl = "https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev";
+const defaultPrimeAgentDownloadBaseUrl = "https://github.com/canesin/prime-agent/releases/latest/download";
 const originalSkipVersionCheck = process.env.PI_SKIP_VERSION_CHECK;
 const originalOffline = process.env.PI_OFFLINE;
 const originalPrimeAgentDownloadBaseUrl = process.env.PRIME_AGENT_DOWNLOAD_BASE_URL;

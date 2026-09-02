@@ -254,7 +254,8 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
 			value: join(selfPackageDir, "dist", "cli.js"),
 			configurable: true,
 		});
-		const fetchMock = vi.fn(async () => Response.json({ version: getNewerPatchVersion() }));
+		const tarballUrl = "https://github.com/canesin/prime-agent/releases/download/vNext/prime-agent-next.tgz";
+		const fetchMock = vi.fn(async () => Response.json({ tarball: tarballUrl, version: getNewerPatchVersion() }));
 		vi.stubGlobal("fetch", fetchMock);
 
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -267,7 +268,7 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
 			expect(errorSpy).not.toHaveBeenCalled();
 			expect(fetchMock).toHaveBeenCalledOnce();
 			const recordedArgs = JSON.parse(readFileSync(recordPath, "utf-8")) as string[];
-			expect(recordedArgs).toContain(PACKAGE_NAME);
+			expect(recordedArgs).toContain(tarballUrl);
 		} finally {
 			logSpy.mockRestore();
 			errorSpy.mockRestore();
@@ -303,7 +304,13 @@ else {
 		const activePackageName = PACKAGE_NAME === "@new-scope/pi" ? "@newer-scope/pi" : "@new-scope/pi";
 		vi.stubGlobal(
 			"fetch",
-			vi.fn(async () => Response.json({ packageName: activePackageName, version: "0.73.0" })),
+			vi.fn(async () =>
+				Response.json({
+					packageName: activePackageName,
+					tarball: "https://github.com/canesin/prime-agent/releases/download/v0.73.0/prime-agent-0.73.0.tgz",
+					version: "0.73.0",
+				}),
+			),
 		);
 
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -316,9 +323,57 @@ else {
 			expect(errorSpy).not.toHaveBeenCalled();
 			const recordedCalls = JSON.parse(readFileSync(recordPath, "utf-8")) as string[][];
 			expect(recordedCalls).toEqual([
+				expect.arrayContaining([
+					"install",
+					"-g",
+					"https://github.com/canesin/prime-agent/releases/download/v0.73.0/prime-agent-0.73.0.tgz",
+				]),
 				expect.arrayContaining(["uninstall", "-g", PACKAGE_NAME]),
-				expect.arrayContaining(["install", "-g", activePackageName]),
 			]);
+		} finally {
+			logSpy.mockRestore();
+			errorSpy.mockRestore();
+		}
+	});
+
+	it("fails closed when the fork release manifest is unavailable", async () => {
+		const globalPrefix = join(tempDir, "global-prefix");
+		const selfPackageDir = join(globalPrefix, "lib", "node_modules", "prime-agent");
+		const fakeNpmPath = join(tempDir, "fake-npm.cjs");
+		const recordPath = join(tempDir, "self-update.json");
+		mkdirSync(selfPackageDir, { recursive: true });
+		writeFileSync(
+			fakeNpmPath,
+			`const fs=require("node:fs"),path=require("node:path"),args=process.argv.slice(2),prefix=args[args.indexOf("--prefix")+1];
+if(args.includes("root")) console.log(path.join(prefix,"lib","node_modules"));
+else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
+`,
+		);
+		writeFileSync(
+			join(agentDir, "settings.json"),
+			JSON.stringify({ npmCommand: [originalExecPath, fakeNpmPath, "--prefix", globalPrefix] }, null, 2),
+		);
+		process.env.PI_PACKAGE_DIR = selfPackageDir;
+		Object.defineProperty(process, "execPath", {
+			value: join(selfPackageDir, "dist", "cli.js"),
+			configurable: true,
+		});
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => new Response(null, { status: 503 })),
+		);
+
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		try {
+			await expect(runSelfUpdateInstallChild(["update", "--self", "--force"])).resolves.toBeUndefined();
+
+			expect(process.exitCode).toBe(1);
+			expect(errorSpy.mock.calls.map(([message]) => String(message)).join("\n")).toContain(
+				"Could not resolve an installable fork release; update cancelled.",
+			);
+			expect(existsSync(recordPath)).toBe(false);
 		} finally {
 			logSpy.mockRestore();
 			errorSpy.mockRestore();
@@ -460,7 +515,13 @@ if(args.includes("install")) process.exit(23);
 		const activePackageName = PACKAGE_NAME === "@new-scope/pi" ? "@newer-scope/pi" : "@new-scope/pi";
 		vi.stubGlobal(
 			"fetch",
-			vi.fn(async () => Response.json({ packageName: activePackageName, version: "0.73.0" })),
+			vi.fn(async () =>
+				Response.json({
+					packageName: activePackageName,
+					tarball: "https://github.com/canesin/prime-agent/releases/download/v0.73.0/prime-agent-0.73.0.tgz",
+					version: "0.73.0",
+				}),
+			),
 		);
 
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -476,8 +537,11 @@ if(args.includes("install")) process.exit(23);
 			expect(stderr).toContain("exited with code 23");
 			const recordedCalls = JSON.parse(readFileSync(recordPath, "utf-8")) as string[][];
 			expect(recordedCalls).toEqual([
-				expect.arrayContaining(["uninstall", "-g", PACKAGE_NAME]),
-				expect.arrayContaining(["install", "-g", activePackageName]),
+				expect.arrayContaining([
+					"install",
+					"-g",
+					"https://github.com/canesin/prime-agent/releases/download/v0.73.0/prime-agent-0.73.0.tgz",
+				]),
 			]);
 		} finally {
 			logSpy.mockRestore();

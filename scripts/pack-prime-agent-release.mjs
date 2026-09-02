@@ -152,8 +152,33 @@ function npmTarballName(packageName, version) {
 	return `${packageName.replace(/^@/, "").replace("/", "-")}-${version}.tgz`;
 }
 
+function githubReleaseTarballUrl(baseUrl, version, tarballFile) {
+	const suffix = "/releases/latest/download";
+	let parsed;
+	try {
+		parsed = new URL(baseUrl);
+	} catch {
+		return undefined;
+	}
+	if (
+		parsed.protocol !== "https:" ||
+		parsed.hostname !== "github.com" ||
+		parsed.search ||
+		parsed.hash ||
+		!parsed.pathname.endsWith(suffix)
+	) {
+		return undefined;
+	}
+	const repositoryPath = parsed.pathname.slice(0, -suffix.length);
+	return `${parsed.origin}${repositoryPath}/releases/download/v${version}/${tarballFile}`;
+}
+
 function releaseTarballUrl(baseUrl, version, tarballFile) {
-	return `${baseUrl}/releases/v${version}/${tarballFile}`;
+	return githubReleaseTarballUrl(baseUrl, version, tarballFile) || `${baseUrl}/releases/v${version}/${tarballFile}`;
+}
+
+function releaseManifestTarball(baseUrl, version, tarballFile) {
+	return githubReleaseTarballUrl(baseUrl, version, tarballFile) || `releases/v${version}/${tarballFile}`;
 }
 
 function rewriteInternalDependencies(dependencies, internalPackageUrls) {
@@ -328,7 +353,7 @@ function main() {
 	writeJson(join(artifactsDir, manifestName), {
 		version: `v${releaseVersion}`,
 		package: publicPackageName,
-		tarball: `releases/v${releaseVersion}/${artifactFiles.get("coding-agent")}`,
+		tarball: releaseManifestTarball(args.baseUrl, releaseVersion, artifactFiles.get("coding-agent")),
 		tarballs: tarballs.map((tarball) => ({
 			package: tarball.name,
 			file: tarball.file,

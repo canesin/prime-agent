@@ -431,6 +431,7 @@ interface SelfUpdatePlan {
 	packageName: string;
 	shouldRun: boolean;
 	targetVersion?: string;
+	failure?: string;
 }
 
 function setSelfUpdateNoChangeExitCode(): void {
@@ -441,19 +442,26 @@ function setSelfUpdateNoChangeExitCode(): void {
 async function getSelfUpdatePlan(force: boolean): Promise<SelfUpdatePlan> {
 	try {
 		const latestRelease = await getLatestPiRelease(VERSION);
+		if (!latestRelease?.installSpec) {
+			return {
+				failure: "Could not resolve an installable fork release; update cancelled.",
+				installSpec: PACKAGE_NAME,
+				packageName: PACKAGE_NAME,
+				shouldRun: false,
+			};
+		}
 		const packageName = latestRelease?.packageName ?? PACKAGE_NAME;
-		const installSpec = latestRelease?.installSpec ?? packageName;
-		const packageRenameRequiresUpdate = !latestRelease?.installSpec && packageName !== PACKAGE_NAME;
-		if (
-			force ||
-			!latestRelease ||
-			packageRenameRequiresUpdate ||
-			isNewerPackageVersion(latestRelease.version, VERSION)
-		) {
+		const installSpec = latestRelease.installSpec;
+		if (force || isNewerPackageVersion(latestRelease.version, VERSION)) {
 			return { installSpec, packageName, shouldRun: true, targetVersion: latestRelease?.version };
 		}
 	} catch {
-		return { installSpec: PACKAGE_NAME, packageName: PACKAGE_NAME, shouldRun: true };
+		return {
+			failure: "Could not resolve an installable fork release; update cancelled.",
+			installSpec: PACKAGE_NAME,
+			packageName: PACKAGE_NAME,
+			shouldRun: false,
+		};
 	}
 
 	console.log(chalk.green(`${APP_NAME} is already up to date (v${VERSION})`));
@@ -1567,6 +1575,11 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 				if (updateTargetIncludesSelf(target)) {
 					const selfUpdatePlan = await getSelfUpdatePlan(options.force);
 					if (!selfUpdatePlan.shouldRun) {
+						if (selfUpdatePlan.failure) {
+							console.error(chalk.red(`Error: ${selfUpdatePlan.failure}`));
+							process.exitCode = 1;
+							return true;
+						}
 						setSelfUpdateNoChangeExitCode();
 						return true;
 					}
