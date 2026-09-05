@@ -28,7 +28,14 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "./messages.js";
-import { cloneUsage } from "./usage.js";
+import {
+	addAssistantUsage,
+	cloneUsage,
+	emptyUsage,
+	type SessionUsageSummary,
+	sessionUsageSummaryFrom,
+	subtractAssistantUsage,
+} from "./usage.js";
 
 export const CURRENT_SESSION_VERSION = 3;
 const SESSION_LIST_SEARCH_TEXT_MAX_CHARS = 64 * 1024;
@@ -131,6 +138,7 @@ export interface CompactionEntry<T = unknown> extends SessionEntryBase {
 	details?: T;
 	fromHook?: boolean;
 	customInstructions?: string;
+	usage?: Usage;
 }
 
 export interface BranchSummaryEntry<T = unknown> extends SessionEntryBase {
@@ -139,6 +147,7 @@ export interface BranchSummaryEntry<T = unknown> extends SessionEntryBase {
 	summary: string;
 	details?: T;
 	fromHook?: boolean;
+	usage?: Usage;
 }
 
 export interface CustomEntry<T = unknown> extends SessionEntryBase {
@@ -257,6 +266,7 @@ export interface SessionInfo {
 	firstMessage: string;
 	allMessagesText: string;
 	agentStatus?: AgentStatus;
+	usage?: SessionUsageSummary;
 }
 
 export type ReadonlySessionManager = Pick<
@@ -958,6 +968,10 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 		let state: SessionState | undefined;
 		let agentStatus: AgentStatus | undefined;
 		let lastActivityTime: number | undefined;
+		// Fold attribution aggregates like the loader: either disk representation cancels to the same own spend.
+		const assistantUsageById = new Map<string, Usage>();
+		const attributedChildUsages: Usage[] = [];
+		const summarizationUsages: Usage[] = [];
 
 		for await (const lineBuffer of readLinesAsBuffers(filePath)) {
 			const line = lineBuffer.toString("utf8");
@@ -1004,7 +1018,17 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 			if (entry.type === "agent_status") {
 				agentStatus = (entry as AgentStatusEntry).status;
 			}
-
+			if (entry.type === "child_usage_attributed") {
+				const attribution = entry as ChildUsageAttributionEntry;
+				if (assistantUsageById.has(attribution.targetId)) {
+					assistantUsageById.set(attribution.targetId, attribution.aggregateUsage);
+					attributedChildUsages.push(attribution.childUsage);
+				}
+			}
+			if (entry.type === "compaction" || entry.type === "branch_summary") {
+				const summarizationUsage = (entry as CompactionEntry | BranchSummaryEntry).usage;
+				if (summarizationUsage) summarizationUsages.push(summarizationUsage);
+			}
 			if (!header) {
 				if (entry.type !== "session") {
 					return null;
@@ -1018,6 +1042,9 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 			messageCount++;
 
 			const message = (entry as SessionMessageEntry).message;
+			if (message.role === "assistant" && (message as { usage?: Usage }).usage) {
+				assistantUsageById.set(entry.id, (message as { usage: Usage }).usage);
+			}
 			if (!isMessageWithContent(message)) continue;
 			if (message.role !== "user" && message.role !== "assistant") continue;
 
@@ -1031,6 +1058,16 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 		}
 
 		if (!header) return null;
+		const usageTotal = emptyUsage();
+		for (const usage of assistantUsageById.values()) {
+			addAssistantUsage(usageTotal, usage);
+		}
+		for (const usage of summarizationUsages) {
+			addAssistantUsage(usageTotal, usage);
+		}
+		for (const childUsage of attributedChildUsages) {
+			subtractAssistantUsage(usageTotal, childUsage);
+		}
 		const cwd = typeof header.cwd === "string" ? header.cwd : "";
 		const parentSessionPath = header.parentSession;
 		const rlmDepth = resolveSessionRlmDepth(header, filePath);
@@ -1050,6 +1087,7 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 			firstMessage: firstMessage || "(no messages)",
 			allMessagesText,
 			agentStatus,
+			usage: sessionUsageSummaryFrom(usageTotal),
 		};
 	} catch {
 		return null;
@@ -1462,6 +1500,7 @@ export class SessionManager {
 		details?: T,
 		fromHook?: boolean,
 		customInstructions?: string,
+		usage?: Usage,
 	): string {
 		const entry: CompactionEntry<T> = {
 			type: "compaction",
@@ -1474,6 +1513,7 @@ export class SessionManager {
 			details,
 			fromHook,
 			customInstructions,
+			usage,
 		};
 		this._appendEntry(entry);
 		return entry.id;
@@ -1851,7 +1891,13 @@ export class SessionManager {
 		this.leafId = null;
 	}
 
-	branchWithSummary(branchFromId: string | null, summary: string, details?: unknown, fromHook?: boolean): string {
+	branchWithSummary(
+		branchFromId: string | null,
+		summary: string,
+		details?: unknown,
+		fromHook?: boolean,
+		usage?: Usage,
+	): string {
 		if (branchFromId !== null && !this.byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
@@ -1865,6 +1911,7 @@ export class SessionManager {
 			summary,
 			details,
 			fromHook,
+			usage,
 		};
 		this._appendEntry(entry);
 		return entry.id;
