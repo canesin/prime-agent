@@ -23,6 +23,7 @@ import type { CustomMessage } from "../../core/messages.js";
 import type { QueuedMessageLane, QueuedMessageMutation } from "../../core/session-action-store.js";
 import type { SessionCwdIssue } from "../../core/session-cwd.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
+import type { SessionUsageSummary } from "../../core/usage.js";
 import type {
 	AgentConnectionAgentStatus,
 	AgentConnectionHeartbeat,
@@ -71,11 +72,12 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 23 lets workers query the supervisor agent roster on demand.
 // Revision 24 adds the capability-gated agent-roster subscription and push.
 // Revision 25 adds capability-gated direct worker peer transport discovery.
-// Revision 26 adds compare-and-cancel RLM child runs and delivery-time fenced cron prompts.
-// Revision 27 adds an exact-idle, session-only profile transition.
-// Revision 28 adds capability-gated, fenced follow-ups for unchanged active goals.
-export const DAEMON_SCHEMA_REVISION = 28;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-28-c13079c67bc3";
+// Revision 26 publishes own-session usage totals on session summary and saved-session rows.
+// Revision 27 adds compare-and-cancel RLM child runs and delivery-time fenced cron prompts.
+// Revision 28 adds an exact-idle, session-only profile transition.
+// Revision 29 adds capability-gated, fenced follow-ups for unchanged active goals.
+export const DAEMON_SCHEMA_REVISION = 29;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-29-0fce2e449985";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -1163,6 +1165,7 @@ export interface DaemonSavedSessionInfo {
 	firstMessage: string;
 	allMessagesText: string;
 	agentStatus?: AgentConnectionAgentStatus;
+	usage?: SessionUsageSummary;
 }
 
 export type DaemonDeleteSavedSessionResult = DeleteSessionFileResult;
