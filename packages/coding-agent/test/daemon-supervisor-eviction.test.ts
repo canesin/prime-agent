@@ -6,7 +6,12 @@ import { getSessionsDir } from "../src/config.js";
 import { type AgentCronJob, AgentCronJobStore, SESSION_SCHEDULED_JOBS_FILENAME } from "../src/core/cron-jobs.js";
 import { getSessionArtifactPathForFile, type SessionInfo } from "../src/core/session-manager.js";
 import { workerRosterEntryFromSummary } from "../src/modes/daemon/agent-roster.js";
-import { success } from "../src/modes/daemon/daemon-protocol.js";
+import {
+	DAEMON_DEFAULT_SERVER_CAPABILITIES,
+	DAEMON_PROTOCOL_INFO,
+	DAEMON_SCHEMA_REVISION,
+	success,
+} from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor, idleEvictionSweepIntervalMs } from "../src/modes/daemon/daemon-supervisor.js";
 import { seedSupervisorRoster } from "./fixtures/roster-seed.js";
@@ -36,6 +41,11 @@ interface WorkerFixture {
 	snapshotCache?: Map<string, unknown>;
 	stopRevision?: number;
 	client?: {
+		hello?: {
+			protocol: typeof DAEMON_PROTOCOL_INFO;
+			schemaRevision: number;
+			serverCapabilities: typeof DAEMON_DEFAULT_SERVER_CAPABILITIES;
+		};
 		request: ReturnType<typeof vi.fn>;
 		requestWorker: ReturnType<typeof vi.fn>;
 		close: ReturnType<typeof vi.fn>;
@@ -105,7 +115,17 @@ function makeSummary(id: string, now: number, overrides: Partial<SessionSummary>
 
 function makeWorker(id: string, summaries: SessionSummary[]): WorkerFixture {
 	const client = {
-		request: vi.fn(async () => success(undefined, "list", { sessions: summaries })),
+		hello: {
+			protocol: DAEMON_PROTOCOL_INFO,
+			schemaRevision: DAEMON_SCHEMA_REVISION,
+			serverCapabilities: DAEMON_DEFAULT_SERVER_CAPABILITIES,
+		},
+		request: vi.fn(async (command?: { type?: string }) => {
+			if (command?.type === "heartbeats_list") {
+				return success(undefined, "heartbeats_list", { heartbeats: [] });
+			}
+			return success(undefined, "list", { sessions: summaries });
+		}),
 		requestWorker: vi.fn(),
 		close: vi.fn(),
 	};
