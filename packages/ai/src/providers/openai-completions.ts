@@ -39,6 +39,7 @@ import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js"
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
 import { buildBaseOptions } from "./simple-options.js";
 import { transformMessages } from "./transform-messages.js";
+import { getZaiThinkingLevelMap } from "./zai.js";
 
 /**
  * Check if conversation messages contain tool calls or tool results.
@@ -629,7 +630,21 @@ function buildParams(
 	}
 
 	if (compat.thinkingFormat === "zai" && model.reasoning) {
-		(params as any).enable_thinking = !!options?.reasoningEffort;
+		if (compat.supportsReasoningEffort) {
+			const zaiParams = params as typeof params & { thinking?: { type: "enabled" | "disabled" } };
+			const requested = options?.reasoningEffort ?? (options?.reasoningEnabled === false ? "off" : undefined);
+			if (requested !== undefined) {
+				const effort = clampThinkingLevel(model, requested);
+				zaiParams.thinking = { type: effort === "off" ? "disabled" : "enabled" };
+				if (effort !== "off") {
+					zaiParams.reasoning_effort = (model.thinkingLevelMap?.[effort] ?? effort) as NonNullable<
+						typeof params.reasoning_effort
+					>;
+				}
+			}
+		} else {
+			(params as any).enable_thinking = !!options?.reasoningEffort;
+		}
 	} else if (compat.thinkingFormat === "qwen" && model.reasoning) {
 		(params as any).enable_thinking = !!options?.reasoningEffort;
 	} else if (compat.thinkingFormat === "qwen-chat-template" && model.reasoning) {
@@ -1185,7 +1200,8 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
 	return {
 		supportsStore: !isNonStandard,
 		supportsDeveloperRole: !isNonStandard,
-		supportsReasoningEffort: !isGrok && !isZai && !isMoonshot && !isCloudflareAiGateway,
+		supportsReasoningEffort:
+			!!getZaiThinkingLevelMap(model) || (!isGrok && !isZai && !isMoonshot && !isCloudflareAiGateway),
 		supportsUsageInStreaming: true,
 		maxTokensField: useMaxTokens ? "max_tokens" : "max_completion_tokens",
 		requiresToolResultName: false,

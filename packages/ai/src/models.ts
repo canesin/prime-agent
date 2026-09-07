@@ -1,4 +1,5 @@
 import { MODELS } from "./models.generated.js";
+import { getZaiThinkingLevelMap } from "./providers/zai.js";
 import type { Api, KnownProvider, Model, ModelThinkingLevel, Usage } from "./types.js";
 
 const modelRegistry: Map<string, Map<string, Model<Api>>> = new Map();
@@ -66,9 +67,10 @@ const EXTENDED_THINKING_LEVELS: ModelThinkingLevel[] = ["off", "minimal", "low",
 
 export function getSupportedThinkingLevels<TApi extends Api>(model: Model<TApi>): ModelThinkingLevel[] {
 	if (!model.reasoning) return ["off"];
+	const thinkingLevelMap = { ...getZaiThinkingLevelMap(model), ...model.thinkingLevelMap };
 
 	return EXTENDED_THINKING_LEVELS.filter((level) => {
-		const mapped = model.thinkingLevelMap?.[level];
+		const mapped = thinkingLevelMap[level];
 		if (mapped === null) return false;
 		if (level === "xhigh" || level === "max") return mapped !== undefined;
 		return true;

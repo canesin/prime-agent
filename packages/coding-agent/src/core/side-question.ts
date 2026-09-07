@@ -1,5 +1,5 @@
 import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, UserMessage } from "@earendil-works/pi-ai";
+import { type AssistantMessage, clampThinkingLevel, type UserMessage } from "@earendil-works/pi-ai";
 import { unwrapSemanticEdgeStreamFn } from "./semantic-edges.js";
 
 export type SideQuestionStatus = "running" | "complete" | "cancelled" | "error";
@@ -38,6 +38,16 @@ function readAssistantText(message: AgentMessage): string {
 		.filter((block) => block.type === "text")
 		.map((block) => block.text)
 		.join("");
+}
+
+function requiresThinking(errorMessage: string): boolean {
+	return (
+		/\b(?:thinking|reasoning)\b[^.\n]{0,80}\b(?:cannot|can't|can not) be (?:disabled|turned off)\b/i.test(
+			errorMessage,
+		) ||
+		/\b(?:thinking|reasoning)(?: mode)? (?:is required|is mandatory|must be enabled)\b/i.test(errorMessage) ||
+		/\bdisabling (?:thinking|reasoning) is (?:not|no longer) supported\b/i.test(errorMessage)
+	);
 }
 
 export function startSideQuestion(
@@ -79,12 +89,18 @@ export function startSideQuestion(
 		} satisfies AssistantMessage,
 	]);
 
+	const initialMessages = [...structuredClone(parent.state.messages), ...previousTurnMessages];
+	const thinkingLevel = clampThinkingLevel(model, "off");
+	const retryThinkingLevel = clampThinkingLevel(
+		model,
+		parent.state.thinkingLevel === "off" ? "low" : parent.state.thinkingLevel,
+	);
 	const sideAgent = new Agent({
 		initialState: {
 			model,
 			systemPrompt: parent.state.systemPrompt,
-			messages: [...structuredClone(parent.state.messages), ...previousTurnMessages],
-			thinkingLevel: "off",
+			messages: initialMessages,
+			thinkingLevel,
 			serviceTier: parent.state.serviceTier,
 			tools: [],
 		},
@@ -104,6 +120,7 @@ export function startSideQuestion(
 	});
 
 	let answer = "";
+	let receivedOutput = false;
 	let abortRequested = false;
 	let started = false;
 	const emit = (status: SideQuestionStatus, errorMessage?: string) =>
@@ -112,6 +129,17 @@ export function startSideQuestion(
 	const unsubscribe = sideAgent.subscribe(async (event) => {
 		if (event.type !== "message_update" && event.type !== "message_end") {
 			return;
+		}
+		if (event.message.role === "assistant") {
+			receivedOutput ||=
+				event.message.usage.output > 0 ||
+				event.message.content.some((block) =>
+					block.type === "text"
+						? block.text.length > 0
+						: block.type === "thinking"
+							? !!(block.thinking || block.thinkingSignature || block.redacted)
+							: true,
+				);
 		}
 		const nextAnswer = readAssistantText(event.message);
 		if (nextAnswer === answer) {
@@ -131,6 +159,20 @@ export function startSideQuestion(
 			}
 			started = true;
 			await sideAgent.prompt(prompt);
+			if (
+				!abortRequested &&
+				!receivedOutput &&
+				thinkingLevel === "off" &&
+				retryThinkingLevel !== "off" &&
+				sideAgent.state.errorMessage &&
+				requiresThinking(sideAgent.state.errorMessage)
+			) {
+				// Custom providers may lack capability metadata. Retry once using the
+				// parent's reasoning preference, without replaying the rejected request.
+				sideAgent.state.messages = initialMessages;
+				sideAgent.state.thinkingLevel = retryThinkingLevel;
+				await sideAgent.prompt(prompt);
+			}
 			if (abortRequested) {
 				await emit("cancelled");
 				return;
