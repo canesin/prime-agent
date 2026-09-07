@@ -1,0 +1,1 @@
+- Fixed Z.ai GLM-5.3 reasoning compatibility across Anthropic Messages, OpenAI Chat Completions, and Responses APIs, including custom provider definitions.

@@ -21,6 +21,7 @@ import {
 	type OpenAICompletionsCompat,
 } from "../src/types.js";
 import { MODELS as EXISTING_MODELS } from "../src/models.generated.js";
+import { getZaiThinkingLevelMap } from "../src/providers/zai.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -279,6 +280,13 @@ function isGemma4Model(modelId: string): boolean {
 }
 
 function applyThinkingLevelMetadata(model: Model<any>): void {
+	const zaiThinkingLevelMap = getZaiThinkingLevelMap(model);
+	if (zaiThinkingLevelMap) {
+		mergeThinkingLevelMap(model, zaiThinkingLevelMap);
+		if (model.api === "openai-completions") {
+			model.compat = { ...model.compat, supportsReasoningEffort: true };
+		}
+	}
 	if (
 		(model.api === "openai-responses" || model.api === "azure-openai-responses") &&
 		model.id.startsWith("gpt-5")
@@ -2392,7 +2400,10 @@ async function generateModels() {
 	for (const model of allModels) {
 		applyThinkingLevelMetadata(model);
 	}
+	writeModels(allModels);
+}
 
+function writeModels(allModels: Model<Api>[]): void {
 	// Group by provider and deduplicate by model ID
 	const providers: Record<string, Record<string, Model<any>>> = {};
 	for (const model of allModels) {
@@ -2481,5 +2492,13 @@ export const MODELS = {
 	}
 }
 
-// Run the generator
-generateModels().catch(console.error);
+// Refresh capability metadata without unrelated live catalog changes.
+if (process.argv.includes("--metadata-only")) {
+	const models: Model<Api>[] = Object.values(EXISTING_MODELS).flatMap((provider) =>
+		Object.values(provider).map((model) => structuredClone(model) as Model<Api>),
+	);
+	for (const model of models) applyThinkingLevelMetadata(model);
+	writeModels(models);
+} else {
+	generateModels().catch(console.error);
+}

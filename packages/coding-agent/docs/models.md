@@ -245,6 +245,10 @@ Example for a model where thinking cannot be disabled:
 
 Migration: older configs that used `compat.reasoningEffortMap` should move that mapping to model-level `thinkingLevelMap`. Use `null` for levels that should not appear in the UI.
 
+`/btw` requests the lowest supported thinking level. When `off` is unsupported, it enables thinking without changing the main session's setting. If incomplete metadata causes an explicit thinking-disabled rejection before any output, it retries once using the main session's thinking level, or `low` when the main session has thinking off. Other errors and cancelled or partially generated responses are not retried this way.
+
+GLM-5.3 models on Z.ai automatically use `low`, `high`, and `max` across `anthropic-messages`, `openai-completions`, and `openai-responses`, including custom provider names pointing to `api.z.ai`. Set `reasoning: true` on custom model definitions. Explicit `thinkingLevelMap` entries override these defaults. For other providers, declare unsupported levels with `null` as shown above.
+
 ## Overriding Built-in Providers
 
 Route a built-in provider through a proxy without redefining models:

@@ -8,7 +8,7 @@ import type {
 } from "@anthropic-ai/sdk/resources/messages.js";
 import { getAnthropicCacheWriteCost, hasStandardAnthropicCachePricing } from "../cache-pricing.js";
 import { getEnvApiKey } from "../env-api-keys.js";
-import { calculateCost, clampThinkingLevel } from "../models.js";
+import { calculateCost, clampThinkingLevel, getSupportedThinkingLevels } from "../models.js";
 import type {
 	AnthropicMessagesCompat,
 	Api,
@@ -806,14 +806,15 @@ export const streamSimpleAnthropic: StreamFunction<"anthropic-messages", SimpleS
 	}
 
 	const base = buildBaseOptions(model, options, apiKey);
-	if (!options?.reasoning || options.reasoning === "off") {
+	const reasoning = options?.reasoning !== undefined ? clampThinkingLevel(model, options.reasoning) : undefined;
+	if (!reasoning || reasoning === "off") {
 		return streamAnthropic(model, context, { ...base, thinkingEnabled: false } satisfies AnthropicOptions);
 	}
 
 	// For Opus 4.6 and Sonnet 4.6: use adaptive thinking with effort level
 	// For older models: use budget-based thinking
 	if (supportsAdaptiveThinking(model.id)) {
-		const effort = mapThinkingLevelToEffort(model, options.reasoning);
+		const effort = mapThinkingLevelToEffort(model, reasoning);
 		return streamAnthropic(model, context, {
 			...base,
 			thinkingEnabled: true,
@@ -824,8 +825,8 @@ export const streamSimpleAnthropic: StreamFunction<"anthropic-messages", SimpleS
 	const adjusted = adjustMaxTokensForThinking(
 		base.maxTokens || 0,
 		model.maxTokens,
-		options.reasoning,
-		options.thinkingBudgets,
+		reasoning,
+		options?.thinkingBudgets,
 	);
 
 	return streamAnthropic(model, context, {
@@ -1025,7 +1026,11 @@ function buildParams(
 					display,
 				};
 			}
-		} else if (options?.thinkingEnabled === false && !isAlwaysOnAdaptiveThinkingModel(model.id)) {
+		} else if (
+			options?.thinkingEnabled === false &&
+			getSupportedThinkingLevels(model).includes("off") &&
+			!isAlwaysOnAdaptiveThinkingModel(model.id)
+		) {
 			params.thinking = { type: "disabled" };
 		}
 	}

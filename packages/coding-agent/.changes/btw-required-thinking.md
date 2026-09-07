@@ -1,0 +1,1 @@
+- Fixed `/btw` for models that require thinking by selecting a supported level and retrying an explicit thinking-disabled rejection once when model metadata is incomplete.
