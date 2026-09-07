@@ -1,1 +1,2 @@
 - Fixed resumed sessions inheriting the daemon supervisor's working directory instead of their saved project directory.
+- Fixed `/name` crashing when another session already uses the requested name and clearing input typed while a rename is pending.
