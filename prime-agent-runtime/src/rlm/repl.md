@@ -68,6 +68,13 @@ runtime keeps serving. Closing stdin is equivalent to `shutdown`.
   `reason`. Restoring a missing file reports `status:"ok"` with empty
   `restored`/`failed` lists and `reason:"snapshot not found"`.
 
+`ready` and `done` also carry optional `cwd` metadata: the kernel process's
+absolute working directory, or `null` when it cannot be resolved (for example,
+after deleting the current directory). This reports `os.chdir()` changes even
+when a cell fails. It does not change the session's project directory or the
+directory used to start a replacement kernel. Hosts may ignore this additive
+metadata; runtimes without it remain usable with protocol `3`.
+
 Before a cell's `done`, the runtime drains both channels: tagged Python-level
 writes ship synchronously from the writing thread, and the fd pipes are fenced
 with a marker byte sequence awaited in the pumps, so every byte the cell wrote

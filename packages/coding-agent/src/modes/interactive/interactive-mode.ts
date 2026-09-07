@@ -474,7 +474,9 @@ export class BrandSplashHeader implements Component {
 		const valueWidth = Math.max(1, metaWidth - this.labelWidth);
 		const labelled = (label: string, value: string) => {
 			const displayValue =
-				label === "cwd" ? truncatePathMiddle(value, valueWidth) : truncateToWidth(value, valueWidth);
+				label === "cwd" || label === "cwd (py)"
+					? truncatePathMiddle(value, valueWidth)
+					: truncateToWidth(value, valueWidth);
 			return theme.fg("dim", label.padEnd(this.labelWidth)) + theme.fg("muted", displayValue);
 		};
 		const extraMetadata = this.options.getExtraMetadata?.() ?? [];
@@ -4783,8 +4785,8 @@ export class InteractiveMode {
 					return;
 				}
 				if (commandName === "name") {
-					await this.handleNameCommand(canonicalCommandText);
 					this.editor.setText("");
+					await this.handleNameCommand(canonicalCommandText);
 					return;
 				}
 				if (commandName === "rlm-max-depth") {
@@ -9208,7 +9210,12 @@ export class InteractiveMode {
 			return;
 		}
 
-		await this.agentConnection.setSessionName(name);
+		try {
+			await this.agentConnection.setSessionName(name);
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+			return;
+		}
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new Text(theme.fg("dim", `Session name set: ${name}`), 1, 0));
 		this.ui.requestRender();

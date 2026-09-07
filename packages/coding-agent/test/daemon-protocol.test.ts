@@ -22,6 +22,7 @@ import {
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
 	isSessionPlaneDaemonCommand,
+	meetsDaemonCommandCompatibility,
 	salvageDaemonCommandId,
 } from "../src/modes/daemon/daemon-protocol.js";
 import {
@@ -183,6 +184,7 @@ describe("daemon protocol helpers", () => {
 			minProtocol: 7,
 			minSchemaRevision: 27,
 			capability: "conditional_session_profile",
+			optionalMetadata: ["kernel_cwd"],
 		});
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("conditional_session_profile");
 	});
@@ -211,17 +213,17 @@ describe("daemon protocol helpers", () => {
 
 	it("schema-gates session commands that carry the telemetry policy", () => {
 		expect(getDaemonCommandCompatibilities({ type: "create", config: { cwd: "/tmp" } })).toEqual([
-			{ minProtocol: 7 },
+			DAEMON_COMMAND_COMPATIBILITY.create,
 		]);
 		expect(
 			getDaemonCommandCompatibilities({ type: "create", config: { cwd: "/tmp", telemetryDisabled: true } }),
-		).toEqual([{ minProtocol: 7, minSchemaRevision: 14 }, { minProtocol: 7 }]);
+		).toEqual([{ minProtocol: 7, minSchemaRevision: 14 }, DAEMON_COMMAND_COMPATIBILITY.create]);
 		expect(getDaemonCommandCompatibilities({ type: "attach", activeSessionId: "active-1" })).toEqual([
-			{ minProtocol: 7 },
+			DAEMON_COMMAND_COMPATIBILITY.attach,
 		]);
 		expect(
 			getDaemonCommandCompatibilities({ type: "attach", activeSessionId: "active-1", telemetryDisabled: true }),
-		).toEqual([{ minProtocol: 7, minSchemaRevision: 14 }, { minProtocol: 7 }]);
+		).toEqual([{ minProtocol: 7, minSchemaRevision: 14 }, DAEMON_COMMAND_COMPATIBILITY.attach]);
 		expect(
 			getDaemonCommandCompatibilities({
 				type: "reattach",
@@ -229,7 +231,7 @@ describe("daemon protocol helpers", () => {
 				targetActiveSessionId: "active-2",
 				telemetryDisabled: true,
 			}),
-		).toEqual([{ minProtocol: 7, minSchemaRevision: 14 }, { minProtocol: 7 }]);
+		).toEqual([{ minProtocol: 7, minSchemaRevision: 14 }, DAEMON_COMMAND_COMPATIBILITY.reattach]);
 	});
 
 	it("capability-gates authoritative rosters and transient owned-session recovery context", () => {
@@ -246,7 +248,7 @@ describe("daemon protocol helpers", () => {
 			}),
 		).toEqual([
 			{ minProtocol: 7, minSchemaRevision: 17, capability: "owned_session_recovery_context" },
-			{ minProtocol: 7 },
+			DAEMON_COMMAND_COMPATIBILITY.attach,
 		]);
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toEqual(
 			expect.arrayContaining([
@@ -414,9 +416,12 @@ describe("daemon protocol helpers", () => {
 	it("keeps the roster push additive for pre-roster clients", () => {
 		// Subscription commands and the push are capability-gated; a client that
 		// never sends roster_subscribe is never written a roster_update.
-		expect(DAEMON_COMMAND_COMPATIBILITY.roster_subscribe).toEqual({ minProtocol: 7, capability: "agent_roster" });
+		expect(DAEMON_COMMAND_COMPATIBILITY.roster_subscribe).toMatchObject({
+			minProtocol: 7,
+			capability: "agent_roster",
+		});
 		expect(DAEMON_COMMAND_COMPATIBILITY.roster_unsubscribe).toEqual({ minProtocol: 7, capability: "agent_roster" });
-		expect(DAEMON_OUTBOUND_COMPATIBILITY.roster_update).toEqual({ minProtocol: 7, capability: "agent_roster" });
+		expect(DAEMON_OUTBOUND_COMPATIBILITY.roster_update).toMatchObject({ minProtocol: 7, capability: "agent_roster" });
 		// list responses now carry rosterStatus/statusLabel/lastHeardFromAt; the
 		// summary validator pre-roster clients shipped stays open to additive fields.
 		expect(
@@ -427,6 +432,36 @@ describe("daemon protocol helpers", () => {
 				statusLabel: "queued",
 				lastHeardFromAt: "2026-08-01T12:00:00.000Z",
 			}),
+		).toBe(true);
+	});
+
+	it("keeps Python directory metadata optional for new clients talking to older daemons", () => {
+		const oldDaemon = { protocol: DAEMON_PROTOCOL_INFO, schemaRevision: 29, serverCapabilities: [] };
+		for (const command of ["list", "create", "attach", "reattach", "rename", "get_state"] as const) {
+			const compatibility = DAEMON_COMMAND_COMPATIBILITY[command];
+			expect(compatibility.optionalMetadata).toContain("kernel_cwd");
+			expect(meetsDaemonCommandCompatibility(oldDaemon, compatibility)).toBe(true);
+		}
+		expect(DAEMON_SCHEMA_REVISION).toBeGreaterThanOrEqual(30);
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("kernel_cwd");
+		expect(DAEMON_OUTBOUND_COMPATIBILITY.roster_update.optionalMetadata).toContain("kernel_cwd");
+	});
+
+	it("keeps new daemon summaries readable by clients that only understand project cwd", () => {
+		const summary = {
+			id: "active-1",
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			cwd: "/project",
+			kernelCwd: "/project/nested",
+		};
+		expect(isDaemonSessionSummary(JSON.parse(JSON.stringify(summary)))).toBe(true);
+		expect(summary.cwd).toBe("/project");
+		expect(
+			meetsDaemonCommandCompatibility(
+				{ protocol: DAEMON_PROTOCOL_INFO, serverCapabilities: DAEMON_DEFAULT_SERVER_CAPABILITIES },
+				{ minProtocol: 7 },
+			),
 		).toBe(true);
 	});
 

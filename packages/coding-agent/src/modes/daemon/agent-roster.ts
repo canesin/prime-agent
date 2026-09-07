@@ -94,6 +94,7 @@ export function passivatedWorkerRosterEntry(
 		isRunningTools,
 		workerState,
 		workerPid,
+		kernelCwd,
 		...summary
 	} = entry.summary;
 	return {

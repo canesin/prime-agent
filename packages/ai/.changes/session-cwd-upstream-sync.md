@@ -1,0 +1,1 @@
+- Added upstream v0.9.3 model catalog and provider client identity updates.

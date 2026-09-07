@@ -1,0 +1,3 @@
+- Fixed resumed sessions inheriting the daemon supervisor's working directory instead of their saved project directory, including when the supervisor's directory has been removed.
+- Fixed `/name` crashing when another session already uses the requested name and clearing input typed while a rename is pending.
+- Added the live Python working directory to the agents view when it differs from the session's project directory, hiding stale metadata during worker failures and daemon disconnections.

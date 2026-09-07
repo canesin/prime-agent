@@ -76,8 +76,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 27 adds compare-and-cancel RLM child runs and delivery-time fenced cron prompts.
 // Revision 28 adds an exact-idle, session-only profile transition.
 // Revision 29 adds capability-gated, fenced follow-ups for unchanged active goals.
-export const DAEMON_SCHEMA_REVISION = 29;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-29-0fce2e449985";
+// Revision 30 adds optional live Python directory metadata to session summaries.
+export const DAEMON_SCHEMA_REVISION = 30;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-30-0fce2e449985";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -128,6 +129,7 @@ export type DaemonServerCapability =
 	| "conditional_cron_delivery"
 	| "conditional_cron_follow_up"
 	| "conditional_session_profile"
+	| "kernel_cwd"
 	| "direct_peer_transport";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
@@ -177,6 +179,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"conditional_cron_delivery",
 	"conditional_cron_follow_up",
 	"conditional_session_profile",
+	"kernel_cwd",
 ];
 
 export interface DaemonSessionProfilePrecondition {
@@ -735,10 +738,13 @@ export interface DaemonCommandCompatibility {
 	minProtocol: number;
 	minSchemaRevision?: number;
 	capability?: DaemonServerCapability;
+	/** Additive response/event metadata; never a prerequisite for the command or event. */
+	optionalMetadata?: readonly DaemonServerCapability[];
 }
 
 const LEGACY_DAEMON_COMMAND = { minProtocol: 7 } as const;
 const CURRENT_DAEMON_COMMAND = { minProtocol: 7 } as const;
+const SESSION_SUMMARY_COMPATIBILITY = { minProtocol: 7, optionalMetadata: ["kernel_cwd"] } as const;
 const RLM_MAX_DEPTH_COMMAND = { minProtocol: 7, minSchemaRevision: 11 } as const;
 const SESSION_INPUT_ADMISSION_COMMAND = {
 	minProtocol: 7,
@@ -813,18 +819,18 @@ const CONDITIONAL_SESSION_PROFILE_COMMAND = {
 
 export const DAEMON_COMMAND_COMPATIBILITY = {
 	ack_result: LEGACY_DAEMON_COMMAND,
-	list: LEGACY_DAEMON_COMMAND,
+	list: SESSION_SUMMARY_COMPATIBILITY,
 	list_saved_sessions: LEGACY_DAEMON_COMMAND,
 	list_agent_peers: AGENT_PEER_LIST_COMMAND,
 	get_direct_worker_transport: DIRECT_PEER_TRANSPORT_COMMAND,
-	create: LEGACY_DAEMON_COMMAND,
-	attach: LEGACY_DAEMON_COMMAND,
-	reattach: LEGACY_DAEMON_COMMAND,
+	create: SESSION_SUMMARY_COMPATIBILITY,
+	attach: SESSION_SUMMARY_COMPATIBILITY,
+	reattach: SESSION_SUMMARY_COMPATIBILITY,
 	detach: LEGACY_DAEMON_COMMAND,
 	complete_owned_session: CLIENT_OWNED_DAEMON_COMMAND,
 	promote_owned_session: CLIENT_OWNED_DAEMON_COMMAND,
 	kill: LEGACY_DAEMON_COMMAND,
-	rename: LEGACY_DAEMON_COMMAND,
+	rename: SESSION_SUMMARY_COMPATIBILITY,
 	prompt: SESSION_INPUT_ADMISSION_COMMAND,
 	cancel_prompt_admission: PROMPT_ADMISSION_CANCELLATION_COMMAND,
 	prompt_and_wait: SESSION_INPUT_ADMISSION_COMMAND,
@@ -849,7 +855,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	wait_for_idle: LEGACY_DAEMON_COMMAND,
 	wait_for_headless_completion: CURRENT_DAEMON_COMMAND,
 	get_session_header: CURRENT_DAEMON_COMMAND,
-	get_state: LEGACY_DAEMON_COMMAND,
+	get_state: SESSION_SUMMARY_COMPATIBILITY,
 	get_connection_state: LEGACY_DAEMON_COMMAND,
 	get_messages: LEGACY_DAEMON_COMMAND,
 	get_rlm_children: AUTHORITATIVE_CHILD_ROSTER_COMMAND,
@@ -868,7 +874,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	release_session_input_pause: SESSION_INPUT_PAUSE_COMMAND,
 	cron_list: LEGACY_DAEMON_COMMAND,
 	heartbeats_list: { minProtocol: 7, capability: "heartbeat_catalog" },
-	roster_subscribe: { minProtocol: 7, capability: "agent_roster" },
+	roster_subscribe: { ...SESSION_SUMMARY_COMPATIBILITY, capability: "agent_roster" },
 	roster_unsubscribe: { minProtocol: 7, capability: "agent_roster" },
 	heartbeat_manage: { minProtocol: 7, capability: "heartbeat_management" },
 	cron_add: LEGACY_DAEMON_COMMAND,
@@ -877,7 +883,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	heartbeat_set: LEGACY_DAEMON_COMMAND,
 	heartbeat_update: LEGACY_DAEMON_COMMAND,
 	set_model: LEGACY_DAEMON_COMMAND,
-	set_profile_if_idle: CONDITIONAL_SESSION_PROFILE_COMMAND,
+	set_profile_if_idle: { ...CONDITIONAL_SESSION_PROFILE_COMMAND, optionalMetadata: ["kernel_cwd"] },
 	cycle_model: LEGACY_DAEMON_COMMAND,
 	set_scoped_models: LEGACY_DAEMON_COMMAND,
 	set_thinking_level: LEGACY_DAEMON_COMMAND,
@@ -1285,20 +1291,20 @@ export type DaemonOutbound =
 	  };
 
 export const DAEMON_OUTBOUND_COMPATIBILITY = {
-	response: LEGACY_DAEMON_COMMAND,
+	response: SESSION_SUMMARY_COMPATIBILITY,
 	session_list_progress: LEGACY_DAEMON_COMMAND,
 	session_list_item: LEGACY_DAEMON_COMMAND,
 	daemon_hello: LEGACY_DAEMON_COMMAND,
 	daemon_closing: LEGACY_DAEMON_COMMAND,
 	heartbeats_changed: { minProtocol: 7, capability: "heartbeat_catalog" },
-	roster_update: { minProtocol: 7, capability: "agent_roster" },
+	roster_update: { ...SESSION_SUMMARY_COMPATIBILITY, capability: "agent_roster" },
 	session_event: LEGACY_DAEMON_COMMAND,
 	side_question_event: LEGACY_DAEMON_COMMAND,
 	session_status: LEGACY_DAEMON_COMMAND,
 	session_replaced: LEGACY_DAEMON_COMMAND,
-	session_resynced: LEGACY_DAEMON_COMMAND,
-	session_attached: LEGACY_DAEMON_COMMAND,
-	session_snapshot_begin: LEGACY_DAEMON_COMMAND,
+	session_resynced: SESSION_SUMMARY_COMPATIBILITY,
+	session_attached: SESSION_SUMMARY_COMPATIBILITY,
+	session_snapshot_begin: SESSION_SUMMARY_COMPATIBILITY,
 	session_snapshot_chunk: LEGACY_DAEMON_COMMAND,
 	session_snapshot_end: LEGACY_DAEMON_COMMAND,
 	session_snapshot_failed: LEGACY_DAEMON_COMMAND,
