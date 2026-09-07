@@ -1,0 +1,1 @@
+- Fixed resumed sessions inheriting the daemon supervisor's working directory instead of their saved project directory.

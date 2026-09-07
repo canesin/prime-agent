@@ -3098,9 +3098,14 @@ export class DaemonSupervisor {
 		}
 		const recoveryStopRevision = existing?.stopRevision;
 		const launchEnv = command.launchEnv ?? existing?.launchEnv;
+		const config = mergeAgentSessionRuntimeConfig(this.defaultSessionConfig, command.config);
 		const createCommand: DaemonCreateCommand = {
 			...withoutSupervisorCreateFields(command),
-			config: mergeAgentSessionRuntimeConfig(this.defaultSessionConfig, command.config),
+			config: {
+				...config,
+				// A supervisor default is not an explicit override of a saved session's directory.
+				...(command.sessionPath ? { cwd: command.config?.cwd } : {}),
+			},
 		};
 		const workerId = existing?.descriptor.workerId ?? createActiveSessionId();
 		const rootActiveSessionId = existing?.descriptor.rootActiveSessionId ?? createActiveSessionId();
@@ -3132,7 +3137,7 @@ export class DaemonSupervisor {
 		delete workerEnvironment.RLM_DEPTH;
 		await this.assertRecoveryAllowed();
 		const child: ChildProcess = spawn(launch.command, launch.args, {
-			cwd: createCommand.config?.cwd ?? process.cwd(),
+			cwd: config.cwd ?? process.cwd(),
 			detached: true,
 			env: workerEnvironment,
 			stdio: ["ignore", "ignore", "pipe", "pipe"],
