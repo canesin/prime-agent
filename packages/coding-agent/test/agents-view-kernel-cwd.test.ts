@@ -6,7 +6,7 @@ import { BrandSplashHeader } from "../src/modes/interactive/interactive-mode.js"
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
 type Context = {
-	client: { supportsServerCapability: (capability: string) => boolean };
+	client: { isConnected: boolean; supportsServerCapability: (capability: string) => boolean };
 	rows: { summary: Partial<SessionSummary> }[];
 	selectedIndex: number;
 	options: { uiServices: { getInitialCwd: () => string } };
@@ -19,7 +19,10 @@ const prototype = AgentsViewMode.prototype as unknown as {
 
 function context(supportsKernelCwd = true): Context {
 	return {
-		client: { supportsServerCapability: (capability) => supportsKernelCwd && capability === "kernel_cwd" },
+		client: {
+			isConnected: true,
+			supportsServerCapability: (capability) => supportsKernelCwd && capability === "kernel_cwd",
+		},
 		rows: [{ summary: { activeSessionId: "active", cwd: "/project", kernelCwd: "/project/nested" } }],
 		selectedIndex: 0,
 		options: { uiServices: { getInitialCwd: () => "/launcher" } },
@@ -59,6 +62,14 @@ describe("agents view Python directory metadata", () => {
 		expect(prototype.getSplashCwd.call(state)).toBe("/project");
 	});
 
+	it("hides cached Python metadata until the daemon reconnects", () => {
+		const state = context();
+		state.client.isConnected = false;
+		expect(prototype.getSplashKernelCwd.call(state)).toBeUndefined();
+		state.client.isConnected = true;
+		expect(prototype.getSplashKernelCwd.call(state)).toBe("/project/nested");
+	});
+
 	it.each([
 		{ kernelCwd: undefined },
 		{ kernelCwd: "/project" },
@@ -66,6 +77,8 @@ describe("agents view Python directory metadata", () => {
 		{ lastHeardFromAt: "2026-09-01T00:00:00.000Z" },
 		{ workerState: "recovering" },
 		{ workerState: "failed" },
+		{ statusLabel: "recovering" },
+		{ statusLabel: "failed" },
 	])("omits unavailable, duplicate, or stale Python directory metadata (%j)", (patch) => {
 		const state = context();
 		Object.assign(state.rows[0]!.summary, patch);

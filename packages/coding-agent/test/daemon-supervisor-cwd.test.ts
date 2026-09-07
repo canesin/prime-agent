@@ -81,6 +81,29 @@ async function startSupervisor(root: string): Promise<DaemonClient> {
 }
 
 describe("supervisor session working directories", () => {
+	it.skipIf(process.platform === "win32")(
+		"resumes after the supervisor directory is removed",
+		async () => {
+			const root = mkdtempSync(join(tmpdir(), "prime-cwd-"));
+			roots.push(root);
+			const client = await startSupervisor(root);
+			const projectDir = join(root, "project");
+			mkdirSync(projectDir);
+			const manager = SessionManager.create(projectDir, join(root, "agent", "sessions"));
+			manager.appendMessage({ role: "user", content: "resume", timestamp: 1 });
+			manager.flushNow();
+			rmSync(join(root, "cto"), { recursive: true });
+
+			const created = await client.request({
+				type: "create",
+				sessionPath: manager.getSessionFile(),
+				config: { noTools: true, noExtensions: true },
+			});
+			expect(created).toMatchObject({ success: true, data: { cwd: projectDir } });
+		},
+		60_000,
+	);
+
 	it("resumes each project independently of the supervisor cwd and honors explicit overrides", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-cwd-"));
 		roots.push(root);

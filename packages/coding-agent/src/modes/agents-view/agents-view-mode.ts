@@ -2766,9 +2766,10 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private getSplashKernelCwd(): string | undefined {
-		if (!this.client?.supportsServerCapability("kernel_cwd")) return undefined;
+		if (!this.client?.isConnected || !this.client.supportsServerCapability("kernel_cwd")) return undefined;
 		const summary = this.rows[this.selectedIndex]?.summary;
 		if (!summary?.activeSessionId || summary.lastHeardFromAt) return undefined;
+		if (summary.statusLabel === "recovering" || summary.statusLabel === "failed") return undefined;
 		if (summary.workerState && summary.workerState !== "ready") return undefined;
 		return summary.kernelCwd && summary.kernelCwd !== summary.cwd ? summary.kernelCwd : undefined;
 	}

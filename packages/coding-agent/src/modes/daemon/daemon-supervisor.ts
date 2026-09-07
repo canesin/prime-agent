@@ -3107,6 +3107,11 @@ export class DaemonSupervisor {
 				...(command.sessionPath ? { cwd: command.config?.cwd } : {}),
 			},
 		};
+		let workerCwd = config.cwd ?? process.cwd();
+		if (command.sessionPath && !command.config?.cwd && !existsSync(workerCwd)) {
+			const savedCwd = (await readSessionInfo(command.sessionPath))?.cwd;
+			if (savedCwd && existsSync(savedCwd)) workerCwd = savedCwd;
+		}
 		const workerId = existing?.descriptor.workerId ?? createActiveSessionId();
 		const rootActiveSessionId = existing?.descriptor.rootActiveSessionId ?? createActiveSessionId();
 		const socketPath = existing?.descriptor.socketPath ?? workerSocketPath(this.socketPath, workerId);
@@ -3137,7 +3142,7 @@ export class DaemonSupervisor {
 		delete workerEnvironment.RLM_DEPTH;
 		await this.assertRecoveryAllowed();
 		const child: ChildProcess = spawn(launch.command, launch.args, {
-			cwd: config.cwd ?? process.cwd(),
+			cwd: workerCwd,
 			detached: true,
 			env: workerEnvironment,
 			stdio: ["ignore", "ignore", "pipe", "pipe"],
