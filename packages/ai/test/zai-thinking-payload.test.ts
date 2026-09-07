@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { getModel, getSupportedThinkingLevels } from "../src/models.js";
 import { streamSimpleAnthropic } from "../src/providers/anthropic.js";
 import { streamOpenAICompletions, streamSimpleOpenAICompletions } from "../src/providers/openai-completions.js";
-import { streamSimpleOpenAIResponses } from "../src/providers/openai-responses.js";
+import { streamOpenAIResponses, streamSimpleOpenAIResponses } from "../src/providers/openai-responses.js";
 import type { Context, Model, ModelThinkingLevel, SimpleStreamOptions } from "../src/types.js";
 
 const context: Context = { messages: [{ role: "user", content: "hello", timestamp: 1 }] };
@@ -50,6 +50,28 @@ async function captureCustomPayload(api: ZaiApi, id: string, reasoning?: ModelTh
 }
 
 describe("Z.ai mandatory thinking payload", () => {
+	it.each([
+		{ requested: undefined, expected: "high" },
+		{ requested: "minimal", expected: "low" },
+		{ requested: "medium", expected: "high" },
+		{ requested: "xhigh", expected: "max" },
+	] as const)("clamps direct Responses effort $requested to $expected", async ({ requested, expected }) => {
+		let payload: unknown;
+		const controller = new AbortController();
+		await streamOpenAIResponses(customModel("openai-responses", "glm-5.3"), context, {
+			apiKey: "fake-key",
+			reasoningEffort: requested,
+			reasoningSummary: "auto",
+			signal: controller.signal,
+			onPayload: (value) => {
+				payload = value;
+				controller.abort();
+				throw new Error("payload captured; no network request");
+			},
+		}).result();
+		expect(payload).toMatchObject({ reasoning: { effort: expected, summary: "auto" } });
+	});
+
 	for (const api of ["anthropic-messages", "openai-completions", "openai-responses"] as const) {
 		it.each(["glm-5.3", "glm-5.3-flash"])(`${api} enables thinking for custom %s without metadata`, async (id) => {
 			expect(getSupportedThinkingLevels(customModel(api, id))).toEqual(["low", "high", "max"]);

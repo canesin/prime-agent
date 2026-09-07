@@ -247,9 +247,8 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 
 	if (model.reasoning) {
 		if (options?.reasoningEffort || options?.reasoningSummary) {
-			const effort = options?.reasoningEffort
-				? (model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort)
-				: "medium";
+			const level = clampThinkingLevel(model, options?.reasoningEffort ?? "medium");
+			const effort = model.thinkingLevelMap?.[level] ?? (level === "off" ? "none" : level);
 			params.reasoning = {
 				effort: effort as NonNullable<typeof params.reasoning>["effort"],
 				summary: options?.reasoningSummary || "auto",
