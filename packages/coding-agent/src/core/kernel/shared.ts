@@ -280,6 +280,8 @@ export interface KernelShutdownOptions {
 export interface KernelClient {
 	readonly ownerSessionId: string | undefined;
 	readonly isRunning: boolean;
+	/** Last directory reported by the running kernel; absent when unavailable. */
+	readonly currentCwd?: string;
 	start(options?: KernelStartOptions): Promise<void>;
 	execute(code: string, opts?: ExecuteOptions): Promise<ExecuteResult>;
 	shutdown(opts?: KernelShutdownOptions): Promise<boolean>;
@@ -295,6 +297,14 @@ export interface KernelClient {
 // One registry serves every client kind; two parallel registries would
 // double-install process signal handlers.
 export const liveKernels = new Set<KernelClient>();
+
+export function getSessionKernelCwd(sessionId: string): string | undefined {
+	for (const kernel of liveKernels) {
+		if (kernel.ownerSessionId === sessionId && kernel.isRunning) return kernel.currentCwd;
+	}
+	return undefined;
+}
+
 let signalHandlersInstalled = false;
 
 registerSessionResourceCleanup((sessionId) => {

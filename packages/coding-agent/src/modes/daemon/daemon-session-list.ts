@@ -6,6 +6,7 @@ import { compactRlmText } from "../../core/agent-session.js";
 import type { AgentSessionRuntimeDiagnostic } from "../../core/agent-session-services.js";
 import { type AgentCronJob, isHeartbeatCronJob } from "../../core/cron-jobs.js";
 import type { GoalState } from "../../core/goals.js";
+import { getSessionKernelCwd } from "../../core/kernel/shared.js";
 import type { SessionActionSnapshot } from "../../core/session-action-store.js";
 import type { AgentTaskState, SessionInfo } from "../../core/session-manager.js";
 import type { SessionUsageSummary } from "../../core/usage.js";
@@ -62,6 +63,8 @@ export interface SessionSummary {
 	sessionFile?: string;
 	sessionName?: string;
 	cwd: string;
+	/** Last directory reported by the live Python kernel; display metadata, not the project cwd. */
+	kernelCwd?: string;
 	model?: Model<Api>;
 	thinkingLevel?: ThinkingLevel;
 	isStreaming: boolean;
@@ -269,6 +272,7 @@ export function summaryForActiveSession(
 		sessionFile: session.sessionFile,
 		sessionName: session.sessionName,
 		cwd: session.sessionManager.getCwd(),
+		kernelCwd: getSessionKernelCwd(session.sessionId),
 		model: session.model as Model<Api> | undefined,
 		thinkingLevel: session.thinkingLevel,
 		isStreaming: session.isStreaming,

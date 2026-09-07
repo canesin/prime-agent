@@ -842,10 +842,12 @@ export class AgentsViewMode implements Component, Focusable {
 				topPadding: true,
 				getExtraMetadata: () => {
 					const root = this.scopeRootSummary;
+					const kernelCwd = this.getSplashKernelCwd();
 					return [
 						{ label: "agents", value: this.getAgentCountsText() },
 						{ label: "scope", value: root ? getAgentsViewSessionTitle(root) : "global" },
 						{ label: "depth", value: String(getAgentsViewDepth(root)) },
+						...(kernelCwd ? [{ label: "cwd (py)", value: kernelCwd }] : []),
 					];
 				},
 			},
@@ -2761,6 +2763,14 @@ export class AgentsViewMode implements Component, Focusable {
 
 	private getSplashCwd(): string {
 		return this.rows[this.selectedIndex]?.summary.cwd ?? this.options.uiServices.getInitialCwd();
+	}
+
+	private getSplashKernelCwd(): string | undefined {
+		if (!this.client?.supportsServerCapability("kernel_cwd")) return undefined;
+		const summary = this.rows[this.selectedIndex]?.summary;
+		if (!summary?.activeSessionId || summary.lastHeardFromAt) return undefined;
+		if (summary.workerState && summary.workerState !== "ready") return undefined;
+		return summary.kernelCwd && summary.kernelCwd !== summary.cwd ? summary.kernelCwd : undefined;
 	}
 
 	private getRowIcon(section: AgentsViewSection): string {

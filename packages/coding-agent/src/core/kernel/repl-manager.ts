@@ -3,7 +3,7 @@
 // a diagnostics tail. The protocol is documented in prime-agent-runtime/src/rlm/repl.md.
 import { type ChildProcess, spawn } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, openSync, renameSync, rmSync, statSync, writeSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, isAbsolute } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { v4 as uuid } from "uuid";
 import { reapKernelOrphanProcesses, recordOrphanProcessState } from "../orphan-process-journal.js";
@@ -164,6 +164,7 @@ export class ReplKernelManager {
 	private child?: ChildProcess;
 	private readyDeferred?: ReturnType<typeof createDeferred<number>>;
 	private kernelStderr = "";
+	private reportedCwd?: string;
 	/** Serializes execute() calls — the runtime runs one request at a time. */
 	private executionQueue: Promise<unknown> = Promise.resolve();
 	private activeExecution?: ActiveExecution;
@@ -221,6 +222,10 @@ export class ReplKernelManager {
 
 	get ownerSessionId(): string | undefined {
 		return this.options.sessionId;
+	}
+
+	get currentCwd(): string | undefined {
+		return this.isRunning ? this.reportedCwd : undefined;
 	}
 
 	private appendKernelDiagnostic(message: string): void {
@@ -735,6 +740,9 @@ export class ReplKernelManager {
 
 	private handleEvent(event: Record<string, unknown>): void {
 		const type = event.event;
+		if (type === "ready" || type === "done") {
+			this.reportedCwd = typeof event.cwd === "string" && isAbsolute(event.cwd) ? event.cwd : undefined;
+		}
 		if (type === "ready") {
 			this.readyDeferred?.resolve(typeof event.protocol === "number" ? event.protocol : -1);
 			return;
@@ -1251,6 +1259,7 @@ export class ReplKernelManager {
 
 	private cleanupResources(killSignal: NodeJS.Signals = "SIGTERM"): void {
 		this.startGeneration++; // any teardown invalidates in-flight starts
+		this.reportedCwd = undefined;
 		this.clearSnapshotTimer();
 		this.lateSentAgentMessageHandlers.clear();
 		this.pendingDoneWaiters.clear();

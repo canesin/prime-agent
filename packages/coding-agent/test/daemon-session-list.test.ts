@@ -3,6 +3,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { describe, expect, it } from "vitest";
 import type { RlmChildAgentSnapshot } from "../src/core/agent-session.js";
 import type { AgentCronJob } from "../src/core/cron-jobs.js";
+import { type KernelClient, liveKernels } from "../src/core/kernel/shared.js";
 import type { SessionInfo } from "../src/core/session-manager.js";
 import type { SessionUsageSummary } from "../src/core/usage.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
@@ -16,6 +17,30 @@ import {
 } from "../src/modes/daemon/daemon-session-list.js";
 
 describe("buildSessionList", () => {
+	it("keeps each kernel directory separate from the project and drops it from passive rows", () => {
+		const kernel = {
+			ownerSessionId: "session-python",
+			isRunning: true,
+			currentCwd: "/tmp/python-directory",
+		} as KernelClient;
+		liveKernels.add(kernel);
+		try {
+			const [python, other] = buildSessionList(
+				[makeState({ activeSessionId: "python" }), makeState({ activeSessionId: "other" })],
+				[],
+			);
+			expect(python).toMatchObject({ cwd: "/tmp/project", kernelCwd: "/tmp/python-directory" });
+			expect(other?.kernelCwd).toBeUndefined();
+			expect(passivatedWorkerRosterEntry(workerRosterEntryFromSummary(python!)).summary).toMatchObject({
+				cwd: "/tmp/project",
+			});
+			expect(passivatedWorkerRosterEntry(workerRosterEntryFromSummary(python!)).summary.kernelCwd).toBeUndefined();
+		} finally {
+			liveKernels.delete(kernel);
+		}
+		expect(summaryForActiveSession(makeState({ activeSessionId: "python" })).kernelCwd).toBeUndefined();
+	});
+
 	it("derives active session lifecycle and activity", () => {
 		const oneMessage = [{ role: "user", content: "hi" }] as unknown as AgentMessage[];
 		const currentSummary = { basedOnMessageCount: 1 } as ActiveSessionState["summaryState"];

@@ -115,6 +115,17 @@ describe("supervisor session working directories", () => {
 					]),
 				},
 			});
+			expect(SessionManager.open(manager.getSessionFile()!).getCwd()).toBe(projectDir);
 		}
+		const fresh = await client.request({
+			type: "create",
+			config: { noTools: true, noExtensions: true },
+		});
+		expect(fresh).toMatchObject({ success: true, data: { cwd: join(root, "cto") } });
+		const freshExplicit = await client.request({
+			type: "create",
+			config: { noTools: true, noExtensions: true, cwd: join(root, "ibira") },
+		});
+		expect(freshExplicit).toMatchObject({ success: true, data: { cwd: join(root, "ibira") } });
 	}, 60_000);
 });

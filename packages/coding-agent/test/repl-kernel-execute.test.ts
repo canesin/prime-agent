@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -10,6 +10,7 @@ import {
 	type HostRequestHandlers,
 	ReplKernelManager,
 } from "../src/core/kernel/index.js";
+import { getSessionKernelCwd } from "../src/core/kernel/shared.js";
 
 function resolveReplPython(): string | null {
 	const candidates = [
@@ -60,6 +61,59 @@ describeIf("ReplKernelManager execute (real runtime)", () => {
 		expect(second.status).toBe("ok");
 		expect(second.result).toBe("42");
 	}, 30_000);
+
+	it("reports Python directory changes after successful and failed cells and resets on restart", async () => {
+		const project = realpathSync(dir);
+		const nested = join(project, "nested");
+		mkdirSync(nested);
+		manager = new ReplKernelManager({
+			python: python as string,
+			cwd: project,
+			sessionId: "kernel-cwd-test",
+			env: { PYTHONPATH: resolve(__dirname, "../../../prime-agent-runtime/src") },
+		});
+		expect(manager.currentCwd).toBeUndefined();
+		await manager.start();
+		expect(manager.currentCwd).toBe(project);
+		const changed = await manager.execute("import os\nos.chdir('nested')");
+		expect(changed.status).toBe("ok");
+		expect(manager.currentCwd).toBe(nested);
+		expect(getSessionKernelCwd("kernel-cwd-test")).toBe(nested);
+		expect(getSessionKernelCwd("another-session")).toBeUndefined();
+		const failed = await manager.execute("os.chdir('..')\nraise ValueError('after chdir')");
+		expect(failed.status).toBe("error");
+		expect(manager.currentCwd).toBe(project);
+		await manager.execute("os.chdir('nested')");
+		await manager.restart();
+		expect(manager.currentCwd).toBe(project);
+		await manager.shutdown();
+		expect(manager.currentCwd).toBeUndefined();
+		expect(getSessionKernelCwd("kernel-cwd-test")).toBeUndefined();
+	}, 30_000);
+
+	it.skipIf(process.platform === "win32")(
+		"keeps serving when the kernel's current directory was deleted",
+		async () => {
+			const project = realpathSync(dir);
+			const deleted = join(project, "deleted");
+			mkdirSync(deleted);
+			manager = new ReplKernelManager({
+				python: python as string,
+				cwd: project,
+				env: { PYTHONPATH: resolve(__dirname, "../../../prime-agent-runtime/src") },
+			});
+			await manager.execute("import os\nos.chdir('deleted')");
+			expect(manager.currentCwd).toBe(deleted);
+			rmSync(deleted, { recursive: true });
+			const result = await manager.execute("1 + 1");
+			expect(result.status).toBe("ok");
+			expect(result.result).toBe("2");
+			expect(manager.currentCwd).toBeUndefined();
+			await manager.execute(`os.chdir(${JSON.stringify(project)})`);
+			expect(manager.currentCwd).toBe(project);
+		},
+		30_000,
+	);
 
 	it("reports cell errors with a clean traceback", async () => {
 		manager = new ReplKernelManager({ python: python as string, cwd: dir });

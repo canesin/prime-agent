@@ -67,6 +67,11 @@ _handoff_interrupted = False
 
 def _send(event: dict[str, Any]) -> None:
     """Write one protocol frame; the locked single write keeps frames atomic."""
+    if event.get("event") in ("ready", "done"):
+        try:
+            event["cwd"] = os.getcwd()
+        except OSError:
+            event["cwd"] = None
     data = (json.dumps(event, separators=(",", ":")) + "\n").encode()
     with _write_lock:
         view = memoryview(data)

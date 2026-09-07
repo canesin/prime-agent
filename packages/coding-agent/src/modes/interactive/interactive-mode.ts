@@ -474,7 +474,9 @@ export class BrandSplashHeader implements Component {
 		const valueWidth = Math.max(1, metaWidth - this.labelWidth);
 		const labelled = (label: string, value: string) => {
 			const displayValue =
-				label === "cwd" ? truncatePathMiddle(value, valueWidth) : truncateToWidth(value, valueWidth);
+				label === "cwd" || label === "cwd (py)"
+					? truncatePathMiddle(value, valueWidth)
+					: truncateToWidth(value, valueWidth);
 			return theme.fg("dim", label.padEnd(this.labelWidth)) + theme.fg("muted", displayValue);
 		};
 		const extraMetadata = this.options.getExtraMetadata?.() ?? [];
