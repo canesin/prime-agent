@@ -16,6 +16,7 @@ import {
 } from "../messages.js";
 import { buildSessionContext, type CompactionEntry, type SessionEntry } from "../session-manager.js";
 import { addAssistantUsage, emptyUsage } from "../usage.js";
+import { boundedSummaryPrompt, summaryBudget } from "./context-budget.js";
 import {
 	computeFileLists,
 	createFileOps,
@@ -214,7 +215,9 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
 export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
 	if (!settings.enabled) return false;
 	if (contextWindow <= 0) return false;
-	return contextTokens > contextWindow - settings.reserveTokens;
+	const reserveTokens =
+		settings.reserveTokens >= contextWindow ? Math.floor(contextWindow / 5) : settings.reserveTokens;
+	return contextTokens > contextWindow - reserveTokens;
 }
 /**
  * Estimate token count for a message using chars/4 heuristic.
@@ -360,7 +363,7 @@ export interface CutPointResult {
  * Find the cut point in session entries that keeps approximately `keepRecentTokens`.
  *
  * Algorithm: Walk backwards from newest, accumulating estimated message sizes.
- * Stop when we've accumulated >= keepRecentTokens. Cut at that point.
+ * Keep the largest legal suffix that fits keepRecentTokens.
  *
  * Can cut at user OR assistant messages (never tool results). When cutting at an
  * assistant message with tool calls, its tool results come after and will be kept.
@@ -384,35 +387,34 @@ export function findCutPoint(
 		return { firstKeptEntryIndex: startIndex, turnStartIndex: -1, isSplitTurn: false };
 	}
 	let accumulatedTokens = 0;
-	let cutIndex = cutPoints[0]; // Default: keep from first message (not header)
+	let cutIndex = endIndex;
+	const validCuts = new Set(cutPoints);
 
 	for (let i = endIndex - 1; i >= startIndex; i--) {
 		const entry = entries[i];
-		if (entry.type !== "message") continue;
-		const messageTokens = estimateTokens(entry.message);
+		const message = getMessageFromEntryForCompaction(entry);
+		if (!message) continue;
+		const messageTokens = estimateTokens(message);
 		accumulatedTokens += messageTokens;
-		if (accumulatedTokens >= keepRecentTokens) {
-			for (let c = 0; c < cutPoints.length; c++) {
-				if (cutPoints[c] >= i) {
-					cutIndex = cutPoints[c];
-					break;
-				}
-			}
-			break;
-		}
+		if (accumulatedTokens > keepRecentTokens) break;
+		if (validCuts.has(i)) cutIndex = i;
 	}
 	while (cutIndex > startIndex) {
 		const prevEntry = entries[cutIndex - 1];
 		if (prevEntry.type === "compaction") {
 			break;
 		}
-		if (prevEntry.type === "message") {
+		if (getMessageFromEntryForCompaction(prevEntry)) {
 			break;
 		}
 		cutIndex--;
 	}
+	if (cutIndex === endIndex) return { firstKeptEntryIndex: cutIndex, turnStartIndex: -1, isSplitTurn: false };
 	const cutEntry = entries[cutIndex];
-	const isUserMessage = cutEntry.type === "message" && cutEntry.message.role === "user";
+	const isUserMessage =
+		cutEntry.type === "custom_message" ||
+		cutEntry.type === "branch_summary" ||
+		(cutEntry.type === "message" && (cutEntry.message.role === "user" || cutEntry.message.role === "bashExecution"));
 	// A cut in a non-user turn requires a prefix summary.
 	const turnStartIndex = isUserMessage ? -1 : findTurnStartIndex(entries, cutIndex, startIndex);
 
@@ -524,17 +526,17 @@ export async function generateSummary(
 	previousSummary?: string,
 	thinkingLevel?: ThinkingLevel,
 ): Promise<SummarySlice> {
-	const maxTokens = Math.floor(0.8 * reserveTokens);
+	const { maxTokens, maxInputBytes } = summaryBudget(model, Math.floor(0.8 * reserveTokens));
 
 	const basePrompt = buildSummarizationPrompt(customInstructions, previousSummary);
 	// Serialize before the LLM call so it summarizes rather than continues this conversation.
 	const llmMessages = convertToLlm(currentMessages);
-	const conversationText = serializeConversation(llmMessages);
-	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
-	if (previousSummary) {
-		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
-	}
-	promptText += basePrompt;
+	const promptText = boundedSummaryPrompt(
+		llmMessages.map((message) => serializeConversation([message])),
+		basePrompt,
+		previousSummary,
+		maxInputBytes - Buffer.byteLength(SUMMARIZATION_SYSTEM_PROMPT),
+	);
 
 	const summarizationMessages = [
 		{
@@ -588,7 +590,12 @@ export function prepareCompaction(
 	pathEntries: SessionEntry[],
 	settings: CompactionSettings,
 ): CompactionPreparation | undefined {
-	if (pathEntries.length > 0 && pathEntries[pathEntries.length - 1].type === "compaction") {
+	if (
+		pathEntries.length > 0 &&
+		pathEntries[pathEntries.length - 1].type === "compaction" &&
+		buildSessionContext(pathEntries).messages.reduce((total, message) => total + estimateTokens(message), 0) <=
+			settings.keepRecentTokens
+	) {
 		return undefined;
 	}
 
@@ -709,7 +716,7 @@ export async function compact(
 	if (isSplitTurn && turnPrefixMessages.length > 0) {
 		// Split turns make two wire calls with different bodies; each needs its own identity.
 		const [historyResult, turnPrefixResult] = await Promise.all([
-			messagesToSummarize.length > 0
+			messagesToSummarize.length > 0 || previousSummary
 				? summaryCall((callHeaders) =>
 						generateSummary(
 							messagesToSummarize,
@@ -789,10 +796,14 @@ async function generateTurnPrefixSummary(
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
 ): Promise<SummarySlice> {
-	const maxTokens = Math.floor(0.5 * reserveTokens); // Smaller budget for turn prefix
+	const { maxTokens, maxInputBytes } = summaryBudget(model, Math.floor(0.5 * reserveTokens));
 	const llmMessages = convertToLlm(messages);
-	const conversationText = serializeConversation(llmMessages);
-	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
+	const promptText = boundedSummaryPrompt(
+		llmMessages.map((message) => serializeConversation([message])),
+		TURN_PREFIX_SUMMARIZATION_PROMPT,
+		undefined,
+		maxInputBytes - Buffer.byteLength(SUMMARIZATION_SYSTEM_PROMPT),
+	);
 	const summarizationMessages = [
 		{
 			role: "user" as const,

@@ -99,6 +99,8 @@ import {
 	collectEntriesForBranchSummary,
 	compact,
 	estimateContextTokens,
+	estimateTokens,
+	findCutPoint,
 	generateBranchSummary,
 	prepareCompaction,
 	serializeConversation,
@@ -257,6 +259,7 @@ import {
 	transitionSessionAction,
 	type WakePolicy,
 } from "./session-action-store.js";
+import { createSessionHistoryHandlers } from "./session-history.js";
 import type { BranchSummaryEntry, CompactionEntry, SessionContext, SessionMessageEntry } from "./session-manager.js";
 import {
 	CURRENT_SESSION_VERSION,
@@ -4579,7 +4582,32 @@ export class AgentSession {
 		return this._finishSubmissionNormalization(text, images, policy);
 	}
 
+	private async _fitContextToModel(): Promise<boolean> {
+		const contextWindow = this.model?.contextWindow ?? 0;
+		const configured = this.settingsManager.getCompactionSettings();
+		const settings = {
+			...configured,
+			reserveTokens: Math.min(configured.reserveTokens, Math.floor(contextWindow / 5)),
+		};
+		const estimatedTokens = () =>
+			this.agent.state.messages.reduce((total, message) => total + estimateTokens(message), 0) +
+			Math.ceil(this.systemPrompt.length / 4);
+		// Saved usage can belong to a larger model or predate the last compaction.
+		// Check the effective transcript even when it contains no assistant message.
+		if (shouldCompact(estimatedTokens(), contextWindow, settings)) {
+			await this._runAutoCompaction("threshold", false, false);
+			if (shouldCompact(estimatedTokens(), contextWindow, settings)) {
+				throw new Error(
+					"Context still exceeds the selected model's budget after compaction. Shorten the system prompt or use a larger-context model.",
+				);
+			}
+			return true;
+		}
+		return false;
+	}
+
 	private async _runPreTurnCompaction(): Promise<void> {
+		if (await this._fitContextToModel()) return;
 		const lastAssistant = this._findLastAssistantMessage();
 		if (lastAssistant) await this._checkCompaction(lastAssistant, false, false);
 	}
@@ -4605,6 +4633,7 @@ export class AgentSession {
 			if (pendingModelSelectEmit) await pendingModelSelectEmit;
 		}
 		if (policy.preTurnCompaction === "afterModelSelection") await this._runPreTurnCompaction();
+		else await this._fitContextToModel();
 
 		const prepared = await steps.prepare();
 		if (steps.shouldCommit && !steps.shouldCommit(prepared)) return undefined;
@@ -7945,8 +7974,21 @@ export class AgentSession {
 		signal: AbortSignal;
 	}): Promise<CompactionResult> {
 		const { model, apiKey, headers, customInstructions, signal } = options;
-		const pathEntries = this.sessionManager.getBranch();
-		const settings = this.settingsManager.getCompactionSettings();
+		let pathEntries = this.sessionManager.getBranch();
+		const configured = this.settingsManager.getCompactionSettings();
+		const settings = {
+			...configured,
+			reserveTokens: Math.min(configured.reserveTokens, Math.floor(model.contextWindow / 5), model.maxTokens),
+			keepRecentTokens: Math.min(configured.keepRecentTokens, Math.floor(model.contextWindow / 4)),
+		};
+		if (
+			findCutPoint(pathEntries, 0, pathEntries.length, settings.keepRecentTokens).firstKeptEntryIndex ===
+			pathEntries.length
+		) {
+			// An empty retained suffix needs a real, non-message entry as its boundary.
+			this.sessionManager.appendCustomEntry("compaction_boundary", {});
+			pathEntries = this.sessionManager.getBranch();
+		}
 
 		const preparation = prepareCompaction(pathEntries, settings);
 		if (!preparation) {
@@ -9127,6 +9169,7 @@ export class AgentSession {
 	private async _runAutoCompaction(
 		reason: "overflow" | "threshold" | "requested",
 		willRetry: boolean,
+		resumeAfterCompaction = true,
 	): Promise<boolean> {
 		// Any compaction consumes a pending model request and honors its instructions
 		// (overflow recovery can fire first and take the request with it).
@@ -9147,6 +9190,7 @@ export class AgentSession {
 		// Overflow stays excluded: a failed overflow recovery must not re-issue the overflowing request.
 		const resumeAfterFailure = () => {
 			if (
+				resumeAfterCompaction &&
 				(reason === "requested" || reason === "threshold") &&
 				(shouldContinueAfterCompaction || this.agent.hasQueuedMessages() || this.hasPendingSessionWork)
 			) {
@@ -9210,7 +9254,7 @@ export class AgentSession {
 				this._schedulePostCompactionContinue(true);
 				this._scheduleAutoRefineAfterCompaction(willContinueAfterCompaction);
 				return true;
-			} else if (shouldContinueAfterCompaction || hasQueuedMessages) {
+			} else if (resumeAfterCompaction && (shouldContinueAfterCompaction || hasQueuedMessages)) {
 				// Compaction can intentionally stop a tool loop between turns.
 				// Queued follow-up/steering/custom messages can also be waiting.
 				this._schedulePostCompactionContinue(shouldContinueAfterCompaction);
@@ -9746,6 +9790,7 @@ export class AgentSession {
 
 	private _createKernelHostHandlers(): HostRequestHandlers {
 		const handlers: HostRequestHandlers = {
+			...createSessionHistoryHandlers(this.sessionManager),
 			"rlm.run": createRlmRunHostHandler(async ({ prompt, kwargs, cellSourceCode }) => ({
 				...(await this.runRlmChild(prompt, kwargs, cellSourceCode)),
 			})),

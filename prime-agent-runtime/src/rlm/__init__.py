@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ._history import SessionHistory
 from .bash import BashHandle, BashResult, bash
 from .harness import HarnessEntry, HarnessScope, HarnessState, RefinementEvent, get_harness_state
 
@@ -228,10 +229,12 @@ class _HarnessProxy:
 
 
 _harness_state = _HarnessProxy()
+history = SessionHistory(host_request)
 
 
 class _RLMCallable:
     harness = _harness_state
+    history = history
     get_harness_state = staticmethod(get_harness_state)
 
     async def run(self, prompt: str, **kwargs: Any) -> RLMSpawnHandle:
@@ -280,6 +283,7 @@ __all__ = [
     "find_models",
     "get_harness_state",
     "harness",
+    "history",
     "host_request",
     "list_subagents",
     "rlm",

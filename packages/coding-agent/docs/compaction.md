@@ -32,13 +32,15 @@ Auto-compaction triggers when:
 contextTokens > contextWindow - reserveTokens
 ```
 
-By default, `reserveTokens` is 16384 tokens (configurable in `~/.prime/agent/settings.json` or `<project-dir>/.prime/agent/settings.json`). This leaves room for the LLM's response.
+By default, `reserveTokens` is 16384 tokens (configurable in `~/.prime/agent/settings.json` or `<project-dir>/.prime/agent/settings.json`). This leaves room for the LLM's response. A reserve that is at least the selected model's entire window falls back to one fifth of that window. Smaller reserves retain their configured threshold, including deliberately early compaction.
+
+Before a new turn, Prime Agent also estimates the effective transcript size. This catches switching or resuming with a smaller context model even when the last usage report predates compaction. This overflow guard reserves at most one fifth of the window, so a configured early-compaction threshold does not reject an otherwise fitting transcript. Automatic compaction still respects `enabled: false`. Recent history retention is capped at one quarter of the selected model's window, and the summary output budget is capped by the model's output limit and one fifth of its window.
 
 You can also trigger manually with `/compact [instructions]`, where optional instructions focus the summary — for example `/compact focus on the auth refactor, remember the exact migration command`. The instructions are passed to the summarization prompt with high priority, persisted on the `CompactionEntry`, and shown on the `[compaction]` message in the TUI.
 
 ### How It Works
 
-1. **Find cut point**: Walk backwards from newest message, accumulating token estimates until `keepRecentTokens` (default 20k, configurable in `~/.prime/agent/settings.json` or `<project-dir>/.prime/agent/settings.json`) is reached
+1. **Find cut point**: Keep the largest valid recent suffix within `keepRecentTokens` (default 20k), including custom messages and kernel state in the estimate. If no complete message group fits, retain only the summary.
 2. **Extract messages**: Collect messages from the previous kept boundary (or session start) up to the cut point
 3. **Generate summary**: Call LLM to summarize with structured format, passing the previous summary as iterative context when present
 4. **Append entry**: Save `CompactionEntry` with summary and `firstKeptEntryId`
@@ -77,6 +79,19 @@ What the LLM sees:
 ```
 
 On repeated compactions, the summarized span starts at the previous compaction's kept boundary (`firstKeptEntryId`), not at the compaction entry itself, falling back to the entry after the previous compaction if that kept entry cannot be found in the path. This preserves messages that survived the earlier compaction by including them in the next summarization pass as well. Prime Agent also recalculates `tokensBefore` from the rebuilt session context before writing the new `CompactionEntry`, so the token count reflects the actual pre-compaction context being replaced.
+
+### Historical Context
+
+Compaction leaves the original entries in the session. The Python handle `rlm.history` reads the full current branch, including older entries removed from the model's active context:
+
+```python
+hits = await rlm.history.search("migration", limit=10)
+page = await rlm.history.read(hits["entries"][0]["id"], max_chars=4000)
+```
+
+Search returns entry ids, timestamps, roles, and short excerpts, newest first. Pass `hits["next_before"]` as `before` to search older entries. Read returns a `json` string, `total_chars`, and `next_offset`; follow `next_offset` until it is `None` and concatenate the strings before calling `json.loads()`. Searches return at most 50 entries, and reads return at most 16000 characters. The data stays in the session host, so a kernel restart does not require restoring a large transcript variable. Saved sessions retain it across application restarts; sessions without persistence retain it only for their lifetime. Historical instructions can be obsolete or superseded.
+
+Summary requests use a bounded recent excerpt, with space reserved for instructions, the previous summary, output, and provider framing. Oversized messages and previous summaries are clipped with an omission notice; older content remains available through `rlm.history`. Text input is conservatively budgeted in UTF-8 bytes. Custom summarization instructions that exceed the available budget fail with an error asking for shorter instructions. Extensions that supply their own summaries remain responsible for their provider request budgets.
 
 ### Split Turns
 
