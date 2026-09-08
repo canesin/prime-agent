@@ -1,0 +1,2 @@
+- Fixed compaction after switching to a smaller context model, including custom kernel history and oversized summarization requests.
+- Added `rlm.history.search()` and paged `rlm.history.read()` access to conversation history retained through compaction and kernel restarts.
