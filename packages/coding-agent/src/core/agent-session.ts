@@ -4583,8 +4583,12 @@ export class AgentSession {
 	}
 
 	private async _fitContextToModel(): Promise<boolean> {
-		const settings = this.settingsManager.getCompactionSettings();
 		const contextWindow = this.model?.contextWindow ?? 0;
+		const configured = this.settingsManager.getCompactionSettings();
+		const settings = {
+			...configured,
+			reserveTokens: Math.min(configured.reserveTokens, Math.floor(contextWindow / 5)),
+		};
 		const estimatedTokens = () =>
 			this.agent.state.messages.reduce((total, message) => total + estimateTokens(message), 0) +
 			Math.ceil(this.systemPrompt.length / 4);

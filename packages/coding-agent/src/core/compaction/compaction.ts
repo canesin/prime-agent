@@ -215,7 +215,9 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
 export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
 	if (!settings.enabled) return false;
 	if (contextWindow <= 0) return false;
-	return contextTokens > contextWindow - Math.min(settings.reserveTokens, Math.floor(contextWindow / 5));
+	const reserveTokens =
+		settings.reserveTokens >= contextWindow ? Math.floor(contextWindow / 5) : settings.reserveTokens;
+	return contextTokens > contextWindow - reserveTokens;
 }
 /**
  * Estimate token count for a message using chars/4 heuristic.

@@ -29,12 +29,12 @@ Both use the same structured summary format and track file operations cumulative
 Auto-compaction triggers when:
 
 ```
-contextTokens > contextWindow - min(reserveTokens, contextWindow / 5)
+contextTokens > contextWindow - reserveTokens
 ```
 
-By default, `reserveTokens` is 16384 tokens (configurable in `~/.prime/agent/settings.json` or `<project-dir>/.prime/agent/settings.json`). This leaves room for the LLM's response.
+By default, `reserveTokens` is 16384 tokens (configurable in `~/.prime/agent/settings.json` or `<project-dir>/.prime/agent/settings.json`). This leaves room for the LLM's response. A reserve that is at least the selected model's entire window falls back to one fifth of that window. Smaller reserves retain their configured threshold, including deliberately early compaction.
 
-Before a new turn, Prime Agent also estimates the effective transcript size. This catches switching or resuming with a smaller context model even when the last usage report predates compaction. Automatic compaction still respects `enabled: false`. Recent history retention is capped at one quarter of the selected model's window, and the summary output budget is capped by the model's output limit and one fifth of its window.
+Before a new turn, Prime Agent also estimates the effective transcript size. This catches switching or resuming with a smaller context model even when the last usage report predates compaction. This overflow guard reserves at most one fifth of the window, so a configured early-compaction threshold does not reject an otherwise fitting transcript. Automatic compaction still respects `enabled: false`. Recent history retention is capped at one quarter of the selected model's window, and the summary output budget is capped by the model's output limit and one fifth of its window.
 
 You can also trigger manually with `/compact [instructions]`, where optional instructions focus the summary — for example `/compact focus on the auth refactor, remember the exact migration command`. The instructions are passed to the summarization prompt with high priority, persisted on the `CompactionEntry`, and shown on the `[compaction]` message in the TUI.
 

@@ -14,7 +14,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { AgentSession } from "../../src/core/agent-session.js";
+import { type AgentSession, CompactionSkippedError } from "../../src/core/agent-session.js";
 import { createHarness, type Harness } from "./harness.js";
 
 type SessionInternals = {
@@ -175,12 +175,15 @@ describe("compaction continuation", () => {
 		};
 		const harness = await createHarness({
 			tools: [bigTool],
-			// Huge keepRecentTokens: prepareCompaction finds nothing to summarize and throws CompactionSkippedError.
-			settings: { compaction: { enabled: true, reserveTokens: 500, keepRecentTokens: 1_000_000 } },
+			settings: { compaction: { enabled: true, reserveTokens: 500 } },
 			models: [{ id: "faux-1", contextWindow: 6_000 }],
 			persistSession: true,
 		});
 		harnesses.push(harness);
+		// Exercise skipped-compaction recovery independently of the retention budget.
+		vi.spyOn(harness.session as unknown as SessionInternals, "_performCompaction").mockRejectedValue(
+			new CompactionSkippedError("Session is too short to compact"),
+		);
 		harness.setResponses([
 			fauxAssistantMessage(fauxToolCall("big", {}), { stopReason: "toolUse" }),
 			fauxAssistantMessage("final answer after the tool call"),
