@@ -13,7 +13,9 @@ import {
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
+	HARNESS_DIGEST_CUSTOM_TYPE,
 } from "../messages.js";
+import { completeWithProviderRetry, type ProviderRetryPolicy } from "../provider-retry.js";
 import { buildSessionContext, type CompactionEntry, type SessionEntry } from "../session-manager.js";
 import { addAssistantUsage, emptyUsage } from "../usage.js";
 import { boundedSummaryPrompt, summaryBudget } from "./context-budget.js";
@@ -93,6 +95,10 @@ function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 
 function getMessageFromEntryForCompaction(entry: SessionEntry): AgentMessage | undefined {
 	if (entry.type === "compaction") {
+		return undefined;
+	}
+	// Harness digests are regenerated on the new compaction head; never summarizer input.
+	if (entry.type === "custom_message" && entry.customType === HARNESS_DIGEST_CUSTOM_TYPE) {
 		return undefined;
 	}
 	return getMessageFromEntry(entry);
@@ -387,7 +393,9 @@ export function findCutPoint(
 		return { firstKeptEntryIndex: startIndex, turnStartIndex: -1, isSplitTurn: false };
 	}
 	let accumulatedTokens = 0;
-	let cutIndex = endIndex;
+	// Default to the last valid cut: when the budget is spent before any cut is reached
+	// (trailing tool results), keep only the final turn instead of keeping everything.
+	let cutIndex = cutPoints[cutPoints.length - 1];
 	const validCuts = new Set(cutPoints);
 
 	for (let i = endIndex - 1; i >= startIndex; i--) {
@@ -409,7 +417,6 @@ export function findCutPoint(
 		}
 		cutIndex--;
 	}
-	if (cutIndex === endIndex) return { firstKeptEntryIndex: cutIndex, turnStartIndex: -1, isSplitTurn: false };
 	const cutEntry = entries[cutIndex];
 	const isUserMessage =
 		cutEntry.type === "custom_message" ||
@@ -525,6 +532,8 @@ export async function generateSummary(
 	customInstructions?: string,
 	previousSummary?: string,
 	thinkingLevel?: ThinkingLevel,
+	retry?: ProviderRetryPolicy,
+	sessionId?: string,
 ): Promise<SummarySlice> {
 	const { maxTokens, maxInputBytes } = summaryBudget(model, Math.floor(0.8 * reserveTokens));
 
@@ -548,13 +557,17 @@ export async function generateSummary(
 
 	const completionOptions =
 		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
-			: { maxTokens, signal, apiKey, headers };
+			? { maxTokens, signal, apiKey, headers, sessionId, reasoning: thinkingLevel }
+			: { maxTokens, signal, apiKey, headers, sessionId };
 
-	const response = await completeSimple(
-		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		completionOptions,
+	const response = await completeWithProviderRetry(
+		() =>
+			completeSimple(
+				model,
+				{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
+				completionOptions,
+			),
+		{ policy: retry, signal },
 	);
 
 	if (response.stopReason === "error") {
@@ -699,6 +712,8 @@ export async function compact(
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
 	summaryCall: SummaryCallRunner = (call) => call(headers),
+	retry?: ProviderRetryPolicy,
+	sessionId?: string,
 ): Promise<CompactionResult> {
 	const {
 		firstKeptEntryId,
@@ -728,6 +743,8 @@ export async function compact(
 							customInstructions,
 							previousSummary,
 							thinkingLevel,
+							retry,
+							sessionId,
 						),
 					)
 				: Promise.resolve<SummarySlice>({ summary: "No prior history." }),
@@ -740,6 +757,8 @@ export async function compact(
 					callHeaders,
 					signal,
 					thinkingLevel,
+					retry,
+					sessionId,
 				),
 			),
 		]);
@@ -757,6 +776,8 @@ export async function compact(
 				customInstructions,
 				previousSummary,
 				thinkingLevel,
+				retry,
+				sessionId,
 			),
 		);
 		slices.push(result);
@@ -795,6 +816,8 @@ async function generateTurnPrefixSummary(
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
+	retry?: ProviderRetryPolicy,
+	sessionId?: string,
 ): Promise<SummarySlice> {
 	const { maxTokens, maxInputBytes } = summaryBudget(model, Math.floor(0.5 * reserveTokens));
 	const llmMessages = convertToLlm(messages);
@@ -812,12 +835,16 @@ async function generateTurnPrefixSummary(
 		},
 	];
 
-	const response = await completeSimple(
-		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
-			: { maxTokens, signal, apiKey, headers },
+	const response = await completeWithProviderRetry(
+		() =>
+			completeSimple(
+				model,
+				{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
+				model.reasoning && thinkingLevel && thinkingLevel !== "off"
+					? { maxTokens, signal, apiKey, headers, sessionId, reasoning: thinkingLevel }
+					: { maxTokens, signal, apiKey, headers, sessionId },
+			),
+		{ policy: retry, signal },
 	);
 
 	if (response.stopReason === "error") {

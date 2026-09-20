@@ -36,20 +36,13 @@ describe("agents view Python directory metadata", () => {
 		const state = context();
 		expect(prototype.getSplashCwd.call(state)).toBe("/project");
 		expect(prototype.getSplashKernelCwd.call(state)).toBe("/project/nested");
-		const header = new BrandSplashHeader(
-			"0.9.3",
-			() => "test-model",
-			() => prototype.getSplashCwd.call(state),
-			undefined,
-			{
-				getExtraMetadata: () => [
-					{ label: "agents", value: "1 running" },
-					{ label: "scope", value: "global" },
-					{ label: "depth", value: "0" },
-					{ label: "cwd (py)", value: prototype.getSplashKernelCwd.call(state)! },
-				],
-			},
-		);
+		const header = new BrandSplashHeader("0.9.3", () => prototype.getSplashCwd.call(state), undefined, {
+			getExtraMetadata: () => [
+				{ label: "agents", value: "1 running" },
+				{ label: "depth", value: "0" },
+				{ label: "cwd (py)", value: prototype.getSplashKernelCwd.call(state)! },
+			],
+		});
 		const output = stripAnsi(header.render(100).join("\n"));
 		expect(output).toContain("cwd      /project");
 		expect(output).toContain("cwd (py) /project/nested");

@@ -77,8 +77,10 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 28 adds an exact-idle, session-only profile transition.
 // Revision 29 adds capability-gated, fenced follow-ups for unchanged active goals.
 // Revision 30 adds optional live Python directory metadata to session summaries.
-export const DAEMON_SCHEMA_REVISION = 30;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-30-0fce2e449985";
+// Revision 31 adds structured session_recovering failure info for known-but-unaddressable sessions.
+// Revision 32 publishes the last recorded model on saved-session rows.
+export const DAEMON_SCHEMA_REVISION = 32;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-32-adf9e1b4b2ea";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -1121,6 +1123,7 @@ export type DaemonErrorInfo =
 			expectedRosterToken: string;
 			actualRosterToken: string;
 	  }
+	| { code: "session_recovering"; activeSessionId: string }
 	| { code: "command_result_uncertain"; clientId: DaemonClientId; commandId: DaemonCommandId };
 
 export type DaemonSessionClosedReason = "killed" | "shutdown" | "completed" | "replaced" | "update";
@@ -1172,6 +1175,8 @@ export interface DaemonSavedSessionInfo {
 	allMessagesText: string;
 	agentStatus?: AgentConnectionAgentStatus;
 	usage?: SessionUsageSummary;
+	/** Last recorded provider/model selector; absent for sessions that never ran a model. */
+	model?: { provider: string; modelId: string };
 }
 
 export type DaemonDeleteSavedSessionResult = DeleteSessionFileResult;
