@@ -1,0 +1,1 @@
+- Merged upstream v0.9.5: unified rosters, session action priorities, update channels with verified compiled updates, worker orphan GC, and session hardening, with fork contracts preserved for /btw thinking, compaction thresholds, release strictness, and daemon schema 32.
