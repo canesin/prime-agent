@@ -1,5 +1,5 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { fauxAssistantMessage, type Model, type SimpleStreamOptions } from "@earendil-works/pi-ai";
+import { clampThinkingLevel, fauxAssistantMessage, type Model, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import { type HarnessState, planRefinement, reviewAutoRefine } from "../../../src/core/refinement/refinement.js";
 import { type SideQuestionEvent, startSideQuestion } from "../../../src/core/side-question.js";
@@ -70,8 +70,11 @@ describe("auxiliary reasoning settings", () => {
 		parent.state.thinkingLevel = testCase.parentLevel;
 		const parentMessages = structuredClone(parent.state.messages);
 		const observed: SimpleStreamOptions[] = [];
-		// Side questions keep the session level (cache identity); the first two calls clamp.
-		const expectedLevels: ThinkingLevel[] = [testCase.expectedLevel, testCase.expectedLevel, testCase.parentLevel];
+		// Refinement and review clamp to the session level. Side questions use the fork
+		// contract: the lowest supported thinking level (upstream v0.9.5 keeps the session
+		// level for cache identity; this fork pins the /btw mandatory-thinking fix instead).
+		const sideQuestionLevel = clampThinkingLevel(model, "off") as ThinkingLevel;
+		const expectedLevels: ThinkingLevel[] = [testCase.expectedLevel, testCase.expectedLevel, sideQuestionLevel];
 		harness.setResponses(
 			[JSON.stringify(proposal), JSON.stringify(review), "Side answer"].map((text, index) => (_context, options) => {
 				const request = options as SimpleStreamOptions;

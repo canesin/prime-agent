@@ -604,8 +604,8 @@ describe("self-update daemon restart", () => {
 				vi.fn(async () =>
 					Response.json({
 						version: VERSION,
-						package: PACKAGE_NAME,
-						tarball: `https://releases.example/releases/v${VERSION}/prime-agent-${VERSION}.tgz`,
+						package: "prime-agent",
+						tarball: `https://github.com/canesin/prime-agent/releases/download/v${VERSION}/prime-agent-${VERSION}.tgz`,
 						binaries:
 							invalidKind === "bad checksum" ? [{ ...artifact, sha256: "invalid" }] : [artifact, artifact],
 					}),
@@ -623,7 +623,7 @@ describe("self-update daemon restart", () => {
 		"keeps the selected npm release URL when a newer release has %s metadata",
 		async (invalidKind) => {
 			mockState.daemonProbe = { reachable: false };
-			const tarball = "https://releases.example/releases/v999.0.0/prime-agent-999.0.0.tgz";
+			const tarball = "https://github.com/canesin/prime-agent/releases/download/v999.0.0/prime-agent-999.0.0.tgz";
 			const artifact = {
 				platform: "linux-x64",
 				file: "prime-agent-999.0.0-linux-x64.tar.gz",
@@ -634,7 +634,7 @@ describe("self-update daemon restart", () => {
 				vi.fn(async () =>
 					Response.json({
 						version: "999.0.0",
-						package: PACKAGE_NAME,
+						package: "prime-agent",
 						tarball,
 						binaries:
 							invalidKind === "bad checksum" ? [{ ...artifact, sha256: "invalid" }] : [artifact, artifact],
@@ -646,6 +646,7 @@ describe("self-update daemon restart", () => {
 
 			expect(mockState.calls.filter((call) => call.startsWith("spawn:"))).toEqual([
 				`spawn:npm install -g ${tarball}`,
+				"spawn:npm uninstall -g @earendil-works/pi-coding-agent",
 			]);
 		},
 	);

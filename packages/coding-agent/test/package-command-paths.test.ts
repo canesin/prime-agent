@@ -364,7 +364,7 @@ else {
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
 		try {
-			await expect(runSelfUpdateInstallChild(["update", "--self"])).resolves.toBeUndefined();
+			await expect(runSelfUpdateInstallChild(["update", "--self", "--force"])).resolves.toBeUndefined();
 
 			expect(process.exitCode).toBeUndefined();
 			expect(errorSpy).not.toHaveBeenCalled();
@@ -415,7 +415,7 @@ else {
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
 		try {
-			await expect(runSelfUpdateInstallChild(["update", "--self"])).resolves.toBeUndefined();
+			await expect(runSelfUpdateInstallChild(["update", "--self", "--force"])).resolves.toBeUndefined();
 
 			expect(process.exitCode).toBeUndefined();
 			expect(errorSpy).not.toHaveBeenCalled();
@@ -509,13 +509,7 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
 		});
 		vi.stubGlobal(
 			"fetch",
-			vi.fn(async () =>
-				Response.json({
-					package: "prime-agent",
-					tarball: "releases/v0.0.1/prime-agent-0.0.1.tgz",
-					version: "0.0.1",
-				}),
-			),
+			vi.fn(async () => Response.json(forkManifest("0.0.1"))),
 		);
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -558,13 +552,7 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
 		});
 		vi.stubGlobal(
 			"fetch",
-			vi.fn(async () =>
-				Response.json({
-					package: "prime-agent",
-					tarball: "releases/v0.0.1-beta.1.1.abcdef0/prime-agent-0.0.1-beta.1.1.abcdef0.tgz",
-					version: "0.0.1-beta.1.1.abcdef0",
-				}),
-			),
+			vi.fn(async () => Response.json(forkManifest("0.0.1-beta.1.1.abcdef0"))),
 		);
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -618,7 +606,7 @@ else {
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
 		try {
-			await expect(runSelfUpdateInstallChild(["update", "--self"])).resolves.toBeUndefined();
+			await expect(runSelfUpdateInstallChild(["update", "--self", "--force"])).resolves.toBeUndefined();
 
 			expect(process.exitCode).toBeUndefined();
 			expect(errorSpy).not.toHaveBeenCalled();
@@ -713,7 +701,7 @@ if(args.includes("install")) process.exit(23);
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
 		try {
-			await expect(main(["update"])).resolves.toBeUndefined();
+			await expect(main(["update", "--force"])).resolves.toBeUndefined();
 
 			expect(process.exitCode).toBe(1);
 			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");

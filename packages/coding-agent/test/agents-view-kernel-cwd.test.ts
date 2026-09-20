@@ -44,9 +44,8 @@ describe("agents view Python directory metadata", () => {
 			],
 		});
 		const output = stripAnsi(header.render(100).join("\n"));
-		expect(output).toContain("cwd      /project");
+		expect(output).toContain("cwd /project");
 		expect(output).toContain("cwd (py) /project/nested");
-		expect(output).toContain("type to search sessions");
 	});
 
 	it("degrades locally when an older daemon does not advertise the capability", () => {

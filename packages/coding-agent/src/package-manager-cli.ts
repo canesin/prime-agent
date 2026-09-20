@@ -545,6 +545,7 @@ async function getSelfUpdatePlan(force: boolean, rollback = false, channel?: Upd
 	try {
 		const latestRelease = await getLatestPiRelease(VERSION, { channel });
 		if (!latestRelease) {
+			if (channel === "nightly") return nightlyReleaseUnavailablePlan();
 			// Fork releases are the only install source; a missing manifest must never
 			// fall through to the public registry package.
 			return {
@@ -561,6 +562,7 @@ async function getSelfUpdatePlan(force: boolean, rollback = false, channel?: Upd
 			return { installSpec, packageName, shouldRun: true, targetVersion: version };
 		}
 	} catch {
+		if (channel === "nightly") return nightlyReleaseUnavailablePlan();
 		return {
 			failure: "Could not resolve an installable fork release; update cancelled.",
 			installSpec: PACKAGE_NAME,

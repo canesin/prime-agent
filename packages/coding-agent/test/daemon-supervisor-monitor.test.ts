@@ -17,6 +17,7 @@ import {
 	createDaemonCommandEnvelope,
 	DAEMON_DEFAULT_SERVER_CAPABILITIES,
 	DAEMON_PROTOCOL_INFO,
+	DAEMON_SCHEMA_REVISION,
 	DAEMON_UPDATE_RESTART_FORMAT_VERSION,
 	type DaemonAttachResult,
 	type DaemonCommand,
@@ -1857,7 +1858,16 @@ describe("daemon worker supervisor monitoring", () => {
 				processStartId: getProcessStartId(process.pid),
 				stopRequestedAt: undefined as string | undefined,
 			},
-			client: undefined as { request: ReturnType<typeof vi.fn> } | undefined,
+			client: undefined as
+				| {
+						hello: {
+							protocol: typeof DAEMON_PROTOCOL_INFO;
+							schemaRevision: number;
+							serverCapabilities: readonly DaemonServerCapability[];
+						};
+						request: ReturnType<typeof vi.fn>;
+				  }
+				| undefined,
 			recovery: undefined as Promise<void> | undefined,
 			summaries: new Map<string, SessionSummary>(),
 			intentionalStop: false,
@@ -1901,9 +1911,14 @@ describe("daemon worker supervisor monitoring", () => {
 	it("recovers a failed identity-current worker when a command is forwarded to it", async () => {
 		const { root, worker } = retryableWorkerFixture("failed-root");
 		const request = vi.fn(async () => ({ type: "response", command: "get_state", success: true, data: root }));
+		const workerHello = {
+			protocol: DAEMON_PROTOCOL_INFO,
+			schemaRevision: DAEMON_SCHEMA_REVISION,
+			serverCapabilities: DAEMON_DEFAULT_SERVER_CAPABILITIES,
+		};
 		const recoverWorker = vi.fn(async () => {
 			worker.descriptor.lifecycle = "ready";
-			worker.client = { request };
+			worker.client = { hello: workerHello, request };
 		});
 		const supervisor = retrySupervisor(worker, { recoverWorker }) as unknown as {
 			forwardToWorker(
@@ -1924,11 +1939,16 @@ describe("daemon worker supervisor monitoring", () => {
 	it("joins an in-flight recovery instead of failing a concurrent forwarded command", async () => {
 		const { root, worker } = retryableWorkerFixture("race");
 		const request = vi.fn(async () => ({ type: "response", command: "get_state", success: true, data: root }));
+		const workerHello = {
+			protocol: DAEMON_PROTOCOL_INFO,
+			schemaRevision: DAEMON_SCHEMA_REVISION,
+			serverCapabilities: DAEMON_DEFAULT_SERVER_CAPABILITIES,
+		};
 		const release = createDeferred<void>();
 		const recoverWorker = vi.fn(() => {
 			worker.recovery = release.promise.then(() => {
 				worker.descriptor.lifecycle = "ready";
-				worker.client = { request };
+				worker.client = { hello: workerHello, request };
 				worker.recovery = undefined;
 			});
 			return worker.recovery;
@@ -4638,7 +4658,15 @@ describe("daemon worker supervisor monitoring", () => {
 			hello: workerHello,
 			request,
 		};
-		const worker = { client: workerClient };
+		const worker = {
+			descriptor: {
+				workerId: "fenced-worker",
+				lifecycle: "ready",
+				pid: process.pid,
+				processStartId: getProcessStartId(process.pid),
+			},
+			client: workerClient,
+		};
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			requireAvailableWorkerClient: vi.fn(() => workerClient),
 		}) as {

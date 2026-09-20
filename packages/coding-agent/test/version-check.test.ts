@@ -161,14 +161,14 @@ describe("update channel preference", () => {
 	});
 
 	it("follows a preferred nightly channel from a stable installation", async () => {
-		const fetchMock = vi.fn(async () => Response.json({ version: "v1.2.5-beta.130.1.abcdef0" }));
+		const fetchMock = vi.fn(async () => Response.json(manifest("v1.2.5-beta.130.1.abcdef0")));
 		vi.stubGlobal("fetch", fetchMock);
 		await expect(getLatestPiVersion("1.2.4", { channel: "nightly" })).resolves.toBe("1.2.5-beta.130.1.abcdef0");
 		expect(fetchMock).toHaveBeenCalledWith(`${defaultPrimeAgentDownloadBaseUrl}/beta.json`, expect.any(Object));
 	});
 
 	it("follows a preferred stable channel from a beta installation", async () => {
-		const fetchMock = vi.fn(async () => Response.json({ version: "v1.2.4" }));
+		const fetchMock = vi.fn(async () => Response.json(manifest("v1.2.4")));
 		vi.stubGlobal("fetch", fetchMock);
 		await expect(getLatestPiVersion("1.2.4-beta.123.1.1234567", { channel: "stable" })).resolves.toBe("1.2.4");
 		expect(fetchMock).toHaveBeenCalledWith(`${defaultPrimeAgentDownloadBaseUrl}/latest.json`, expect.any(Object));
@@ -204,7 +204,7 @@ describe("update channel preference", () => {
 	it("reports the current beta build from a stable installation once nightly is preferred", async () => {
 		vi.stubGlobal(
 			"fetch",
-			vi.fn(async () => Response.json({ version: "v1.2.3-beta.5.1.abcdef0" })),
+			vi.fn(async () => Response.json(manifest("v1.2.3-beta.5.1.abcdef0"))),
 		);
 		await expect(checkForNewPiVersion("1.2.3", "nightly")).resolves.toBe("1.2.3-beta.5.1.abcdef0");
 		await expect(checkForNewPiVersion("1.2.3")).resolves.toBeUndefined();
@@ -213,7 +213,7 @@ describe("update channel preference", () => {
 	it("reports a newer beta build when nightly is preferred", async () => {
 		vi.stubGlobal(
 			"fetch",
-			vi.fn(async () => Response.json({ version: "v1.2.5-beta.1.1.abcdef0" })),
+			vi.fn(async () => Response.json(manifest("v1.2.5-beta.1.1.abcdef0"))),
 		);
 		await expect(checkForNewPiVersion("1.2.4", "nightly")).resolves.toBe("1.2.5-beta.1.1.abcdef0");
 	});
@@ -231,9 +231,7 @@ describe("manifest binary schema compatibility", () => {
 			"fetch",
 			vi.fn(async () =>
 				Response.json({
-					version: "v1.2.4",
-					package: "prime-agent",
-					tarball: "releases/v1.2.4/prime-agent-1.2.4.tgz",
+					...manifest("v1.2.4"),
 					...fields,
 				}),
 			),
@@ -308,7 +306,7 @@ describe("manifest binary schema compatibility", () => {
 		await expect(getLatestPiRelease("1.2.3")).resolves.toEqual({
 			version: "1.2.4",
 			packageName: "prime-agent",
-			installSpec: `${defaultPrimeAgentDownloadBaseUrl}/releases/v1.2.4/prime-agent-1.2.4.tgz`,
+			installSpec: manifest("v1.2.4").tarball,
 		});
 	});
 });

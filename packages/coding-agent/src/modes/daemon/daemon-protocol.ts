@@ -80,7 +80,7 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 31 adds structured session_recovering failure info for known-but-unaddressable sessions.
 // Revision 32 publishes the last recorded model on saved-session rows.
 export const DAEMON_SCHEMA_REVISION = 32;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-32-adf9e1b4b2ea";
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-32-8612d9c6be24";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
