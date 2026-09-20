@@ -192,13 +192,6 @@ export function startSideQuestion(
 			const runWithRetry = (): Promise<AssistantMessage> =>
 				completeWithProviderRetry(
 					async () => {
-						if (process.env.SQ_DEBUG)
-							console.error(
-								"SQDBG callback: promptedOnce=%s msgs=%s turns=%s",
-								promptedOnce,
-								sideAgent.state.messages.length,
-								assistantTurns().length,
-							);
 						if (promptedOnce) {
 							// Session-loop recovery: drop the failed assistant turn and re-run.
 							sideAgent.state.messages = sideAgent.state.messages.slice(0, -1);
@@ -216,14 +209,6 @@ export function startSideQuestion(
 					{ policy: retry, signal: retryAbortController.signal },
 				);
 			let finalTurn = await runWithRetry();
-			if (process.env.SQ_DEBUG)
-				console.error(
-					"SQDBG after first: receivedOutput=%s err=%s level=%s retryLevel=%s",
-					receivedOutput,
-					sideAgent.state.errorMessage,
-					thinkingLevel,
-					retryThinkingLevel,
-				);
 			if (
 				!abortRequested &&
 				!receivedOutput &&
