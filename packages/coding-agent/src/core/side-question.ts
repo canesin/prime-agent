@@ -222,6 +222,7 @@ export function startSideQuestion(
 				sideAgent.state.messages = initialMessages;
 				sideAgent.state.thinkingLevel = retryThinkingLevel;
 				promptedOnce = false;
+				turnCount = 0;
 				finalTurn = await runWithRetry();
 			}
 			if (abortRequested) {

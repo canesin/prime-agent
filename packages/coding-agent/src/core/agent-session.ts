@@ -110,7 +110,6 @@ import {
 	compact,
 	estimateContextTokens,
 	estimateTokens,
-	findCutPoint,
 	generateBranchSummary,
 	prepareCompaction,
 	serializeConversation,
@@ -8827,22 +8826,13 @@ export class AgentSession {
 		signal: AbortSignal;
 	}): Promise<CompactionResult> {
 		const { model, apiKey, headers, customInstructions, signal } = options;
-		let pathEntries = this.sessionManager.getBranch();
+		const pathEntries = this.sessionManager.getBranch();
 		const configured = this.settingsManager.getCompactionSettings();
 		const settings = {
 			...configured,
 			reserveTokens: Math.min(configured.reserveTokens, Math.floor(model.contextWindow / 5), model.maxTokens),
 			keepRecentTokens: Math.min(configured.keepRecentTokens, Math.floor(model.contextWindow / 4)),
 		};
-		if (
-			findCutPoint(pathEntries, 0, pathEntries.length, settings.keepRecentTokens).firstKeptEntryIndex ===
-			pathEntries.length
-		) {
-			// An empty retained suffix needs a real, non-message entry as its boundary.
-			this.sessionManager.appendCustomEntry("compaction_boundary", {});
-			pathEntries = this.sessionManager.getBranch();
-		}
-
 		const preparation = prepareCompaction(pathEntries, settings);
 		if (!preparation) {
 			const lastEntry = pathEntries[pathEntries.length - 1];

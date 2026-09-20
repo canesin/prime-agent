@@ -1,4 +1,6 @@
-import { appendFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { AgentContinueError, type AgentMessage, type ShouldStopAfterTurnContext } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
@@ -8,6 +10,7 @@ import {
 	type Usage,
 } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ENV_AGENT_DIR } from "../../src/config.js";
 import { convertToLlm } from "../../src/core/messages.js";
 import { getLocalHarnessStateDir, loadHarnessState, saveHarnessState } from "../../src/core/refinement/index.js";
 import { SessionManager } from "../../src/core/session-manager.js";
@@ -77,6 +80,7 @@ describe("AgentSession compaction characterization", () => {
 	afterEach(() => {
 		vi.useRealTimers();
 		vi.restoreAllMocks();
+		vi.unstubAllEnvs();
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
 		}
@@ -199,6 +203,9 @@ describe("AgentSession compaction characterization", () => {
 	});
 
 	it("prepends the harness digest to the compaction head message on initial and update-merge compactions", async () => {
+		// Ambient global harness state (real memories on this machine) would crowd the
+		// ranked digest; point the agent dir at an empty scratch dir for this test.
+		vi.stubEnv(ENV_AGENT_DIR, mkdtempSync(join(tmpdir(), "pi-compaction-digest-")));
 		const harness = await createHarness({
 			settings: { compaction: { keepRecentTokens: 1 } },
 			persistSession: true,
