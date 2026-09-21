@@ -65,11 +65,9 @@ describe("built-in slash commands", () => {
 		});
 	});
 
-	test("exposes trace preview and backfill syntax", () => {
-		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "traces")).toMatchObject({
-			description: "Preview, upload, or configure Prime Agent traces",
-			argumentHint: "[status|on|off|preview|upload|upload-current|upload-all|login]",
-		});
+	test("does not expose trace sharing commands", () => {
+		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "traces")).toBeUndefined();
+		expect(isBuiltinSlashCommandName("traces")).toBe(false);
 	});
 
 	test("marks argument commands as taking a free-form argument", () => {

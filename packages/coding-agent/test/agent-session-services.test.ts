@@ -29,6 +29,48 @@ describe("createAgentSessionFromServices", () => {
 		}
 	});
 
+	it("does not expose trace-sharing settings", () => {
+		const settingsManager = SettingsManager.inMemory();
+		expect(settingsManager).not.toHaveProperty("getAgentTracesEnabled");
+		expect(settingsManager).not.toHaveProperty("setAgentTracesEnabled");
+	});
+
+	it("keeps sessions local despite legacy trace-sharing opt-in and credentials", async () => {
+		const tempDir = join(tmpdir(), `pi-session-no-trace-upload-${Date.now()}`);
+		mkdirSync(tempDir, { recursive: true });
+		cleanupPaths.push(tempDir);
+		vi.stubEnv(ENV_AGENT_DIR, tempDir);
+		vi.stubEnv("PRIME_AGENT_TRACES_API_KEY", "unused-trace-key");
+		writeFileSync(join(tempDir, "settings.json"), JSON.stringify({ agentTraces: { enabled: true } }));
+		const services = await createAgentSessionServices({
+			cwd: tempDir,
+			agentDir: tempDir,
+			authStorage: AuthStorage.inMemory(),
+			telemetryDisabled: true,
+			resourceLoaderOptions: {
+				noExtensions: true,
+				noSkills: true,
+				noPromptTemplates: true,
+				noThemes: true,
+				noContextFiles: true,
+			},
+		});
+		const sessionManager = SessionManager.create(tempDir, join(tempDir, "sessions"));
+		const onPersist = vi.spyOn(sessionManager, "onPersist");
+		const { session } = await createAgentSessionFromServices({
+			services,
+			sessionManager,
+			telemetryDisabled: true,
+		});
+		try {
+			expect(onPersist).not.toHaveBeenCalled();
+			expect(existsSync(join(tempDir, "agent-traces-outbox"))).toBe(false);
+		} finally {
+			onPersist.mockRestore();
+			session.dispose();
+		}
+	});
+
 	it("enables CLI login reuse only for default services storage", async () => {
 		const tempDir = join(tmpdir(), `pi-default-services-auth-${Date.now()}`);
 		mkdirSync(tempDir, { recursive: true });

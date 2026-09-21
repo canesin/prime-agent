@@ -904,6 +904,17 @@ describe("InteractiveMode working timer", () => {
 });
 
 describe("InteractiveMode submit handling", () => {
+	test("does not intercept the removed /traces command in the client", async () => {
+		const fakeThis = createSubmitHandlerHarness();
+		const handleTracesCommand = vi.fn();
+		Object.assign(fakeThis, { handleTracesCommand });
+
+		await fakeThis.defaultEditor.onSubmit?.("/traces on");
+
+		expect(handleTracesCommand).not.toHaveBeenCalled();
+		expect(fakeThis.agentConnection.prompt).toHaveBeenCalledWith("/traces on", expect.any(Object));
+	});
+
 	test.each(["normal Enter", "installed custom editor"])("captures exact rich state for %s", async () => {
 		const image = { type: "image", data: "base64", mimeType: "image/png" };
 		const pasteSnapshot = { pastes: [[1, "expanded paste"]] as const, pasteCounter: 2 };
@@ -3481,7 +3492,6 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		applySelectedModel(model: AgentConnectionModel): Promise<void>;
 		prepareForModelSelectionAfterLogin(authResult: AuthenticationResult): Promise<boolean>;
 		askOnboardingProviders(signal: AbortSignal): Promise<void>;
-		askOnboardingTraceOptIn(): Promise<void>;
 		setupAutocompleteProvider(): void;
 	};
 	type OnboardingFake = OnboardingHarness & {
@@ -3501,7 +3511,6 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 				getOnboardingShown: () => boolean;
 				setOnboardingShown: (shown: boolean) => void;
 				setDefaultModelAndProvider: (provider: string, modelId: string) => void;
-				getAgentTracesEnabled: () => boolean;
 				flush: () => Promise<void>;
 			};
 		};
@@ -4180,7 +4189,6 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 				getOnboardingShown: vi.fn(() => shown),
 				setOnboardingShown: vi.fn(),
 				setDefaultModelAndProvider: vi.fn(),
-				getAgentTracesEnabled: vi.fn(() => false),
 				flush: vi.fn(async () => {}),
 			},
 		};
@@ -4234,6 +4242,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 
 	test("reports no completion when the block never mounts", async () => {
 		const fakeThis = createPrimeCliHarness(false);
+		fakeThis.connectionState = createConnectionState({ model: undefined });
 		fakeThis.showOnboardingSplash = vi.fn(async () => undefined);
 		fakeThis.showConfigurationMenu = vi.fn(async () => {});
 
@@ -4246,20 +4255,18 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		const fakeThis = createPrimeCliHarness(false);
 		const dismiss = vi.fn();
 		fakeThis.showOnboardingSplash = vi.fn(async () => ({ dismiss }));
-		fakeThis.askOnboardingTraceOptIn = vi.fn(async () => {});
 		fakeThis.createAuthFlows = vi.fn();
 		fakeThis.prepareForModelSelectionAfterLogin = vi.fn(async () => true);
 		fakeThis.showConfigurationMenu = vi.fn(async () => {});
 
 		await expect(runOnboardingFlow.call(fakeThis)).resolves.toBe(true);
 
-		expect(fakeThis.showOnboardingSplash).toHaveBeenCalledWith({ immediate: true });
+		expect(fakeThis.showOnboardingSplash).not.toHaveBeenCalled();
 		expect(fakeThis.createAuthFlows).not.toHaveBeenCalled();
 		expect(fakeThis.prepareForModelSelectionAfterLogin).not.toHaveBeenCalled();
-		expect(fakeThis.askOnboardingTraceOptIn).toHaveBeenCalledTimes(1);
 		// The model picker is no longer part of first launch.
 		expect(fakeThis.showConfigurationMenu).not.toHaveBeenCalled();
-		expect(dismiss).toHaveBeenCalledOnce();
+		expect(dismiss).not.toHaveBeenCalled();
 	});
 
 	test("never opens the model picker, even when models are already available", async () => {
@@ -4299,11 +4306,20 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		expect(fakeThis.uiServices.settingsManager.flush).not.toHaveBeenCalled();
 	});
 
-	test("reports no completion when a reset interrupts the trace question", async () => {
+	test("reports no completion when a reset interrupts provider selection", async () => {
 		const fakeThis = createPrimeCliHarness(false);
+		fakeThis.connectionState = createConnectionState({ model: undefined });
 		fakeThis.showOnboardingSplash = vi.fn(async () => ({ dismiss: vi.fn() }));
-		// The reset settles the trace question and aborts the flow behind it.
-		fakeThis.askOnboardingTraceOptIn = vi.fn(async () => {
+		fakeThis.createAuthFlows = vi.fn(() => ({
+			runPrimeInferenceLogin: vi.fn(async () => ({
+				status: "success" as const,
+				providerId: PRIME_INFERENCE_PROVIDER_ID,
+				providerName: "Prime Inference",
+				authType: "api_key" as const,
+			})),
+		}));
+		fakeThis.prepareForModelSelectionAfterLogin = vi.fn(async () => true);
+		fakeThis.askOnboardingProviders = vi.fn(async () => {
 			(fakeThis as unknown as { onboardingFlowAbort?: AbortController }).onboardingFlowAbort?.abort();
 		});
 
