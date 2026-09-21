@@ -1,3 +1,4 @@
+import { isNativePlatform } from "./native-installation.js";
 import { getPiUserAgent } from "./pi-user-agent.js";
 
 const DEFAULT_PRIME_AGENT_DOWNLOAD_BASE_URL = "https://github.com/canesin/prime-agent/releases/latest/download";
@@ -8,10 +9,19 @@ const DEFAULT_VERSION_CHECK_TIMEOUT_MS = 10000;
 const RELEASE_MANIFEST_VERSION_PATTERN =
 	/^v?((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)$/;
 
+export type UpdateChannel = "stable" | "nightly";
+
 export interface LatestPiRelease {
 	version: string;
 	packageName: string;
 	installSpec: string;
+	binaries?: NativeReleaseArtifact[];
+}
+
+interface NativeReleaseArtifact {
+	platform: string;
+	file: string;
+	sha256: string;
 }
 
 interface ParsedVersion {
@@ -88,13 +98,60 @@ export function isNewerPackageVersion(candidateVersion: string, currentVersion: 
 	return candidateVersion.trim() !== currentVersion.trim();
 }
 
+function normalizeReleaseVersion(version: string): string {
+	return version.trim().replace(/^v/, "");
+}
+
 function parseReleaseManifestVersion(version: string): string | undefined {
 	return RELEASE_MANIFEST_VERSION_PATTERN.exec(version)?.[1];
 }
 
-function getReleaseManifestPath(currentVersion: string): string {
+/**
+ * A preferred channel wins; otherwise a build tagged `-beta` stays on nightly and anything else
+ * follows stable. Nightly builds are what the release bucket publishes as beta.
+ */
+export function resolveUpdateChannel(currentVersion: string, preferred?: UpdateChannel): UpdateChannel {
+	if (preferred) return preferred;
 	const prerelease = parsePackageVersion(currentVersion)?.prerelease;
-	return prerelease?.match(/^beta(?:\.|$)/) ? BETA_VERSION_MANIFEST_PATH : STABLE_VERSION_MANIFEST_PATH;
+	return prerelease?.match(/^beta(?:\.|$)/) ? "nightly" : "stable";
+}
+
+/**
+ * Whether `candidateVersion` should replace `currentVersion` on the effective channel.
+ * Same-channel updates must be strictly newer. An explicit switch to another channel
+ * accepts any different version whose base version is not older, so a stable 1.2.3
+ * can move onto 1.2.3-beta.5 even though prerelease ordering ranks that lower.
+ */
+export function isReleaseUpdateCandidate(
+	candidateVersion: string,
+	currentVersion: string,
+	channel?: UpdateChannel,
+): boolean {
+	if (isNewerPackageVersion(candidateVersion, currentVersion)) return true;
+	if (!channel || channel === resolveUpdateChannel(currentVersion)) return false;
+	if (normalizeReleaseVersion(candidateVersion) === normalizeReleaseVersion(currentVersion)) return false;
+	const candidate = parsePackageVersion(candidateVersion);
+	const current = parsePackageVersion(currentVersion);
+	if (!candidate || !current) return true;
+	if (candidate.major !== current.major) return candidate.major > current.major;
+	if (candidate.minor !== current.minor) return candidate.minor > current.minor;
+	return candidate.patch >= current.patch;
+}
+
+/** True when installing `candidateVersion` would lower the major.minor.patch base, prerelease tags aside. */
+export function isBaseVersionDowngrade(candidateVersion: string, currentVersion: string): boolean {
+	const candidate = parsePackageVersion(candidateVersion);
+	const current = parsePackageVersion(currentVersion);
+	if (!candidate || !current) return false;
+	if (candidate.major !== current.major) return candidate.major < current.major;
+	if (candidate.minor !== current.minor) return candidate.minor < current.minor;
+	return candidate.patch < current.patch;
+}
+
+function getReleaseManifestPath(currentVersion: string, channel?: UpdateChannel): string {
+	return resolveUpdateChannel(currentVersion, channel) === "nightly"
+		? BETA_VERSION_MANIFEST_PATH
+		: STABLE_VERSION_MANIFEST_PATH;
 }
 
 function canonicalForkTarball(version: string): string {
@@ -103,12 +160,12 @@ function canonicalForkTarball(version: string): string {
 
 export async function getLatestPiRelease(
 	currentVersion: string,
-	options: { timeoutMs?: number } = {},
+	options: { timeoutMs?: number; baseUrl?: string; channel?: UpdateChannel } = {},
 ): Promise<LatestPiRelease | undefined> {
 	if (process.env.PI_SKIP_VERSION_CHECK || process.env.PI_OFFLINE) return undefined;
 
-	const baseUrl = DEFAULT_PRIME_AGENT_DOWNLOAD_BASE_URL;
-	const response = await fetch(`${baseUrl}/${getReleaseManifestPath(currentVersion)}`, {
+	const baseUrl = options.baseUrl?.replace(/\/+$/, "") ?? DEFAULT_PRIME_AGENT_DOWNLOAD_BASE_URL;
+	const response = await fetch(`${baseUrl}/${getReleaseManifestPath(currentVersion, options.channel)}`, {
 		headers: {
 			"User-Agent": getPiUserAgent(currentVersion),
 			accept: "application/json",
@@ -121,6 +178,8 @@ export async function getLatestPiRelease(
 		package?: unknown;
 		tarball?: unknown;
 		version?: unknown;
+		binaries?: unknown;
+		binariesV2?: unknown;
 	};
 	if (typeof data.version !== "string") {
 		return undefined;
@@ -129,20 +188,52 @@ export async function getLatestPiRelease(
 	if (!version || data.package !== PRIME_AGENT_PACKAGE_NAME) return undefined;
 	const installSpec = canonicalForkTarball(version);
 	if (data.tarball !== installSpec) return undefined;
-	return { version, packageName: PRIME_AGENT_PACKAGE_NAME, installSpec };
+	const release: LatestPiRelease = { version, packageName: PRIME_AGENT_PACKAGE_NAME, installSpec };
+	// Prefer the complete v2 schema, with the v1 schema as a compatibility
+	// fallback. Structurally valid entries for future platforms are ignored,
+	// while malformed or duplicate supported-platform entries reject the list.
+	const binarySource = Array.isArray(data.binariesV2)
+		? data.binariesV2
+		: Array.isArray(data.binaries)
+			? data.binaries
+			: undefined;
+	if (binarySource) {
+		const binaries: NativeReleaseArtifact[] = [];
+		const platforms = new Set<string>();
+		for (const candidate of binarySource) {
+			if (!candidate || typeof candidate !== "object") return release;
+			const artifact = candidate as Partial<NativeReleaseArtifact>;
+			if (typeof artifact.platform !== "string") return release;
+			if (!isNativePlatform(artifact.platform)) continue;
+			if (
+				platforms.has(artifact.platform) ||
+				artifact.file !== `prime-agent-${release.version}-${artifact.platform}.tar.gz` ||
+				typeof artifact.sha256 !== "string" ||
+				!/^[a-f0-9]{64}$/.test(artifact.sha256)
+			)
+				return release;
+			platforms.add(artifact.platform);
+			binaries.push({ platform: artifact.platform, file: artifact.file, sha256: artifact.sha256 });
+		}
+		if (binaries.length > 0) release.binaries = binaries;
+	}
+	return release;
 }
 
 export async function getLatestPiVersion(
 	currentVersion: string,
-	options: { timeoutMs?: number } = {},
+	options: { timeoutMs?: number; channel?: UpdateChannel } = {},
 ): Promise<string | undefined> {
 	return (await getLatestPiRelease(currentVersion, options))?.version;
 }
 
-export async function checkForNewPiVersion(currentVersion: string): Promise<string | undefined> {
+export async function checkForNewPiVersion(
+	currentVersion: string,
+	channel?: UpdateChannel,
+): Promise<string | undefined> {
 	try {
-		const latestVersion = await getLatestPiVersion(currentVersion);
-		if (latestVersion && isNewerPackageVersion(latestVersion, currentVersion)) {
+		const latestVersion = await getLatestPiVersion(currentVersion, { channel });
+		if (latestVersion && isReleaseUpdateCandidate(latestVersion, currentVersion, channel)) {
 			return latestVersion;
 		}
 		return undefined;

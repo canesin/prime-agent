@@ -1,0 +1,1 @@
+- Merged upstream v0.9.5 model catalog and provider updates, keeping Z.ai mandatory-thinking capability defaults.

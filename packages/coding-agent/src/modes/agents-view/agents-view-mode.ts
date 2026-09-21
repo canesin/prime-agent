@@ -29,6 +29,7 @@ import { ensureTool } from "../../utils/tools-manager.js";
 import { DaemonAgentConnection } from "../agent-connection/daemon-agent-connection.js";
 import type { AgentConnectionHeartbeat, AgentConnectionSavedSessionInfo } from "../agent-connection/types.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../daemon/daemon-client.js";
+import { DaemonSessionRecoveringError } from "../daemon/daemon-errors.js";
 import {
 	collectDaemonClientEnv,
 	type DaemonClosingReason,
@@ -44,7 +45,6 @@ import {
 	listDaemonSavedSessions,
 	renameDaemonSavedSession,
 } from "../daemon/saved-session-catalog.js";
-import { formatTokenCount } from "../interactive/agent-activity.js";
 import { CustomEditor } from "../interactive/components/custom-editor.js";
 import { keyText } from "../interactive/components/keybinding-hints.js";
 import { BrandSplashHeader, InteractiveMode } from "../interactive/interactive-mode.js";
@@ -67,6 +67,7 @@ import {
 	type StartupNotices,
 } from "../shared/startup-notices.js";
 import {
+	type AgentsViewRecursiveRollup,
 	type AgentsViewRow,
 	type AgentsViewScopeFrame,
 	type AgentsViewScopeKey,
@@ -76,15 +77,15 @@ import {
 	buildUnifiedSessionIndex,
 	computeRecursiveRollups,
 	createUnattachableChildOpenResult,
+	filterEmptyAgentsViewSessions,
 	filterUnifiedSessions,
 	formatHeartbeatBadge,
 	getAgentsViewSelectionKey,
 	getAgentsViewSessionTitle,
+	getSessionStatusLabel,
 	getAgentsViewSummaryIdentity as getSummaryIdentity,
 	getUnifiedSessionAncestorSessionIds,
 	hasUnifiedSessionChildren,
-	isEmptyAgentsViewSession,
-	isSubagentSummary,
 	migrateAgentsViewIdentitySet,
 	reconcileUnifiedSessions,
 	resolveAgentsViewLeftResult,
@@ -103,6 +104,7 @@ import { AgentsViewRosterStore, STALE_ROSTER_DAEMON_MESSAGE } from "./roster-sto
 import { matchesSearchText } from "./session-view-search.js";
 
 const HEARTBEAT_POLL_INTERVAL_MS = 15000;
+const SAVED_CATALOG_RECONCILE_INTERVAL_MS = 75;
 const RECONNECT_TIMEOUT_MS = 120000;
 const RECONNECT_RETRY_MS = 1000;
 const EXIT_HINT_DURATION_MS = 2000;
@@ -111,8 +113,7 @@ const STATUS_MESSAGE_DURATION_MS = 4500;
 const SEARCH_PROMPT_PLACEHOLDER = "Search sessions";
 const REPLY_PROMPT_FALLBACK_PLACEHOLDER = "Write a reply to this agent";
 const RESUME_PROMPT_PLACEHOLDER = "Write a prompt to resume this session";
-const COMPLETED_ROW_ICON = "✓";
-const NEEDS_INPUT_ROW_ICON = "●";
+const STATUS_ROW_ICON = "•";
 const SELECTED_ROW_MARKER = "\0agents-view-selected-row\0";
 const CODE_ROW_MARKER = "\0agents-view-code-row\0";
 
@@ -123,7 +124,6 @@ export interface AgentsViewModeOptions {
 	createUiServicesForSession?: (summary: SessionSummary) => Promise<InteractiveModeUiServices>;
 	migratedProviders?: string[];
 	modelFallbackMessage?: string;
-	startupModelId?: string;
 	verbose?: boolean;
 	recoverDaemon?: () => Promise<void>;
 	reconnectTimeoutMs?: number;
@@ -279,12 +279,16 @@ export function createInitialAgentsViewPersistentState(
 	options: Pick<AgentsViewModeOptions, "initialScopeKey" | "initialSession">,
 ): AgentsViewPersistentState {
 	const initialSession = options.initialSession;
+	// A scoped view excludes its root from its own rows, so anchoring the
+	// selection on the entered-from chat could never resolve there and would
+	// only arm the pending-anchor state for the whole catalog scan.
+	const seedSelection = initialSession && !options.initialScopeKey;
 	return {
-		...(initialSession
+		...(initialSession ? { backSession: initialSession } : {}),
+		...(seedSelection
 			? {
 					selectedRowIdentity: getSummaryIdentity(initialSession),
 					selectedSessionKey: getAgentsViewSelectionKey(initialSession),
-					backSession: initialSession,
 				}
 			: {}),
 		...(options.initialScopeKey
@@ -338,6 +342,7 @@ async function openAgentsViewSession(
 		try {
 			const connection = await DaemonAgentConnection.attach(client, summary.activeSessionId, {
 				closeClientOnDispose: true,
+				deferSessionEvents: true,
 				recoverDaemon: options.recoverDaemon,
 				reconnectTimeoutMs: options.reconnectTimeoutMs,
 				telemetryDisabled: options.config.telemetryDisabled,
@@ -345,7 +350,11 @@ async function openAgentsViewSession(
 			return { connection, summary };
 		} catch (error) {
 			client.close();
-			if (!summary.sessionFile || !isUnknownActiveSessionError(error)) {
+			// Recovering takes the saved-session path too; its create/open route retries the recovery.
+			if (
+				!summary.sessionFile ||
+				!(isUnknownActiveSessionError(error) || error instanceof DaemonSessionRecoveringError)
+			) {
 				throw error;
 			}
 			client = await connectAgentsViewDaemonClient(socketPath);
@@ -361,6 +370,7 @@ async function openAgentsViewSession(
 		const resumed = await resumeSavedAgentsViewSession(client, options.config, summary);
 		const connection = await DaemonAgentConnection.attach(client, resumed.activeSessionId, {
 			closeClientOnDispose: true,
+			deferSessionEvents: true,
 			recoverDaemon: options.recoverDaemon,
 			reconnectTimeoutMs: options.reconnectTimeoutMs,
 			telemetryDisabled: options.config.telemetryDisabled,
@@ -666,6 +676,7 @@ export class AgentsViewMode implements Component, Focusable {
 	private heartbeats: AgentConnectionHeartbeat[] = [];
 	private unifiedRecords: UnifiedSessionRecord[] = [];
 	private unifiedIndex: UnifiedSessionIndex = buildUnifiedSessionIndex([]);
+	private recursiveRollups: ReadonlyMap<UnifiedSessionRecord, AgentsViewRecursiveRollup> = new Map();
 	private scopedRecords: UnifiedSessionRecord[] = [];
 	private scopeKey: AgentsViewScopeKey | undefined;
 	private scopeRootSummary: SessionSummary | undefined;
@@ -673,6 +684,7 @@ export class AgentsViewMode implements Component, Focusable {
 	private savedCatalogGeneration = 0;
 	private heartbeatCatalogGeneration = 0;
 	private savedCatalogRefreshPending = false;
+	private savedCatalogReconcileTimer: ReturnType<typeof setTimeout> | undefined;
 	private expandedSubagentParents = new Set<string>();
 	// Agent row identities whose full spawn program is currently shown.
 	// The program key toggles each agent shown ↔ hidden.
@@ -833,25 +845,18 @@ export class AgentsViewMode implements Component, Focusable {
 				this.editor.invalidate();
 			},
 		};
-		this.splash = new BrandSplashHeader(
-			VERSION,
-			() => this.getSplashModelId(),
-			() => this.getSplashCwd(),
-			undefined,
-			{
-				topPadding: true,
-				getExtraMetadata: () => {
-					const root = this.scopeRootSummary;
-					const kernelCwd = this.getSplashKernelCwd();
-					return [
-						{ label: "agents", value: this.getAgentCountsText() },
-						{ label: "scope", value: root ? getAgentsViewSessionTitle(root) : "global" },
-						{ label: "depth", value: String(getAgentsViewDepth(root)) },
-						...(kernelCwd ? [{ label: "cwd (py)", value: kernelCwd }] : []),
-					];
-				},
+		this.splash = new BrandSplashHeader(VERSION, () => this.getSplashCwd(), undefined, {
+			topPadding: true,
+			getExtraMetadata: () => {
+				const root = this.scopeRootSummary;
+				const kernelCwd = this.getSplashKernelCwd();
+				return [
+					{ label: "agents", value: this.getAgentCountsText() },
+					...(root ? [{ label: "depth", value: String(getAgentsViewDepth(root)) }] : []),
+					...(kernelCwd ? [{ label: "cwd (py)", value: kernelCwd }] : []),
+				];
 			},
-		);
+		});
 	}
 
 	async run(): Promise<AgentsViewRunResult> {
@@ -904,8 +909,6 @@ export class AgentsViewMode implements Component, Focusable {
 			const hasRunning = this.rows.some((row) => row.section === "running");
 			const hasStaleAge = this.rows.some((row) => row.summary.lastHeardFromAt !== undefined);
 			if (!hasRunning && !hasStaleAge) return;
-			// Age labels are baked into rows at build time; ticking them needs a rebuild.
-			if (hasStaleAge) this.rebuildRows();
 			if (hasRunning) this.workingIconFrame += 1;
 			this.ui.requestRender();
 		}, WORKING_ICON_INTERVAL_MS);
@@ -960,6 +963,13 @@ export class AgentsViewMode implements Component, Focusable {
 			this.cycleProgramForSelected();
 			return;
 		}
+		if (!this.replyTarget && this.editor.getText().length === 0) {
+			if (this.keybindings.matches(data, "app.agents.expand")) {
+				const row = this.rows[this.selectedIndex];
+				if (row && (row.kind === "subagent-summary" || row.descendantCount > 0)) this.toggleSubagentList(row);
+				return;
+			}
+		}
 		if (!this.replyTarget && this.keybindings.matches(data, "app.agents.open")) {
 			if (this.editor.getText().length === 0 || this.isSearchCursorAtEnd()) {
 				this.openSelected();
@@ -1005,6 +1015,11 @@ export class AgentsViewMode implements Component, Focusable {
 		const noticeLines = this.renderStartupNotices(width);
 		if (noticeLines.length > 0) {
 			headerLines.push("", ...noticeLines);
+		}
+		const root = this.scopeRootSummary;
+		if (root) {
+			const scopeLabel = `${keyText("app.agents.back")} back · ${getAgentsViewSessionTitle(root)} › subagents`;
+			headerLines.push("", truncateToWidth(theme.fg("dim", scopeLabel), width));
 		}
 		headerLines.push("");
 
@@ -1245,6 +1260,8 @@ export class AgentsViewMode implements Component, Focusable {
 		while (added) {
 			added = false;
 			for (const row of this.rows) {
+				// Summary/code rows reuse their parent's summary; only session rows own expansion keys.
+				if (row.kind !== "agent" && row.kind !== "subagent") continue;
 				if (wanted.has(row.summary.sessionId) && !this.expandedSubagentParents.has(row.identity)) {
 					this.expandedSubagentParents.add(row.identity);
 					added = true;
@@ -1274,15 +1291,23 @@ export class AgentsViewMode implements Component, Focusable {
 		this.persistentState.query = this.editor.getText();
 		this.armSavedSearchFetch();
 		this.rebuildRows();
-		// Typing must not claim the visible fallback row while the restored
-		// anchor is still waiting for its catalog row.
-		if (!this.selectionAnchorPending) this.syncSelectedRowState();
+		// Searching is explicit user intent: claim the visible row as the new
+		// anchor even if a remembered one is still waiting for its catalog row.
+		this.syncSelectedRowState();
 		this.ui.requestRender();
 	}
 
 	private getFilteredRecords(): UnifiedSessionRecord[] {
 		const query = this.replyTarget || this.renameTarget ? (this.actionModeSearchQuery ?? "") : this.editor.getText();
-		return filterUnifiedSessions(this.scopedRecords, (text) => matchesSearchText(text, query));
+		const preservedSessionIds = new Set([
+			...(this.anchorSessionId ? [this.anchorSessionId] : []),
+			...(this.scopeKey ? [this.scopeKey.sessionId] : []),
+			...this.heartbeats.map((heartbeat) => heartbeat.job.sessionId),
+		]);
+		const records = filterEmptyAgentsViewSessions(this.scopedRecords, preservedSessionIds, this.unifiedIndex);
+		return query.trim()
+			? filterUnifiedSessions(records, (text) => matchesSearchText(text, query), this.unifiedIndex)
+			: records;
 	}
 
 	/** Rebuild rows from the last fetched summaries, keeping selection on the same row. */
@@ -1293,7 +1318,7 @@ export class AgentsViewMode implements Component, Focusable {
 			this.expandedSubagentParents,
 			this.programShownParents,
 			this.scopeKey,
-			computeRecursiveRollups(this.unifiedRecords, this.unifiedIndex),
+			this.recursiveRollups,
 			this.anchorSessionId,
 		);
 		const index =
@@ -1375,10 +1400,6 @@ export class AgentsViewMode implements Component, Focusable {
 		if (!row?.selectable || this.isPendingDeleteRow(row)) {
 			return;
 		}
-		if (this.selectionAnchorPending) {
-			this.setStatusMessage("Waiting for the selected session to load");
-			return;
-		}
 		if (row.kind === "subagent-summary") {
 			this.toggleSubagentList(row);
 			return;
@@ -1403,16 +1424,12 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private toggleSubagentList(row: AgentsViewRow): void {
-		if (!row.parentIdentity) {
-			return;
-		}
-		if (this.expandedSubagentParents.has(row.parentIdentity)) {
-			this.expandedSubagentParents.delete(row.parentIdentity);
-			// A collapsed agent's revealed program collapses with it, so reopening
-			// starts from the hidden state rather than a stale reveal.
-			this.programShownParents.delete(row.parentIdentity);
+		const target = row.kind === "subagent-summary" ? (row.parentIdentity ?? row.identity) : row.identity;
+		if (this.expandedSubagentParents.has(target)) {
+			this.expandedSubagentParents.delete(target);
+			this.programShownParents.delete(target);
 		} else {
-			this.expandedSubagentParents.add(row.parentIdentity);
+			this.expandedSubagentParents.add(target);
 		}
 		this.rebuildRows();
 		this.syncSelectedRowState();
@@ -1463,16 +1480,6 @@ export class AgentsViewMode implements Component, Focusable {
 			}
 		}
 		return false;
-	}
-
-	/** True when the selected row exposes the "show program" affordance. */
-	private selectedRowCanShowProgram(): boolean {
-		const row = this.rows[this.selectedIndex];
-		if (!row) {
-			return false;
-		}
-		const target = row.kind === "agent" ? row.identity : row.parentIdentity;
-		return target !== undefined && this.targetHasSpawnCode(target);
 	}
 
 	private openSelectedSubagent(row: AgentsViewRow): void {
@@ -2160,6 +2167,7 @@ export class AgentsViewMode implements Component, Focusable {
 		this.lastVisibleSummaries = this.withPendingDeleteSession(visibleSessions);
 		this.unifiedRecords = reconcileUnifiedSessions(this.lastVisibleSummaries, this.savedSessions, this.heartbeats);
 		this.unifiedIndex = buildUnifiedSessionIndex(this.unifiedRecords);
+		this.recursiveRollups = computeRecursiveRollups(this.unifiedRecords, this.unifiedIndex);
 		migrateAgentsViewIdentitySet(this.expandedSubagentParents, this.unifiedIndex.byKey);
 		migrateAgentsViewIdentitySet(this.programShownParents, this.unifiedIndex.byKey);
 
@@ -2181,7 +2189,7 @@ export class AgentsViewMode implements Component, Focusable {
 			this.expandedSubagentParents,
 			this.programShownParents,
 			this.scopeKey,
-			computeRecursiveRollups(this.unifiedRecords, this.unifiedIndex),
+			this.recursiveRollups,
 			this.anchorSessionId,
 		);
 		this.applyPendingAncestorExpansion();
@@ -2202,6 +2210,10 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 		const generation = ++this.savedCatalogGeneration;
 		this.persistentState.savedCatalogGeneration = generation;
+		if (this.savedCatalogReconcileTimer) {
+			clearTimeout(this.savedCatalogReconcileTimer);
+			this.savedCatalogReconcileTimer = undefined;
+		}
 		this.savedCatalogRefreshPending = true;
 		this.savedCatalogReady = false;
 		const successfulSessions = this.lastSuccessfulSavedSessions;
@@ -2212,9 +2224,16 @@ export class AgentsViewMode implements Component, Focusable {
 			const onSession = (session: AgentConnectionSavedSessionInfo) => {
 				if (generation !== this.savedCatalogGeneration) return;
 				progressiveSessions.set(resolvePath(canonicalizePath(session.path)), session);
-				this.savedSessions = [...progressiveSessions.values()];
-				this.persistentState.savedSessions = this.savedSessions;
-				this.reconcileCatalogs();
+				// Keep a bounded batch window so a continuous stream still appears progressively.
+				if (this.savedCatalogReconcileTimer) return;
+				this.savedCatalogReconcileTimer = setTimeout(() => {
+					if (generation !== this.savedCatalogGeneration) return;
+					this.savedCatalogReconcileTimer = undefined;
+					this.savedSessions = [...progressiveSessions.values()];
+					this.persistentState.savedSessions = this.savedSessions;
+					this.reconcileCatalogs();
+				}, SAVED_CATALOG_RECONCILE_INTERVAL_MS);
+				this.savedCatalogReconcileTimer.unref?.();
 			};
 			const sessions = await listDaemonSavedSessions(
 				this.requireClient(),
@@ -2248,6 +2267,10 @@ export class AgentsViewMode implements Component, Focusable {
 			return false;
 		} finally {
 			if (generation === this.savedCatalogGeneration) {
+				if (this.savedCatalogReconcileTimer) {
+					clearTimeout(this.savedCatalogReconcileTimer);
+					this.savedCatalogReconcileTimer = undefined;
+				}
 				this.savedCatalogRefreshPending = false;
 				this.resolveMissingSelectionAnchor();
 			}
@@ -2314,10 +2337,11 @@ export class AgentsViewMode implements Component, Focusable {
 			this.selectedActiveSessionId = undefined;
 			return;
 		}
+		const selectedIdentity = this.selectedRowIdentity ?? this.persistentState.selectedRowIdentity;
 		const resolution = resolveAgentsViewSelectionState(
 			this.rows,
 			this.selectedIndex,
-			this.selectedRowIdentity ?? this.persistentState.selectedRowIdentity,
+			selectedIdentity,
 			this.selectedSessionKey ?? this.persistentState.selectedSessionKey,
 		);
 		this.selectedIndex = resolution.index;
@@ -2360,6 +2384,10 @@ export class AgentsViewMode implements Component, Focusable {
 		this.stopped = true;
 		this.savedCatalogGeneration += 1;
 		this.heartbeatCatalogGeneration += 1;
+		if (this.savedCatalogReconcileTimer) {
+			clearTimeout(this.savedCatalogReconcileTimer);
+			this.savedCatalogReconcileTimer = undefined;
+		}
 		if (this.heartbeatPollTimer) {
 			clearInterval(this.heartbeatPollTimer);
 			this.heartbeatPollTimer = undefined;
@@ -2481,148 +2509,95 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private renderSessionRows(width: number, maxRows: number): string[] {
-		if (maxRows <= 0) {
-			return [];
+		if (maxRows <= 0) return [];
+		const layout = buildCompactAgentsViewLayout(this.rows, width);
+		const displayItems: DisplayItem[] = [];
+		const counts = countRowsBySection(this.rows);
+		for (const section of ["running", "idle", "inactive"] as const) {
+			if (counts[section] === 0) continue;
+			if (displayItems.length > 0) displayItems.push({ type: "spacer" });
+			displayItems.push({ type: "heading", section });
+			for (const row of getDisplayRowsForSection(this.rows, section)) {
+				displayItems.push({ type: "row", row });
+			}
 		}
-		if (this.rows.length === 0) {
-			const emptyLegend = buildAgentsViewUsageLayout([]).legends.get("running") ?? "";
-			return [
-				this.renderSectionHeading("running", width, emptyLegend),
-				theme.fg("dim", "  No sessions match your search."),
-			].slice(0, maxRows);
+		if (displayItems.length === 0) {
+			const query =
+				this.replyTarget || this.renameTarget ? (this.actionModeSearchQuery ?? "") : this.editor.getText();
+			return [theme.fg("dim", query.trim() ? "No sessions match your search." : "No sessions yet.")];
 		}
-
-		const displayItems = buildDisplayItems(this.rows);
-		const usageLayout = buildAgentsViewUsageLayout(this.rows);
+		// Reserve the column header and its spacer, leaving at least one session row visible.
+		const headerRows = Math.min(2, maxRows - 1);
+		const visibleRows = maxRows - headerRows;
 		const selectedIdentity = this.rows[this.selectedIndex]?.identity;
 		const selectedDisplayIndex = displayItems.findIndex(
 			(item) => item.type === "row" && item.row.identity === selectedIdentity,
 		);
-		const visibleRows = Math.min(maxRows, this.visibleListRows());
 		const start = Math.max(
 			0,
 			Math.min(displayItems.length - visibleRows, selectedDisplayIndex - Math.floor(visibleRows / 2)),
 		);
-		const showLeadingEllipsis = start > 0;
-		let showTrailingEllipsis = start + visibleRows < displayItems.length;
-		if ((showLeadingEllipsis ? 1 : 0) + (showTrailingEllipsis ? 1 : 0) >= visibleRows) {
-			showTrailingEllipsis = false;
-		}
-		const contentVisibleRows = Math.max(
-			0,
-			visibleRows - (showLeadingEllipsis ? 1 : 0) - (showTrailingEllipsis ? 1 : 0),
-		);
-		// The prepended ellipsis consumes a viewport line; shift the window down
-		// so a selection at the very end is not pushed out of the slice.
-		const sliceStart =
-			selectedDisplayIndex >= start + contentVisibleRows ? selectedDisplayIndex - contentVisibleRows + 1 : start;
-		const visibleItems = displayItems.slice(sliceStart, sliceStart + contentVisibleRows);
-		const lines = visibleItems.map((item) => {
-			if (item.type === "spacer") {
-				return "";
-			}
+		const showLeadingEllipsis = start > 0 && visibleRows > 1;
+		const showTrailingEllipsis = start + visibleRows < displayItems.length && visibleRows > 2;
+		const contentRows = visibleRows - Number(showLeadingEllipsis) - Number(showTrailingEllipsis);
+		const sliceStart = selectedDisplayIndex >= start + contentRows ? selectedDisplayIndex - contentRows + 1 : start;
+		const lines = displayItems.slice(sliceStart, sliceStart + contentRows).map((item) => {
+			if (item.type === "spacer") return "";
 			if (item.type === "heading") {
-				return this.renderSectionHeading(item.section, width, usageLayout.legends.get(item.section) ?? "");
+				return theme.fg("muted", truncateToWidth(`${sectionTitle(item.section)} (${counts[item.section]})`, width));
 			}
-			if (item.type === "empty") {
-				return theme.fg("dim", "  No agents");
-			}
-			return this.renderRow(item.row, width, usageLayout.details);
+			return this.renderRow(item.row, width, layout);
 		});
-		if (showLeadingEllipsis) {
-			lines.unshift(theme.fg("dim", "  ..."));
-		}
-		if (showTrailingEllipsis) {
-			lines.push(theme.fg("dim", "  ..."));
-		}
+		if (showLeadingEllipsis) lines.unshift(theme.fg("dim", "  ..."));
+		if (showTrailingEllipsis) lines.push(theme.fg("dim", "  ..."));
+		if (headerRows > 1) lines.unshift("");
+		if (headerRows > 0) lines.unshift(theme.bold(layout.legend));
 		return lines;
 	}
 
 	private renderRow(
 		row: AgentsViewRow,
 		width: number,
-		rowDetails: ReadonlyMap<string, string> = buildAgentsViewUsageLayout([row]).details,
+		layout: AgentsViewUsageLayout = buildCompactAgentsViewLayout(this.rows.length > 0 ? this.rows : [row], width),
 	): string {
 		const selected = row.selectable && row.identity === this.rows[this.selectedIndex]?.identity;
 		const markRow = (line: string): string => (selected ? `${SELECTED_ROW_MARKER}${line}` : line);
-		if (row.kind === "subagent-code") {
-			return this.renderCodeRow(row);
-		}
+		if (row.kind === "subagent-code") return this.renderCodeRow(row);
 		if (row.kind === "subagent-summary") {
 			const indent = "  ".repeat(row.depth);
-			const hint = row.hasSpawnCode ? theme.fg("dim", ` · ${keyText("app.agents.program")} show program`) : "";
-			const titleColor = row.runningSubagentCount > 0 ? ("success" as const) : ("dim" as const);
-			const label = `${theme.fg(titleColor, `${row.expanded ? "▾" : "▸"} ${row.title}`)}${hint}`;
-			const line = padLine(truncateToWidth(`${indent}${label}`, width, ""), width);
-			return markRow(line);
+			return markRow(formatTableCell(`${indent}${row.expanded ? "▾" : "▸"} ${row.title}`, width));
 		}
 		const pendingDelete = row.kind === "agent" && this.isPendingDeleteRow(row);
 		const pendingKill = row.kind === "subagent" && this.isPendingKillSubagentRow(row);
-		const rawIcon = this.getRowIcon(row.section);
-		const icon = this.formatRowIcon(row.section, rawIcon);
-		const indent = "  ".repeat(row.depth);
-		const details = rowDetails.get(row.identity) ?? "";
-		const detailsWidth = Math.max(10, visibleWidth(details));
-		const heartbeatBadge = !pendingDelete && !pendingKill ? formatHeartbeatBadge(row.heartbeat) : "";
-		const heartbeatPausedOnly = (row.heartbeat?.activeCount ?? 0) < 1;
-		const heartbeatCell = heartbeatBadge ? theme.fg(heartbeatPausedOnly ? "dim" : "error", heartbeatBadge) : "";
-		const heartbeatWidth = visibleWidth(heartbeatBadge);
-		const titleWidth = Math.max(
-			0,
-			width -
-				visibleWidth(indent) -
-				visibleWidth(rawIcon) -
-				detailsWidth -
-				2 -
-				(heartbeatWidth > 0 ? heartbeatWidth + 1 : 0),
-		);
-		const armedHeartbeat = row.summary.hasActiveHeartbeat === true || (row.heartbeat?.activeCount ?? 0) > 0;
-		const heartbeatWarning = armedHeartbeat ? "has an armed heartbeat — " : "";
-		const title = pendingDelete
-			? `${heartbeatWarning}${this.getPendingDeleteTitle()}`
-			: pendingKill
-				? `${heartbeatWarning}${keyText("app.agents.delete")} again to ${hasLiveWork(row) ? "stop" : "delete"}`
-				: styleRowTitle(row);
-		// Keep stable model information ahead of the variable summary so narrow rows truncate the summary first.
-		const summaryText = !pendingDelete && !pendingKill ? row.summary.summary : undefined;
-		const modelLabel =
-			isSubagentSummary(row.summary) && !pendingDelete && !pendingKill && row.summary.model
-				? `${row.summary.model.provider}/${row.summary.model.id}${row.summary.thinkingLevel && row.summary.thinkingLevel !== "off" ? `:${row.summary.thinkingLevel}` : ""}`
-				: undefined;
-		const statusLabel =
-			!pendingDelete &&
-			!pendingKill &&
-			(row.summary.statusLabel !== undefined || row.summary.lastHeardFromAt !== undefined)
-				? row.statusLabel
-				: undefined;
-		const suffixes = [statusLabel, modelLabel, summaryText].filter(
-			(suffix): suffix is string => suffix !== undefined && suffix.length > 0,
-		);
-		const titleContent = suffixes.length > 0 ? `${title} ${theme.fg("dim", `· ${suffixes.join(" · ")}`)}` : title;
-		const titleCell = formatTableCell(titleContent, titleWidth);
-		const cells = [
-			icon,
-			pendingDelete || pendingKill ? theme.fg("error", titleCell) : titleCell,
-			formatRightTableCell(details, detailsWidth),
-		];
-		const base = `${indent}${cells[0]} ${heartbeatCell ? `${heartbeatCell} ` : ""}${cells[1]} ${cells[2]}`;
-		const line = padLine(truncateToWidth(base, width, ""), width);
-		return markRow(line);
-	}
-
-	// Bold like the section title so the legend reads as part of the header line.
-	// The legend is right-aligned to the same edge as the row details cells, so
-	// its columns sit exactly above the row columns.
-	private renderSectionHeading(section: AgentsViewSection, width: number, legend: string): string {
-		const counts = countRowsBySection(this.rows);
-		const title = `${sectionTitle(section)} (${counts[section]})`;
-		const gap = width - visibleWidth(title) - visibleWidth(legend);
-		if (legend.length === 0 || gap < 2) {
-			return theme.bold(truncateToWidth(title, width, ""));
+		const details = layout.details.get(row.identity) ?? "";
+		if (pendingDelete || pendingKill) {
+			const armed = row.summary.hasActiveHeartbeat === true || (row.heartbeat?.activeCount ?? 0) > 0;
+			const title =
+				(armed ? "has an armed heartbeat — " : "") +
+				(pendingDelete
+					? this.getPendingDeleteTitle()
+					: `${keyText("app.agents.delete")} again to ${hasLiveWork(row) ? "stop" : "delete"}`);
+			return markRow(formatTableCell(theme.fg("error", title), width));
 		}
-		return `${theme.bold(title)}${" ".repeat(gap)}${theme.bold(legend)}`;
+		const icon = this.formatRowIcon(row.section, this.getRowIcon(row.section));
+		const badge = formatHeartbeatBadge(row.heartbeat);
+		const heartbeat = badge ? `${theme.fg((row.heartbeat?.activeCount ?? 0) > 0 ? "error" : "dim", badge)} ` : "";
+		const title = `${"  ".repeat(row.depth)}${icon} ${heartbeat}${styleRowTitle(row)}`;
+		const status =
+			row.summary.lastHeardFromAt !== undefined
+				? getSessionStatusLabel(row.summary, row.heartbeat)
+				: row.summary.statusLabel !== undefined
+					? row.statusLabel
+					: undefined;
+		const activity = [status, row.summary.summary].filter(Boolean).join(" · ");
+		const cells = [
+			formatTableCell(title, layout.nameWidth),
+			formatTableCell(theme.fg("muted", formatSessionModel(row)), layout.modelWidth),
+		];
+		if (layout.activityWidth > 0) cells.push(formatTableCell(theme.fg("dim", activity), layout.activityWidth));
+		cells.push(theme.fg("dim", details));
+		return markRow(formatTableCell(cells.join("  "), width));
 	}
-
 	// Spawn-code rows are read-only context. They render deemphasized — muted
 	// text on a panel background (applied in finalizeRenderedLine) so the program
 	// reads as one quiet segmented block rather than competing with agent rows.
@@ -2678,7 +2653,14 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private renderPrompt(width: number): string[] {
-		return this.editor.render(width);
+		const inline = !this.replyTarget && !this.renameTarget;
+		// A transparent surface preserves the editor's padding, scroll hints, and cursor without input chrome.
+		this.editor.backgroundColor = inline ? (text) => text : theme.getEditorBackgroundColor();
+		const lines = this.editor.render(width);
+		if (!inline) return lines;
+		return lines
+			.filter((line, index) => (index > 0 && index < lines.length - 1) || line.trim().length > 0)
+			.map((line) => theme.fg("muted", line));
 	}
 
 	private renderDock(width: number): string[] {
@@ -2702,29 +2684,15 @@ export class AgentsViewMode implements Component, Focusable {
 		if (this.replyTarget) {
 			return truncateToWidth(theme.fg("muted", this.renderReplyComposerHints()), width);
 		}
-		// Replying is reserved for top-level agents; subagents can be stopped or deleted.
-		const selectedRow = this.rows[this.selectedIndex];
-		const selectedAgent = selectedRow?.kind === "agent";
-		const selectedSubagent = selectedRow?.kind === "subagent";
-		const selectedSummary = selectedRow?.kind === "subagent-summary";
+		const selected = this.rows[this.selectedIndex];
+		// Enter and Right both toggle the list on a summary row and open everywhere
+		// else; Left only has a parent scope to return to below the root view.
+		const rightAction = selected?.kind === "subagent-summary" ? (selected.expanded ? "collapse" : "expand") : "open";
 		const hints = [
-			`${keyText("tui.select.up")}/${keyText("tui.select.down")} move`,
-			selectedSummary
-				? `${keyText("tui.select.confirm")} ${selectedRow?.expanded ? "collapse" : "expand"}`
-				: `${keyText("tui.select.confirm")} open`,
-			selectedSummary ? undefined : `${keyText("app.agents.open")} open`,
-			selectedAgent
-				? `${keyText("app.agents.reply")} ${selectedRow?.section === "inactive" ? "resume" : "reply"}`
-				: undefined,
+			`${keyText("tui.select.up")}/${keyText("tui.select.down")} navigate`,
+			`${keyText("tui.select.confirm")}/${keyText("app.agents.open")} ${rightAction}`,
+			this.scopeRootSummary ? `${keyText("app.agents.back")} parent` : undefined,
 			`${keyText("app.agents.new")} new`,
-			selectedAgent ? `${keyText("app.agents.rename")} rename` : undefined,
-			selectedAgent
-				? `${keyText("app.agents.delete")} ${selectedRow?.section === "inactive" ? "delete" : "stop/deactivate"}`
-				: undefined,
-			selectedSubagent
-				? `${keyText("app.agents.delete")} ${selectedRow.section === "running" ? "stop" : "delete"}`
-				: undefined,
-			this.selectedRowCanShowProgram() ? `${keyText("app.agents.program")} program` : undefined,
 		]
 			.filter((hint): hint is string => hint !== undefined)
 			.join("   ");
@@ -2757,11 +2725,8 @@ export class AgentsViewMode implements Component, Focusable {
 		return Math.max(0, rows - dockHeight);
 	}
 
-	private getSplashModelId(): string | undefined {
-		return this.rows[this.selectedIndex]?.summary.model?.id ?? this.options.startupModelId;
-	}
-
-	private getSplashCwd(): string {
+	private getSplashCwd(): string | undefined {
+		if (this.scopeRootSummary) return undefined;
 		return this.rows[this.selectedIndex]?.summary.cwd ?? this.options.uiServices.getInitialCwd();
 	}
 
@@ -2779,9 +2744,8 @@ export class AgentsViewMode implements Component, Focusable {
 			case "running":
 				return workingIconFrame(this.workingIconFrame);
 			case "idle":
-				return NEEDS_INPUT_ROW_ICON;
 			case "inactive":
-				return COMPLETED_ROW_ICON;
+				return STATUS_ROW_ICON;
 			default: {
 				const _exhaustive: never = section;
 				return _exhaustive;
@@ -2794,9 +2758,9 @@ export class AgentsViewMode implements Component, Focusable {
 			case "running":
 				return theme.bold(icon);
 			case "idle":
-				return theme.fg("warning", icon);
+				return theme.bold(theme.fg("warning", icon));
 			case "inactive":
-				return theme.fg("dim", icon);
+				return theme.bold(theme.fg("dim", icon));
 			default: {
 				const _exhaustive: never = section;
 				return _exhaustive;
@@ -2808,28 +2772,7 @@ export class AgentsViewMode implements Component, Focusable {
 type DisplayItem =
 	| { type: "spacer" }
 	| { type: "heading"; section: AgentsViewSection }
-	| { type: "empty"; section: AgentsViewSection }
 	| { type: "row"; row: AgentsViewRow };
-
-function buildDisplayItems(rows: readonly AgentsViewRow[]): DisplayItem[] {
-	const items: DisplayItem[] = [];
-	const sections: AgentsViewSection[] = ["running", "idle", "inactive"];
-	for (const [index, section] of sections.entries()) {
-		if (index > 0) {
-			items.push({ type: "spacer" });
-		}
-		items.push({ type: "heading", section });
-		const sectionRows = getDisplayRowsForSection(rows, section);
-		if (sectionRows.length === 0) {
-			items.push({ type: "empty", section });
-			continue;
-		}
-		for (const row of sectionRows) {
-			items.push({ type: "row", row });
-		}
-	}
-	return items;
-}
 
 // Nested rows (subagent summaries and expanded subagents) always render in
 // their top-level agent's section block, regardless of their own section.
@@ -2870,93 +2813,40 @@ function hasLiveWork(row: AgentsViewRow): boolean {
 	return row.section === "running" || row.runningSubagentCount > 0 || row.summary.hasRunningRlmChildren === true;
 }
 
-interface AgentsViewUsageParts {
-	inTokens: string;
-	outTokens: string;
-	agentCost: string;
-	count: string;
-	totalCost: string;
-	age: string;
-}
-
-const AGENTS_VIEW_USAGE_LABELS: AgentsViewUsageParts = {
-	inTokens: "↑in",
-	outTokens: "↓out",
-	agentCost: "$agent",
-	count: "#sub",
-	totalCost: "$total",
-	age: "age",
-};
-
-const AGENTS_VIEW_USAGE_COLUMNS = Object.keys(AGENTS_VIEW_USAGE_LABELS) as (keyof AgentsViewUsageParts)[];
-
 export interface AgentsViewUsageLayout {
-	/** Legend line per section, padded to that section's column widths. */
-	legends: ReadonlyMap<AgentsViewSection, string>;
-	/** Details string per row identity, padded to its section's column widths. */
+	legend: string;
 	details: ReadonlyMap<string, string>;
+	nameWidth: number;
+	modelWidth: number;
+	activityWidth: number;
 }
 
-/**
- * One shared column layout per section for the header legend and every row:
- * each column is as wide as the section's widest value or its legend label,
- * everything right-aligned, so the ` · ` separators land in the same terminal
- * column for the legend and every row. Empty sessions render only the age,
- * aligned to the age column.
- */
-export function buildAgentsViewUsageLayout(rows: readonly AgentsViewRow[]): AgentsViewUsageLayout {
-	const rowsBySection = new Map<AgentsViewSection, AgentsViewRow[]>();
-	// Nested rows render inside their top-level agent's section block, so group
-	// by the block's section rather than each row's own.
-	let blockSection: AgentsViewSection = "running";
-	for (const row of rows) {
-		if (row.depth === 0) blockSection = row.section;
-		if (row.kind !== "agent" && row.kind !== "subagent") continue;
-		const sectionRows = rowsBySection.get(blockSection) ?? [];
-		sectionRows.push(row);
-		rowsBySection.set(blockSection, sectionRows);
-	}
-	const legends = new Map<AgentsViewSection, string>();
-	const details = new Map<string, string>();
-	for (const section of ["running", "idle", "inactive"] as const) {
-		const entries = (rowsBySection.get(section) ?? []).map((row) => {
-			const usage = row.summary.usage;
-			const parts: AgentsViewUsageParts = {
-				inTokens: `↑${formatTokenCount(usage?.inputTokens ?? 0)}`,
-				outTokens: `↓${formatTokenCount(usage?.outputTokens ?? 0)}`,
-				agentCost: `$${(usage?.cost ?? 0).toFixed(2)}`,
-				count: String(row.descendantCount),
-				totalCost: `$${row.recursiveCost.toFixed(2)}`,
-				age: formatSessionDuration(row.summary),
-			};
-			return { identity: row.identity, empty: isEmptyAgentsViewSession(row.summary), parts };
-		});
-		const widths = {} as Record<keyof AgentsViewUsageParts, number>;
-		for (const column of AGENTS_VIEW_USAGE_COLUMNS) {
-			let width = visibleWidth(AGENTS_VIEW_USAGE_LABELS[column]);
-			for (const entry of entries) {
-				// Empty sessions render no usage segment; only their age takes space.
-				if (entry.empty && column !== "age") continue;
-				width = Math.max(width, visibleWidth(entry.parts[column]));
-			}
-			widths[column] = width;
-		}
-		const pad = (parts: AgentsViewUsageParts, column: keyof AgentsViewUsageParts): string =>
-			padCellStart(parts[column], widths[column]);
-		const formatLine = (parts: AgentsViewUsageParts): string =>
-			[
-				`${pad(parts, "inTokens")} ${pad(parts, "outTokens")}`,
-				pad(parts, "agentCost"),
-				pad(parts, "count"),
-				pad(parts, "totalCost"),
-				pad(parts, "age"),
-			].join(" · ");
-		legends.set(section, formatLine(AGENTS_VIEW_USAGE_LABELS));
-		for (const entry of entries) {
-			details.set(entry.identity, entry.empty ? pad(entry.parts, "age") : formatLine(entry.parts));
-		}
-	}
-	return { legends, details };
+export function buildCompactAgentsViewLayout(rows: readonly AgentsViewRow[], width = 120): AgentsViewUsageLayout {
+	const sessions = rows.filter((row) => row.kind === "agent" || row.kind === "subagent");
+	const entries = sessions.map((row) => ({
+		identity: row.identity,
+		cost: `$${row.recursiveCost.toFixed(2)}`,
+		age: formatSessionDuration(row.summary),
+	}));
+	const costWidth = entries.reduce((size, entry) => Math.max(size, visibleWidth(entry.cost)), 4);
+	const ageWidth = entries.reduce((size, entry) => Math.max(size, visibleWidth(entry.age)), 3);
+	const detailsWidth = costWidth + 2 + ageWidth;
+	const available = Math.max(0, width - detailsWidth - 4);
+	const desiredModelWidth = sessions.reduce((size, row) => Math.max(size, visibleWidth(formatSessionModel(row))), 12);
+	const modelWidth = Math.min(desiredModelWidth, 32, Math.max(0, available - 12));
+	const nameWidth = Math.min(28, Math.max(0, available - modelWidth));
+	const activityWidth = Math.max(0, available - modelWidth - nameWidth - 2);
+	const detailLine = (cost: string, age: string) => `${padCellStart(cost, costWidth)}  ${padCellStart(age, ageWidth)}`;
+	const headings = [formatTableCell("Session", nameWidth), formatTableCell("Model", modelWidth)];
+	if (activityWidth > 0) headings.push(formatTableCell("Activity", activityWidth));
+	headings.push(detailLine("Cost", "Age"));
+	return {
+		legend: formatTableCell(headings.join("  "), width),
+		details: new Map(entries.map((entry) => [entry.identity, detailLine(entry.cost, entry.age)])),
+		nameWidth,
+		modelWidth,
+		activityWidth,
+	};
 }
 
 function padCellStart(value: string, width: number): string {
@@ -2980,9 +2870,16 @@ function formatTableCell(value: string, width: number): string {
 	return truncated + " ".repeat(Math.max(0, width - visibleWidth(truncated)));
 }
 
-function formatRightTableCell(value: string, width: number): string {
-	const truncated = truncateToWidth(value, width, "");
-	return " ".repeat(Math.max(0, width - visibleWidth(truncated))) + truncated;
+// Model ids can embed a provider path ("moonshotai/kimi-k2"); the column shows
+// the bare model name plus the thinking level ("kimi-k2:high") when one is
+// active — "off" reads as noise, so it and absent levels render bare (saved
+// rows carry no level).
+function formatSessionModel(row: AgentsViewRow): string {
+	const id = row.summary.model?.id ?? row.record?.saved?.model?.modelId;
+	if (!id) return "-";
+	const bare = id.slice(id.lastIndexOf("/") + 1) || id;
+	const level = row.summary.thinkingLevel;
+	return level && level !== "off" ? `${bare}:${level}` : bare;
 }
 
 function formatSessionDuration(summary: SessionSummary): string {

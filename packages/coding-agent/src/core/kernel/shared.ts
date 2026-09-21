@@ -87,6 +87,9 @@ export const ATTACHMENT_DISPLAY_MIME = "application/vnd.prime-agent.attachment+j
 /** MIME tag the `agent-message` skill emits after sending a message. */
 export const AGENT_MESSAGE_DISPLAY_MIME = "application/vnd.prime-agent.agent-message+json";
 
+/** Internal lifetime notices, consumed before user display rendering. */
+export const BASH_ACTIVITY_DISPLAY_MIME = "application/vnd.prime-agent.bash-activity+json";
+
 /**
  * Hard ceiling on a single attachment's base64 payload, a defensive guard
  * against a runaway direct display emit. The `attach-image` skill caps
@@ -282,6 +285,9 @@ export interface KernelClient {
 	readonly isRunning: boolean;
 	/** Last directory reported by the running kernel; absent when unavailable. */
 	readonly currentCwd?: string;
+	readonly hasBackgroundWork: boolean;
+	/** Terminal: the kernel died or was torn down; only a fresh manager can serve again. */
+	readonly isDefunct: boolean;
 	start(options?: KernelStartOptions): Promise<void>;
 	execute(code: string, opts?: ExecuteOptions): Promise<ExecuteResult>;
 	shutdown(opts?: KernelShutdownOptions): Promise<boolean>;

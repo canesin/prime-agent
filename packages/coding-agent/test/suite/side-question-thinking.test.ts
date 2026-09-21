@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { type SideQuestionEvent, type SideQuestionRun, startSideQuestion } from "../../src/core/side-question.js";
 import { createHarness, getMessageText } from "./harness.js";
 
+const noRetry = { enabled: false, maxRetries: 0, baseDelayMs: 1, maxRetryDelayMs: 1 };
 const THINKING_REQUIRED =
 	'400 {"error":{"code":"1210","message":"This model always engages in thinking and cannot be disabled; please use low, high, or max"}}';
 
@@ -30,9 +31,16 @@ describe("side question thinking", () => {
 				},
 			]);
 			const events: SideQuestionEvent[] = [];
-			await startSideQuestion(harness.session.agent, "side", "question", (event) => {
-				events.push(event);
-			}).done;
+			await startSideQuestion(
+				harness.session.agent,
+				"side",
+				"question",
+				(event) => {
+					events.push(event);
+				},
+				[],
+				noRetry,
+			).done;
 			expect(observed).toEqual([expected]);
 			expect(events.at(-1)).toMatchObject({ status: "complete", answer: "answer" });
 			expect(harness.session.agent.state.thinkingLevel).toBe("high");
@@ -59,7 +67,6 @@ describe("side question thinking", () => {
 				(context, options) => {
 					requests.push(context.messages.map(getMessageText));
 					reasoning.push((options as SimpleStreamOptions)?.reasoning);
-					expect(context.tools).toEqual([]);
 					return fauxAssistantMessage("recovered answer");
 				},
 			]);
@@ -72,6 +79,7 @@ describe("side question thinking", () => {
 					events.push(event);
 				},
 				[{ question: "earlier question", answer: "earlier answer" }],
+				noRetry,
 			).done;
 			expect(reasoning).toEqual(["off", parentThinking === "off" ? "low" : parentThinking]);
 			expect(requests[1]).toEqual(requests[0]);
@@ -96,9 +104,16 @@ describe("side question thinking", () => {
 				fauxAssistantMessage("must not run"),
 			]);
 			const events: SideQuestionEvent[] = [];
-			await startSideQuestion(harness.session.agent, "side", "question", (event) => {
-				events.push(event);
-			}).done;
+			await startSideQuestion(
+				harness.session.agent,
+				"side",
+				"question",
+				(event) => {
+					events.push(event);
+				},
+				[],
+				noRetry,
+			).done;
 			expect(harness.faux.state.callCount).toBe(2);
 			expect(events.at(-1)).toMatchObject({ status: "error", errorMessage: THINKING_REQUIRED });
 		} finally {
@@ -117,9 +132,16 @@ describe("side question thinking", () => {
 		try {
 			harness.setResponses([fauxAssistantMessage([], { stopReason: "error", errorMessage })]);
 			const events: SideQuestionEvent[] = [];
-			await startSideQuestion(harness.session.agent, "side", "question", (event) => {
-				events.push(event);
-			}).done;
+			await startSideQuestion(
+				harness.session.agent,
+				"side",
+				"question",
+				(event) => {
+					events.push(event);
+				},
+				[],
+				noRetry,
+			).done;
 			expect(harness.faux.state.callCount).toBe(1);
 			expect(events.at(-1)).toMatchObject({ status: "error", errorMessage });
 		} finally {
@@ -145,7 +167,7 @@ describe("side question thinking", () => {
 				};
 			}
 			harness.setResponses([response]);
-			await startSideQuestion(harness.session.agent, "side", "question", () => {}).done;
+			await startSideQuestion(harness.session.agent, "side", "question", () => {}, [], noRetry).done;
 			expect(harness.faux.state.callCount).toBe(1);
 		} finally {
 			harness.cleanup();

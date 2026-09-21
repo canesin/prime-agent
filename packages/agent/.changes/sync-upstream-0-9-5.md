@@ -1,0 +1,1 @@
+- Changed provider retry handling to use the session retry policy consistently with upstream v0.9.5.
