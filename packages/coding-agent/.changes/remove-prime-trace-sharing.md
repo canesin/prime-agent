@@ -1,0 +1,1 @@
+- Removed the trace-sharing prompt, commands, credentials, and uploads to Prime Intellect.

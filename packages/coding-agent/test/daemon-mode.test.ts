@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
 	appendFileSync,
@@ -44,10 +43,9 @@ import {
 	type AgentObserveListResult,
 } from "../src/core/agent-observe.js";
 import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.js";
-import { installAgentTraceUpload } from "../src/core/agent-traces.js";
+import { createAgentSessionFromServices, createAgentSessionServices } from "../src/core/agent-session-services.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { type AgentCronJob, AgentCronJobStore } from "../src/core/cron-jobs.js";
-import { PRIME_AGENT_TRACES_PROVIDER_ID } from "../src/core/prime-inference-auth.js";
 import {
 	type CreateRlmSubagentRuntimeOptions,
 	createDefaultRlmSubagentSessionName,
@@ -60,7 +58,6 @@ import {
 	type SessionInfo,
 	SessionManager,
 } from "../src/core/session-manager.js";
-import { SettingsManager } from "../src/core/settings-manager.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
 import {
@@ -7825,43 +7822,73 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
-	it("resolves delete_subagent while the child's trace upload is still in flight, then the transcript upload completes", async () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-delete-trace-outbox-"));
+	it("persists daemon sessions locally without trace uploads despite legacy sharing settings", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-local-session-"));
 		const originalAgentDir = process.env[ENV_AGENT_DIR];
 		process.env[ENV_AGENT_DIR] = tempDir;
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}", { status: 200 }));
+		const persistSpy = vi.spyOn(SessionManager.prototype, "onPersist");
+		let state: ActiveSessionState | undefined;
 		try {
-			const fixture = makePersistedRlmDaemonFixture(tempDir);
-			const internals = fixture.daemon as unknown as {
-				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
-				createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
-			};
-			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
-			const childState = await internals.createRuntime({ type: "create", sessionPath: fixture.childSessionFile });
-			const childManager = childState.runtime.session.sessionManager as SessionManager;
-			const { calls, releaseFetch } = installGatedTraceUpload(childManager);
-			childManager.appendMessage({ role: "user", content: "pending trace data", timestamp: 3 });
-			childManager.flushNow();
-			await vi.waitFor(() => expect(calls).toHaveLength(1), { timeout: 5_000 });
-			const transcriptAtUpload = readFileSync(fixture.childSessionFile, "utf8");
-
-			// The fetch gate is still held: the delete must not await the upload.
-			await internals
-				.createSubagentRuntimeHost(parentState)
-				.deleteRlmSubagentRuntime(fixture.childId, childState.runtime.session);
-			expect(calls).toHaveLength(1);
-			expect(childState.runtime.session.disposeAsync).toHaveBeenCalledWith({ kernelSnapshot: false });
-
-			// The transcript survives deletion and its upload completes independently.
-			releaseFetch();
-			const entryKey = createHash("sha256").update(fixture.childSessionFile).digest("hex").slice(0, 32);
-			await vi.waitFor(() => {
-				const entry = JSON.parse(
-					readFileSync(join(tempDir, "agent-traces-outbox", `${entryKey}.json`), "utf8"),
-				) as { sessionFile: string; size?: number };
-				expect(entry.size).toBeGreaterThan(0);
+			writeFileSync(join(tempDir, "settings.json"), JSON.stringify({ agentTraces: { enabled: true } }));
+			writeFileSync(
+				join(tempDir, "auth.json"),
+				JSON.stringify({ "prime-agent-traces": { type: "api_key", key: "legacy-trace-key" } }),
+			);
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir: join(tempDir, "sessions") },
+				createRuntime: async (options) => {
+					const services = await createAgentSessionServices({
+						cwd: options.cwd,
+						agentDir: options.agentDir,
+						telemetryDisabled: true,
+						resourceLoaderOptions: {
+							noExtensions: true,
+							noSkills: true,
+							noPromptTemplates: true,
+							noThemes: true,
+							noContextFiles: true,
+						},
+					});
+					const result = await createAgentSessionFromServices({
+						...options.sessionOptions,
+						services,
+						sessionManager: options.sessionManager,
+						noTools: "all",
+						prewarmIpythonKernel: false,
+						telemetryDisabled: true,
+					});
+					return { ...result, services, diagnostics: services.diagnostics };
+				},
 			});
-			expect(calls[0]?.body).toBe(transcriptAtUpload);
+			const internals = daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				closeSession(state: ActiveSessionState, reason: "shutdown"): Promise<void>;
+			};
+			state = await internals.createRuntime({ type: "create" });
+			const manager = state.runtime.session.sessionManager;
+			manager.appendMessage({ role: "user", content: "private daemon transcript", timestamp: 3 });
+			manager.flushNow();
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) throw new Error("Missing daemon session file");
+			await internals.closeSession(state, "shutdown");
+			state = undefined;
+
+			expect(readFileSync(sessionFile, "utf8")).toContain("private daemon transcript");
+			expect(SessionManager.open(sessionFile).buildSessionContext().messages).toEqual([
+				expect.objectContaining({ role: "user", content: "private daemon transcript" }),
+			]);
+			expect(persistSpy).not.toHaveBeenCalled();
+			for (const [url, init] of fetchSpy.mock.calls) {
+				expect(String(url)).not.toContain("agent-traces");
+				expect(init?.method ?? "GET").toBe("GET");
+				expect(init?.body).toBeUndefined();
+			}
+			expect(existsSync(join(tempDir, "agent-traces-outbox"))).toBe(false);
 		} finally {
+			await state?.runtime.dispose();
+			persistSpy.mockRestore();
+			fetchSpy.mockRestore();
 			if (originalAgentDir === undefined) {
 				delete process.env[ENV_AGENT_DIR];
 			} else {
@@ -7917,7 +7944,7 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
-	it("resolves a delete that joins an in-flight passivation close without awaiting the trace upload", async () => {
+	it("preserves the local transcript when deletion joins an in-flight passivation close", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-delete-passivation-flush-"));
 		const originalAgentDir = process.env[ENV_AGENT_DIR];
 		process.env[ENV_AGENT_DIR] = tempDir;
@@ -7945,10 +7972,8 @@ describe("daemon mode helpers", () => {
 				parentState.runtime.session as unknown as { releaseRlmChildSession: ReturnType<typeof vi.fn> }
 			).releaseRlmChildSession = vi.fn(() => vi.fn());
 			const childManager = childState.runtime.session.sessionManager as SessionManager;
-			const { calls, releaseFetch } = installGatedTraceUpload(childManager);
-			childManager.appendMessage({ role: "user", content: "pending trace data", timestamp: 3 });
+			childManager.appendMessage({ role: "user", content: "local child transcript", timestamp: 3 });
 			childManager.flushNow();
-			await vi.waitFor(() => expect(calls).toHaveLength(1), { timeout: 5_000 });
 
 			const passivation = internals.passivateIdleChildren(90, Date.parse("2036-08-01T12:00:00Z"), 1);
 			await disposeStarted;
@@ -7956,11 +7981,9 @@ describe("daemon mode helpers", () => {
 				.createSubagentRuntimeHost(parentState)
 				.deleteRlmSubagentRuntime(fixture.childId, childState.runtime.session);
 			releaseDispose();
-			// Both resolve while the fetch gate is still held.
 			await Promise.all([passivation, deletion]);
-			expect(calls).toHaveLength(1);
+			expect(readFileSync(fixture.childSessionFile, "utf8")).toContain("local child transcript");
 			expect(childState.runtime.session.disposeAsync).toHaveBeenCalledWith({ kernelSnapshot: true });
-			releaseFetch();
 		} finally {
 			releaseDispose();
 			if (originalAgentDir === undefined) {
@@ -10680,34 +10703,6 @@ function makeCronJob(input: {
 		nextRunAt: "2026-01-01T12:05:00.000Z",
 		runCount: 0,
 	};
-}
-
-/** Gated fetch stub on a session's trace-upload controller: observes whether a close awaits the upload. */
-function installGatedTraceUpload(sessionManager: SessionManager): {
-	calls: Array<{ url: string; body: string }>;
-	releaseFetch: () => void;
-} {
-	const calls: Array<{ url: string; body: string }> = [];
-	let releaseFetch: () => void = () => {};
-	const gate = new Promise<void>((resolveGate) => {
-		releaseFetch = resolveGate;
-	});
-	installAgentTraceUpload(sessionManager, {
-		authStorage: AuthStorage.inMemory({
-			[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
-		}),
-		settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
-		baseUrl: "https://api.example.test",
-		fetchFn: (async (input: unknown, init?: RequestInit) => {
-			calls.push({ url: String(input), body: String(init?.body ?? "") });
-			await gate;
-			return new Response(JSON.stringify({ bytes_stored: 1 }), {
-				status: 200,
-				headers: { "content-type": "application/json" },
-			});
-		}) as typeof fetch,
-	});
-	return { calls, releaseFetch };
 }
 
 function makePersistedRlmDaemonFixture(

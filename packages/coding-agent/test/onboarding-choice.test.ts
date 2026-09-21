@@ -16,21 +16,21 @@ describe("OnboardingChoiceComponent", () => {
 
 	it("renders the prompt, the options and a grey note in the onboarding language", () => {
 		const component = new OnboardingChoiceComponent(
-			[{ label: "Share agent traces" }, { label: "Not now" }],
+			[{ label: "Personal account" }, { label: "Team account" }],
 			() => {},
 			() => {},
 			{
-				prompt: "Help improve Prime Agent by sharing agent traces?",
-				note: "You can change this anytime with /traces.",
+				prompt: "Which account should Prime Agent use?",
+				note: "You can change this anytime with /login.",
 			},
 		);
 		const lines = component.render(90);
 		const output = stripAnsi(lines.join("\n"));
 
-		expect(output).toContain("Help improve Prime Agent by sharing agent traces?");
-		expect(output).toContain("> Share agent traces");
-		expect(output).toContain("  Not now");
-		expect(output).toContain("You can change this anytime with /traces.");
+		expect(output).toContain("Which account should Prime Agent use?");
+		expect(output).toContain("> Personal account");
+		expect(output).toContain("  Team account");
+		expect(output).toContain("You can change this anytime with /login.");
 		for (const line of lines) {
 			expect(visibleWidth(line)).toBe(90);
 		}

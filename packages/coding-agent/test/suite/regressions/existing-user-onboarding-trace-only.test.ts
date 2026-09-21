@@ -30,7 +30,7 @@ interface ExistingUserOnboardingHarness {
 	askOnboardingProviders(signal: AbortSignal): Promise<void>;
 }
 
-describe("existing user onboarding shows only trace question", () => {
+describe("onboarding without trace sharing", () => {
 	const harnesses: Harness[] = [];
 
 	beforeEach(() => {
@@ -44,7 +44,7 @@ describe("existing user onboarding shows only trace question", () => {
 		}
 	});
 
-	test("existing user sees only the trace question, not login or provider picker", async () => {
+	test("existing user completes without trace sharing, login, or provider picker", async () => {
 		const harness = await createHarness({ provider: "prime-inference", withConfiguredAuth: true });
 		harnesses.push(harness);
 		const order: string[] = [];
@@ -88,40 +88,15 @@ describe("existing user onboarding shows only trace question", () => {
 		const result = await fakeThis.runOnboardingFlow();
 
 		expect(result).toBe(true);
-		expect(fakeThis.showOnboardingSplash).toHaveBeenCalledWith({ immediate: true });
+		expect(fakeThis.showOnboardingSplash).not.toHaveBeenCalled();
 		expect(fakeThis.createAuthFlows).not.toHaveBeenCalled();
 		expect(fakeThis.prepareForModelSelectionAfterLogin).not.toHaveBeenCalled();
 		expect(fakeThis.askOnboardingProviders).not.toHaveBeenCalled();
-		expect(fakeThis.askOnboardingTraceOptIn).toHaveBeenCalled();
-		expect(order).toEqual(["splash", "trace", "dismiss"]);
-	});
-
-	test("existing user with traces already enabled completes silently", async () => {
-		const harness = await createHarness({ provider: "prime-inference", withConfiguredAuth: true });
-		harnesses.push(harness);
-		harness.settingsManager.setAgentTracesEnabled(true);
-		const fakeThis = Object.create(InteractiveMode.prototype) as ExistingUserOnboardingHarness;
-		fakeThis.uiServices = {
-			modelRegistry: harness.session.modelRegistry,
-			settingsManager: harness.settingsManager,
-		};
-		fakeThis.connectionState = { model: harness.getModel() as AgentConnectionModel };
-		fakeThis.onboardingFlowAbort = undefined;
-		fakeThis.showOnboardingSplash = vi.fn(async () => ({ dismiss: vi.fn() }));
-		fakeThis.askOnboardingTraceOptIn = vi.fn();
-		fakeThis.createAuthFlows = vi.fn(() => ({
-			runPrimeInferenceLogin: vi.fn(),
-		}));
-
-		const result = await fakeThis.runOnboardingFlow();
-
-		expect(result).toBe(true);
-		expect(fakeThis.showOnboardingSplash).not.toHaveBeenCalled();
 		expect(fakeThis.askOnboardingTraceOptIn).not.toHaveBeenCalled();
-		expect(fakeThis.createAuthFlows).not.toHaveBeenCalled();
+		expect(order).toEqual([]);
 	});
 
-	test("new user without configured auth runs the full flow unchanged", async () => {
+	test("new user completes login and provider selection without a trace sharing prompt", async () => {
 		const harness = await createHarness({ provider: "prime-inference", withConfiguredAuth: false });
 		harnesses.push(harness);
 		const order: string[] = [];
@@ -170,7 +145,7 @@ describe("existing user onboarding shows only trace question", () => {
 		expect(fakeThis.createAuthFlows).toHaveBeenCalled();
 		expect(fakeThis.prepareForModelSelectionAfterLogin).toHaveBeenCalled();
 		expect(fakeThis.askOnboardingProviders).toHaveBeenCalled();
-		expect(fakeThis.askOnboardingTraceOptIn).toHaveBeenCalled();
-		expect(order).toEqual(["splash", "login", "prepare", "providers", "trace", "dismiss"]);
+		expect(fakeThis.askOnboardingTraceOptIn).not.toHaveBeenCalled();
+		expect(order).toEqual(["splash", "login", "prepare", "providers", "dismiss"]);
 	});
 });

@@ -600,7 +600,6 @@ describe("interactive interrupt preserves the queue", () => {
 	it("aborts without clearing or restoring queued messages", () => {
 		const abort = vi.fn(async () => {});
 		const harness = {
-			traceUploadAllAbortController: undefined,
 			sideQuestionEvent: undefined,
 			getRetryAttempt: () => 0,
 			isAgentCompacting: () => false,
