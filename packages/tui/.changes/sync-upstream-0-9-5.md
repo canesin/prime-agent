@@ -1,0 +1,1 @@
+- Fixed terminal input, completion, image rendering, and scrolling issues from upstream v0.9.5.

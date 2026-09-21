@@ -12,12 +12,12 @@ describe("LiteLLM context overflow recovery", () => {
 		while (harnesses.length > 0) harnesses.pop()?.cleanup();
 	});
 
-	async function setup() {
+	async function setup(keepRecentTokens = 50) {
 		const harness = await createHarness({
 			models: [{ id: "litellm-fixture", contextWindow: 262144, maxTokens: 8192 }],
 			settings: {
 				autoRefine: { enabled: false },
-				compaction: { enabled: true, reserveTokens: 8192, keepRecentTokens: 50 },
+				compaction: { enabled: true, reserveTokens: 8192, keepRecentTokens },
 				retry: { enabled: true, maxRetries: 1, baseDelayMs: 1 },
 			},
 		});
@@ -28,45 +28,77 @@ describe("LiteLLM context overflow recovery", () => {
 	}
 
 	it.each([
-		["LiteLLM rejection", litellmError],
-		["known overflow control", "prompt is too long: 270128 tokens > 262144 maximum"],
-	])("compacts and continues after %s without retrying the unchanged request", async (_name, errorMessage) => {
-		const harness = await setup();
-		const requests: Context[] = [];
-		harness.setResponses([
-			fauxAssistantMessage("", { stopReason: "error", errorMessage }),
-			(context) => {
-				requests.push({ systemPrompt: context.systemPrompt, messages: structuredClone(context.messages) });
-				return fauxAssistantMessage("Summary of earlier findings.");
-			},
-			(context) => {
-				requests.push({ systemPrompt: context.systemPrompt, messages: structuredClone(context.messages) });
-				return fauxAssistantMessage("Recovered.");
-			},
-		]);
+		{ name: "LiteLLM rejection", errorMessage: litellmError, keepRecentTokens: 50 },
+		{ name: "LiteLLM rejection", errorMessage: litellmError, keepRecentTokens: 200 },
+		{
+			name: "known overflow control",
+			errorMessage: "prompt is too long: 270128 tokens > 262144 maximum",
+			keepRecentTokens: 50,
+		},
+		{
+			name: "known overflow control",
+			errorMessage: "prompt is too long: 270128 tokens > 262144 maximum",
+			keepRecentTokens: 200,
+		},
+	])(
+		"compacts and continues after $name with $keepRecentTokens retained tokens",
+		async ({ errorMessage, keepRecentTokens }) => {
+			const harness = await setup(keepRecentTokens);
+			const requests: Context[] = [];
+			const splitTurn = keepRecentTokens === 50;
+			harness.setResponses([
+				fauxAssistantMessage("", { stopReason: "error", errorMessage }),
+				(context) => {
+					requests.push({ systemPrompt: context.systemPrompt, messages: structuredClone(context.messages) });
+					return fauxAssistantMessage("Summary of earlier findings.");
+				},
+				...(splitTurn
+					? [
+							(context: Context) => {
+								requests.push({
+									systemPrompt: context.systemPrompt,
+									messages: structuredClone(context.messages),
+								});
+								return fauxAssistantMessage("Continue the task using the earlier findings.");
+							},
+						]
+					: []),
+				(context) => {
+					requests.push({ systemPrompt: context.systemPrompt, messages: structuredClone(context.messages) });
+					return fauxAssistantMessage("Recovered.");
+				},
+			]);
 
-		await harness.session.prompt("Continue the task using the earlier findings. ".repeat(8));
+			await harness.session.prompt("Continue the task using the earlier findings. ".repeat(8));
 
-		expect(harness.eventsOfType("compaction_start").map((event) => event.reason)).toEqual(["overflow"]);
-		expect(harness.eventsOfType("compaction_end")).toEqual([
-			expect.objectContaining({ reason: "overflow", aborted: false, willRetry: true, result: expect.any(Object) }),
-		]);
-		await vi.waitFor(() => {
-			expect(harness.session.messages.at(-1)).toEqual(
-				expect.objectContaining({ content: [{ type: "text", text: "Recovered." }], stopReason: "stop" }),
-			);
-		});
-		expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
-		expect(requests).toHaveLength(2);
-		expect(getMessageText(requests[0].messages[0])).toContain("<conversation>");
-		expect(requests[1].messages.map(getMessageText).join("\n")).toContain("Summary of earlier findings.");
-		expect(
-			requests[1].messages.some((message) => message.role === "assistant" && message.stopReason === "error"),
-		).toBe(false);
-		expect(harness.sessionManager.getBranch().filter((entry) => entry.type === "compaction")).toHaveLength(1);
-		expect(harness.faux.state.callCount).toBe(4);
-		expect(harness.getPendingResponseCount()).toBe(0);
-	});
+			expect(harness.eventsOfType("compaction_start").map((event) => event.reason)).toEqual(["overflow"]);
+			expect(harness.eventsOfType("compaction_end")).toEqual([
+				expect.objectContaining({
+					reason: "overflow",
+					aborted: false,
+					willRetry: true,
+					result: expect.any(Object),
+				}),
+			]);
+			await vi.waitFor(() => {
+				expect(harness.session.messages.at(-1)).toEqual(
+					expect.objectContaining({ content: [{ type: "text", text: "Recovered." }], stopReason: "stop" }),
+				);
+			});
+			expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
+			expect(requests).toHaveLength(splitTurn ? 3 : 2);
+			expect(getMessageText(requests[0].messages[0])).toContain("<conversation>");
+			if (splitTurn) expect(getMessageText(requests[1].messages[0])).toContain("PREFIX of a turn");
+			const resumed = requests.at(-1)!;
+			expect(resumed.messages.map(getMessageText).join("\n")).toContain("Summary of earlier findings.");
+			expect(
+				resumed.messages.some((message) => message.role === "assistant" && message.stopReason === "error"),
+			).toBe(false);
+			expect(harness.sessionManager.getBranch().filter((entry) => entry.type === "compaction")).toHaveLength(1);
+			expect(harness.faux.state.callCount).toBe(splitTurn ? 5 : 4);
+			expect(harness.getPendingResponseCount()).toBe(0);
+		},
+	);
 
 	it("retries a token-rate-limit rejection without compacting", async () => {
 		const harness = await setup();

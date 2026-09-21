@@ -65,7 +65,9 @@ describe("release workflow signature gates", () => {
 		]);
 		const publish = release.jobs.publish!;
 		expect(publish.needs).toEqual(expect.arrayContaining(["build", "validate-macos"]));
-		expect(publish.if).toBe("github.event_name != 'pull_request'");
+		expect(publish.if).toBe(
+			"github.repository == 'PrimeIntellect-ai/prime-agent' && github.event_name != 'pull_request'",
+		);
 		requiresSuccess(validation);
 		requiresSuccess(publish);
 	});
@@ -238,7 +240,9 @@ ${step(validation, "Verify and exercise exact final Mac archives").run}`,
 					expect(pack.run).toContain(`--channel ${channel}`);
 					expect(pack.run).toContain("--binary-dir packages/coding-agent/binaries");
 				}
-				expect(release.jobs.publish!.if).toBe("github.event_name != 'pull_request'");
+				expect(release.jobs.publish!.if).toBe(
+					"github.repository == 'PrimeIntellect-ai/prime-agent' && github.event_name != 'pull_request'",
+				);
 			} finally {
 				rmSync(directory, { recursive: true, force: true });
 			}

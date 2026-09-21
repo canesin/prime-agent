@@ -108,6 +108,8 @@ exit 1
 		Buffer.from(
 			JSON.stringify({
 				version,
+				package: "prime-agent",
+				tarball: `https://github.com/canesin/prime-agent/releases/download/v${version}/prime-agent-${version}.tgz`,
 				binaries: [{ platform, file: filename, sha256: digest }],
 			}),
 		),
@@ -587,13 +589,15 @@ download_prime_agent_package "$1" "$prime_agent_base_url/releases/v$1/$prime_age
 				Buffer.from(
 					JSON.stringify({
 						version: "1.0.1",
+						package: "prime-agent",
+						tarball: "https://github.com/canesin/prime-agent/releases/download/v1.0.1/prime-agent-1.0.1.tgz",
 						binaries: failure === "missing" ? [] : failure === "duplicate" ? [artifact, artifact] : [artifact],
 					}),
 				),
 			);
 			await expect(
 				getNativeUpdatePlan({ force: false, rollback: false, executable: realpathSync(command()) }),
-			).rejects.toThrow();
+			).rejects.toThrow(`No verified compiled archive is available for ${platform}.`);
 			expect(readlinkSync(command())).toBe(current);
 		},
 	);
@@ -1179,6 +1183,8 @@ exec /bin/${operation} "$@"
 				Buffer.from(
 					JSON.stringify({
 						version,
+						package: "prime-agent",
+						tarball: `https://github.com/canesin/prime-agent/releases/download/v${version}/prime-agent-${version}.tgz`,
 						binaries: [
 							{ platform, file: name, sha256: createHash("sha256").update(readFileSync(archive)).digest("hex") },
 						],
@@ -1207,7 +1213,12 @@ exec /bin/${operation} "$@"
 			feed.set(`/releases/v99.0.0/${nextFile}`, bytes);
 			feed.set("/releases/v99.0.0/SHA256SUMS", Buffer.from(`${sha256}  ${nextFile}\n`));
 			const nextManifest = Buffer.from(
-				JSON.stringify({ version: "v99.0.0", binaries: [{ platform, file: nextFile, sha256 }] }),
+				JSON.stringify({
+					version: "v99.0.0",
+					package: "prime-agent",
+					tarball: "https://github.com/canesin/prime-agent/releases/download/v99.0.0/prime-agent-99.0.0.tgz",
+					binaries: [{ platform, file: nextFile, sha256 }],
+				}),
 			);
 			feed.set(manifestPath, nextManifest);
 			mkdirSync(join(home, "agent"), { recursive: true });

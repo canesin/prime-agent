@@ -102,10 +102,12 @@ describe.skipIf(!archive)("extracted standalone archive", () => {
 		root = realpathSync(mkdtempSync(join(process.platform === "darwin" ? "/tmp" : tmpdir(), "pa-bin-")));
 		extracted = join(root, "extracted app");
 		mkdirSync(extracted);
-		execFileSync("tar", ["-xzf", resolve(archive!), "-C", extracted]);
+		execFileSync("tar", ["-xzf", resolve(archive!), "-C", extracted], { timeout: 60000 });
 		binary = join(extracted, "prime-agent");
 		if (process.platform === "darwin") {
-			execFileSync("/usr/bin/codesign", ["--verify", "--deep", "--strict", "--verbose=4", binary]);
+			execFileSync("/usr/bin/codesign", ["--verify", "--deep", "--strict", "--verbose=4", binary], {
+				timeout: 60000,
+			});
 		}
 		const bin = join(root, "bin");
 		mkdirSync(bin);
@@ -139,7 +141,7 @@ describe.skipIf(!archive)("extracted standalone archive", () => {
 				mode: 0o755,
 			});
 		}
-	});
+	}, 130000);
 	beforeEach(() => {
 		home = mkdtempSync(join(root, "home-"));
 		cwd = join(home, "project with spaces");

@@ -11,6 +11,7 @@ const artifact = {
 	file: "prime-agent-1.2.4-linux-x64.tar.gz",
 	sha256: "b".repeat(64),
 };
+const tarball = "https://github.com/canesin/prime-agent/releases/download/v1.2.4/prime-agent-1.2.4.tgz";
 const invalidMetadata: Array<{ name: string; binaries: unknown }> = [
 	{ name: "invalid checksum", binaries: [{ ...artifact, sha256: "invalid" }] },
 	{ name: "duplicate platform", binaries: [artifact, artifact] },
@@ -64,7 +65,7 @@ describe("native release metadata isolation", () => {
 					Response.json({
 						version: "v1.2.4",
 						package: "prime-agent",
-						tarball: "releases/v1.2.4/prime-agent-1.2.4.tgz",
+						tarball,
 						binaries,
 					}),
 				),
@@ -73,7 +74,7 @@ describe("native release metadata isolation", () => {
 			await expect(getLatestPiRelease("1.2.3")).resolves.toEqual({
 				version: "1.2.4",
 				packageName: "prime-agent",
-				installSpec: `${baseUrl}/releases/v1.2.4/prime-agent-1.2.4.tgz`,
+				installSpec: tarball,
 			});
 			for (const force of [false, true]) {
 				await expect(getNativeUpdatePlan({ force, rollback: false, executable })).rejects.toThrow(
@@ -87,7 +88,7 @@ describe("native release metadata isolation", () => {
 	it("uses the verified platform checksum when the entire native list is valid", async () => {
 		vi.stubGlobal(
 			"fetch",
-			vi.fn(async () => Response.json({ version: "1.2.4", binaries: [artifact] })),
+			vi.fn(async () => Response.json({ version: "1.2.4", package: "prime-agent", tarball, binaries: [artifact] })),
 		);
 
 		const plan = await getNativeUpdatePlan({ force: false, rollback: false, executable });

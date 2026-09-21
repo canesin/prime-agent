@@ -66,7 +66,7 @@ console.log(getUpdateInstruction('prime-agent'));
 				);
 				expect(output.trim()).toBe(
 					state === "unmanaged"
-						? "Download from: https://github.com/PrimeIntellect-ai/prime-agent/releases/latest"
+						? "Download from: https://github.com/canesin/prime-agent/releases/latest"
 						: "Run: prime-agent update",
 				);
 			} finally {
