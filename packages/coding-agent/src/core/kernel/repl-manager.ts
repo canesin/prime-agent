@@ -157,6 +157,7 @@ export class ReplKernelManager {
 		| "env"
 		| "sessionId"
 		| "hostHandlers"
+		| "onBackgroundWorkChange"
 		| "pythonSkills"
 		| "snapshot"
 		| "bootstrapCode"
@@ -216,6 +217,7 @@ export class ReplKernelManager {
 			env: options.env,
 			sessionId: options.sessionId,
 			hostHandlers: options.hostHandlers,
+			onBackgroundWorkChange: options.onBackgroundWorkChange,
 			pythonSkills: options.pythonSkills,
 			snapshot: options.snapshot,
 			bootstrapCode: options.bootstrapCode,
@@ -233,6 +235,16 @@ export class ReplKernelManager {
 
 	get hasBackgroundWork(): boolean {
 		return this.backgroundBashHandles.size > 0;
+	}
+
+	private notifyBackgroundWorkChange(wasActive: boolean): void {
+		const active = this.hasBackgroundWork;
+		if (wasActive === active) return;
+		try {
+			this.options.onBackgroundWorkChange?.(active);
+		} catch (error) {
+			this.appendKernelDiagnostic(`background activity callback failed: ${errorMessage(error)}`);
+		}
 	}
 
 	private appendKernelDiagnostic(message: string): void {
@@ -773,6 +785,7 @@ export class ReplKernelManager {
 				activity.pid > 0 &&
 				typeof activity.active === "boolean"
 			) {
+				const wasActive = this.hasBackgroundWork;
 				if (activity.active) {
 					if (!this.backgroundBashHandles.has(activity.id)) {
 						this.backgroundBashHandles.set(activity.id, activity.pid);
@@ -780,6 +793,7 @@ export class ReplKernelManager {
 				} else if (this.backgroundBashHandles.get(activity.id) === activity.pid) {
 					this.backgroundBashHandles.delete(activity.id);
 				}
+				this.notifyBackgroundWorkChange(wasActive);
 			}
 			return;
 		}
@@ -1301,6 +1315,7 @@ export class ReplKernelManager {
 	}
 
 	private cleanupResources(killSignal: NodeJS.Signals = "SIGTERM"): void {
+		const hadBackgroundWork = this.hasBackgroundWork;
 		this.startGeneration++; // any teardown invalidates in-flight starts
 		this.reportedCwd = undefined;
 		this.clearSnapshotTimer();
@@ -1338,6 +1353,7 @@ export class ReplKernelManager {
 			if (pid !== undefined) reapKernelOrphanProcesses(pid);
 		}
 		this.startPromise = undefined;
+		this.notifyBackgroundWorkChange(hadBackgroundWork);
 	}
 
 	private async waitForKernelExit(): Promise<void> {

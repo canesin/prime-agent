@@ -1,10 +1,13 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getBundledSkillsDir } from "../src/config.js";
-import type { PythonSkillRuntimeInfo } from "../src/core/skills.js";
+import { loadSkillsFromDir, type PythonSkillRuntimeInfo } from "../src/core/skills.js";
 import { IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
+import { createHarness } from "./suite/harness.js";
+import { createTestResourceLoader } from "./utilities.js";
 
 function bundledGoalSkill(): PythonSkillRuntimeInfo {
 	const packagePath = join(getBundledSkillsDir(), "goal");
@@ -80,6 +83,81 @@ print(_completed["goal"]["status"], _completed["completion_budget_report"])
 
 		expect(requests.map((request) => request.type)).toEqual(["goal.create", "goal.complete"]);
 		expect(requests[0].payload).toMatchObject({ type: "goal.create", objective: "ship it", token_budget: 10 });
+	});
+
+	it("round-trips goal.pause and rejects invalid reasons before contacting the host", async () => {
+		const requests: Array<Record<string, unknown>> = [];
+		provisioner = new IpythonKernelProvisioner(tempDir, {
+			pythonSkills: [bundledGoalSkill()],
+			hostHandlers: {
+				"goal.pause": async (payload) => {
+					requests.push(payload);
+					return {
+						goal: { objective: "ship it", status: "paused", tokens_used: 7 },
+						remaining_tokens: 3,
+						completion_budget_report: null,
+					};
+				},
+			},
+		});
+		const manager = await provisioner.ensure();
+		const result = await manager.execute(`
+import json
+print(json.dumps(await goal.pause("  Waiting for independent approval.  "), sort_keys=True))
+for reason in [None, 42, "", "   ", "x" * 1001]:
+    try:
+        await goal.pause(reason)
+    except (TypeError, ValueError) as error:
+        print(type(error).__name__)
+`);
+		expect(result.status, JSON.stringify(result.error)).toBe("ok");
+		const lines = result.stdout.trim().split("\n");
+		expect(JSON.parse(lines[0])).toEqual({
+			goal: { objective: "ship it", status: "paused", tokens_used: 7 },
+			remaining_tokens: 3,
+			completion_budget_report: null,
+		});
+		expect(lines.slice(1)).toEqual(["TypeError", "TypeError", "ValueError", "ValueError", "ValueError"]);
+		expect(requests).toHaveLength(1);
+		expect(requests[0]).toMatchObject({ type: "goal.pause", reason: "Waiting for independent approval." });
+	});
+
+	it("pauses through the real session ipython handler without another goal or autonomous call", async () => {
+		const harness = await createHarness({
+			rlmDepth: 0,
+			persistSession: true,
+			autonomous: { enabled: true, maxContinuations: 5 },
+			resourceLoader: createTestResourceLoader({
+				skills: loadSkillsFromDir({ dir: join(getBundledSkillsDir(), "goal"), source: "path" }).skills,
+			}),
+		});
+		try {
+			const pause = fauxAssistantMessage(
+				fauxToolCall("ipython", { code: 'print(await goal.pause("Waiting for independent approval."))' }),
+				{ stopReason: "toolUse" },
+			);
+			harness.setResponses([
+				pause,
+				fauxAssistantMessage("Paused until approval arrives."),
+				fauxAssistantMessage("UNEXPECTED continuation", { stopReason: "error" }),
+			]);
+			await harness.session.prompt("/goal ship after independent approval");
+			expect(harness.session.goalState).toMatchObject({
+				status: "paused",
+				active: false,
+				lastReason: "Waiting for independent approval.",
+			});
+			const pauseMessage = harness.session.messages.find((message) => message.role === "assistant");
+			if (!pauseMessage || pauseMessage.role !== "assistant") throw new Error("Missing pause tool turn");
+			expect(harness.session.goalState.tokensUsed).toBe(pauseMessage.usage.input + pauseMessage.usage.output);
+			expect(harness.session.goalState.tokensUsed).toBeGreaterThan(0);
+			expect(harness.eventsOfType("tool_execution_end")).toHaveLength(1);
+			expect(harness.eventsOfType("tool_execution_end")[0].isError).toBe(false);
+			expect(harness.getPendingResponseCount()).toBe(1);
+		} finally {
+			await harness.session.disposeAsync({ kernelSnapshot: false });
+			harness.cleanup();
+		}
 	});
 
 	it("surfaces host errors and missing handlers as Python exceptions", async () => {

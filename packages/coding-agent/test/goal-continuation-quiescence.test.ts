@@ -2,8 +2,15 @@ import { describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.js";
 
 type Harness = {
-	_goalState: { status: string; objective?: string; continuationsUsed: number };
+	_goalState: { status: string; goalId?: string; objective?: string; continuationsUsed: number };
 	_goalContinuationAwaitsRlmWork: boolean;
+	_goalContinuationGuard: { observe: () => void; complete: () => boolean };
+	_hasGoalBackgroundWork: () => boolean;
+	_allowGoalContinuation: (message: unknown) => boolean;
+	agent: { hasQueuedMessages: () => boolean };
+	queuedActionCount: number;
+	unfinishedActionCount: number;
+	isStreaming: boolean;
 	_disposed: boolean;
 	_disposing: boolean;
 	_sessionInputAdmissionPauses: Set<symbol>;
@@ -26,8 +33,17 @@ const maybeResume = Reflect.get(AgentSession.prototype, "_maybeResumeGoalContinu
 
 function harness(overrides: Partial<Harness> = {}): Harness {
 	return {
-		_goalState: { status: "active", objective: "ship it", continuationsUsed: 0 },
+		_goalState: { status: "active", goalId: "test-goal", objective: "ship it", continuationsUsed: 0 },
 		_goalContinuationAwaitsRlmWork: false,
+		_goalContinuationGuard: { observe: () => {}, complete: () => false },
+		_hasGoalBackgroundWork: function () {
+			return this._hasUnsettledRlmQuiescenceWork();
+		},
+		_allowGoalContinuation: Reflect.get(AgentSession.prototype, "_allowGoalContinuation"),
+		agent: { hasQueuedMessages: () => false },
+		queuedActionCount: 0,
+		unfinishedActionCount: 0,
+		isStreaming: false,
 		_disposed: false,
 		_disposing: false,
 		_sessionInputAdmissionPauses: new Set(),
@@ -47,7 +63,7 @@ function harness(overrides: Partial<Harness> = {}): Harness {
 	};
 }
 
-const context = { message: { role: "assistant", stopReason: "stop" }, context: {} };
+const context = { message: { role: "assistant", stopReason: "stop", content: [] }, context: {} };
 
 describe("goal continuation vs unsettled subagent work", () => {
 	it("defers the continuation while descendant work is unsettled", async () => {
