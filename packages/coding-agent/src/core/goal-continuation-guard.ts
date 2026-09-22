@@ -74,7 +74,9 @@ export class GoalContinuationGuard {
 		}
 	}
 
-	observe(messages: AgentMessage[]): void {
+	observe(messages: AgentMessage[] | undefined): void {
+		// Callers may supply a partial context (cast in callers/tests) without newMessages.
+		if (!messages) return;
 		const cursor = this.cursors.get(messages) ?? 0;
 		if (
 			this.state &&
