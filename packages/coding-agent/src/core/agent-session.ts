@@ -154,6 +154,7 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.js";
 import { emitSessionShutdownEvent } from "./extensions/runner.js";
+import { GOAL_CONTINUATION_GUARD_TYPE, GoalContinuationGuard } from "./goal-continuation-guard.js";
 import {
 	createGoalContextMessage,
 	emptyGoalState,
@@ -1461,8 +1462,12 @@ export class AgentSession {
 	private _pendingNextTurnMessages: CustomMessage[] = [];
 
 	private _goalState: GoalState = emptyGoalState();
+	private readonly _goalContinuationGuard = new GoalContinuationGuard((state) =>
+		this.sessionManager.appendCustomEntryWithRollback(GOAL_CONTINUATION_GUARD_TYPE, state),
+	);
 	private _goalAccountingStartedAt: number | undefined = undefined;
 	private _goalContinuationAwaitsRlmWork = false;
+	private _goalPauseBlocksAutonomous = false;
 	private readonly _recoveredConditionalGoalReceipts = new Set<string>();
 	private _goalAccountedAssistantMessages = new WeakSet<AssistantMessage>();
 	private _goalAbortInProgress = false;
@@ -1710,6 +1715,8 @@ export class AgentSession {
 			defaultLimits: this.settingsManager.getAutonomousLimits(),
 		});
 		this._goalState = this._loadPersistedGoalState();
+		this._goalContinuationGuard.restore(this.sessionManager.getBranch(), this._goalState.goalId);
+		this._goalPauseBlocksAutonomous = this._goalState.status === "paused";
 		// Seed initial goal from CLI --goal flag, but only for top-level sessions
 		// and only when the branch contains only bootstrap entry types (model_change,
 		// thinking_level_change, service_tier_change) and no persisted
@@ -2116,6 +2123,8 @@ export class AgentSession {
 			};
 		} else {
 			this._goalState = reloaded;
+			this._goalContinuationGuard.restore(this.sessionManager.getBranch(), reloaded.goalId);
+			this._goalPauseBlocksAutonomous = reloaded.status === "paused";
 		}
 		this._goalAccountingStartedAt = this._goalState.status === "active" ? Date.now() : undefined;
 		this._emitGoalUpdate();
@@ -2298,6 +2307,7 @@ export class AgentSession {
 		this._goalAccountingStartedAt = now;
 		this._goalContinuationAwaitsRlmWork = false;
 		this._setGoalState(goal);
+		this._goalContinuationGuard.reset(goal.goalId!);
 		return this._goalState;
 	}
 
@@ -2307,7 +2317,12 @@ export class AgentSession {
 	}
 
 	private _pauseGoal(reason = "Paused by user"): void {
+		this._goalPauseBlocksAutonomous = true;
 		this._clearQueuedGoalContexts();
+		this._clearAutonomousContinuationAwait();
+		this._clearQueuedAutonomousContinuations();
+		this._cancelPostCompactionContinue();
+		this._continueAfterThresholdCompaction = false;
 		if (this._goalState.status !== "active") {
 			this._emitGoalUpdate();
 			return;
@@ -2342,6 +2357,7 @@ export class AgentSession {
 			lastError: undefined,
 		});
 		if (nextStatus === "active") {
+			this._goalContinuationGuard.reset(this._goalState.goalId!);
 			await this._runOrQueueGoalContext("continuation");
 		}
 	}
@@ -2590,7 +2606,7 @@ export class AgentSession {
 
 	private _maybeResumeGoalContinuationAfterRlmWork(): void {
 		if (!this._goalContinuationAwaitsRlmWork) return;
-		if (this._disposed || this._disposing || this._hasUnsettledRlmQuiescenceWork()) return;
+		if (this._disposed || this._disposing || this._hasGoalBackgroundWork()) return;
 		if (this._goalState.status !== "active" || !this._goalState.objective) {
 			this._goalContinuationAwaitsRlmWork = false;
 			return;
@@ -2598,6 +2614,7 @@ export class AgentSession {
 		// Keep the deferral while admission is paused or the pump is suspended
 		// (post-abort); the pause release and resumeQueuedWork retry.
 		if (this._sessionInputAdmissionPauses.size > 0 || this._sessionInputPumpSuspended) return;
+		if (this.isStreaming || this.unfinishedActionCount > 0 || this.agent.hasQueuedMessages()) return;
 		const goalBeforeResume = this._goalState;
 		try {
 			this._ensureGoalRuntimeActive();
@@ -2659,7 +2676,9 @@ export class AgentSession {
 
 	/** True while an active goal's continuation loop owns the session wake-ups. */
 	private _goalOwnsContinuationWakeup(): boolean {
-		return this._goalState.status === "active" && !!this._goalState.objective;
+		return (
+			this._goalState.status === "active" || (this._goalState.status === "paused" && this._goalPauseBlocksAutonomous)
+		);
 	}
 
 	/** Deliver the owed continuation once descendant work settles. */
@@ -3007,6 +3026,7 @@ export class AgentSession {
 	}
 
 	private async _shouldStopAfterTurn(context: ShouldStopAfterTurnContext): Promise<boolean> {
+		this._goalContinuationGuard.observe(context.newMessages);
 		if (this._stopGoalContinuationForTerminalMessage(context.message)) {
 			return true;
 		}
@@ -3582,6 +3602,7 @@ export class AgentSession {
 	private async _queueAutonomousContinuationForThresholdCompaction(
 		message: AssistantMessage,
 	): Promise<AgentMessage | undefined> {
+		if (this._goalOwnsContinuationWakeup()) return undefined;
 		const queuedMessage = this._queuedAutonomousThresholdContinuations.get(message);
 		if (queuedMessage && this._postCompactionContinuationMessages.includes(queuedMessage)) {
 			return queuedMessage;
@@ -3622,6 +3643,40 @@ export class AgentSession {
 
 	// The role heuristic reads an assistant-last threshold stop as "task finished" and
 	// agent.continue() cannot resume from it, so the goal continuation is queued as a session input.
+	private _hasGoalBackgroundWork(): boolean {
+		return (
+			this._ipythonKernelProvisioner?.manager?.hasBackgroundWork === true || this._hasUnsettledRlmQuiescenceWork()
+		);
+	}
+
+	private _allowGoalContinuation(message: AssistantMessage, completedCycle = false): boolean {
+		if (
+			this.agent.signal?.aborted ||
+			this._goalState.status !== "active" ||
+			!this._goalState.goalId ||
+			message.stopReason === "error" ||
+			message.stopReason === "aborted"
+		)
+			return false;
+		// Tool turns are intermediate, including a threshold compaction between tools.
+		if (
+			!completedCycle &&
+			(message.stopReason === "toolUse" || message.content.some((block) => block.type === "toolCall"))
+		)
+			return false;
+		if (this.queuedActionCount > 0 || this.agent.hasQueuedMessages()) return false;
+		if (this._hasGoalBackgroundWork()) {
+			this._goalContinuationAwaitsRlmWork = true;
+			return false;
+		}
+		this._goalContinuationAwaitsRlmWork = false;
+		if (this._goalContinuationGuard.complete(this._goalState.goalId, message)) {
+			this._pauseGoal("Paused after three completed cycles without tool execution. Use /goal resume to continue.");
+			return false;
+		}
+		return true;
+	}
+
 	private _queueGoalContinuationForThresholdCompaction(message: AssistantMessage): boolean {
 		if (message.stopReason === "error" || message.stopReason === "aborted") {
 			return false;
@@ -3629,6 +3684,7 @@ export class AgentSession {
 		if (this._goalState.status !== "active" || !this._goalState.objective) {
 			return false;
 		}
+		if (!this._allowGoalContinuation(message)) return false;
 		const alreadyQueued = this._queuedGoalThresholdContinuation;
 		if (
 			alreadyQueued !== undefined &&
@@ -3761,6 +3817,20 @@ export class AgentSession {
 					throw new Error("goal.create token_budget must be an integer when provided");
 				}
 				return goalHostResponse(this._createGoalFromHost(payload.objective, payload.token_budget), false);
+			}
+			case "goal.pause": {
+				if (
+					typeof payload.reason !== "string" ||
+					!payload.reason.trim() ||
+					[...payload.reason.trim()].length > 1000
+				) {
+					throw new Error("goal.pause reason must be a nonempty string of at most 1000 characters");
+				}
+				if (this._goalState.status !== "active" && this._goalState.status !== "paused") {
+					throw new Error(`cannot pause goal with status ${this._goalState.status}`);
+				}
+				this._pauseGoal(payload.reason.trim());
+				return goalHostResponse(this.goalState, false);
 			}
 			case "goal.complete":
 				return goalHostResponse(this._completeGoalFromHost(), true);
@@ -4092,13 +4162,8 @@ export class AgentSession {
 		if (signal?.aborted || this._goalState.status !== "active" || !this._goalState.objective) {
 			return [];
 		}
-		// Delegating and ending the turn is correct behavior; hold the continuation
-		// until descendants settle instead of re-prompting a waiting parent.
-		if (this._hasUnsettledRlmQuiescenceWork()) {
-			this._goalContinuationAwaitsRlmWork = true;
-			return [];
-		}
-		this._goalContinuationAwaitsRlmWork = false;
+		this._goalContinuationGuard.observe(context.newMessages);
+		if (!this._allowGoalContinuation(context.message, true)) return [];
 		try {
 			this._ensureGoalRuntimeActive(context.context);
 			const nextGoal = {
@@ -4140,6 +4205,7 @@ export class AgentSession {
 			return goalMessages;
 		}
 		if (
+			this._goalOwnsContinuationWakeup() ||
 			this._autonomousContinuationSuppressionDepth > 0 ||
 			context.newMessages.some((message) => this._autonomousContinuationSuppressedMessages.has(message))
 		) {
@@ -4420,7 +4486,9 @@ export class AgentSession {
 				event.message.role === "assistant" ||
 				event.message.role === "toolResult"
 			) {
-				this.sessionManager.appendMessage(event.message);
+				const entryId = this.sessionManager.appendMessage(event.message);
+				if (event.message.role === "assistant")
+					this._goalContinuationGuard.bindMessageEntry(event.message, entryId);
 			}
 
 			if (event.message.role === "assistant") {
@@ -7067,6 +7135,7 @@ export class AgentSession {
 				if (epoch !== this._sessionInputPumpEpoch || blocked) return;
 			}
 		} finally {
+			this._maybeResumeGoalContinuationAfterRlmWork();
 			if (!blocked && epoch === this._sessionInputPumpEpoch && this._hasSelectableSessionInput()) {
 				this._scheduleSessionInputPump();
 			}
@@ -7334,6 +7403,14 @@ export class AgentSession {
 					this._emitQueueUpdate();
 					this._commitConditionalGoalProviderBoundary(preparedMessages);
 					this._commitConditionalGoalFollowUpProviderBoundary(turns);
+					if (
+						turns.some(
+							(action) =>
+								isHumanInputSource(action.source) && primaryDeliveryRecord(action).message.role === "user",
+						)
+					) {
+						this._goalPauseBlocksAutonomous = false;
+					}
 					return turns.some((action) => action.suppressAutonomousContinuation)
 						? this._runWithAutonomousContinuationSuppressed(() => this.agent.prompt(preparedMessages))
 						: this.agent.prompt(preparedMessages);
@@ -10696,6 +10773,10 @@ export class AgentSession {
 				snapshotDir: this._ipythonKernelSnapshotDir,
 				readyGate: previousDispose,
 				onRestore: notifyRestore ? (result) => this._onIpythonStateRestored(result) : undefined,
+				onBackgroundWorkChange: (active) => {
+					if (!active) this._maybeResumeGoalContinuationAfterRlmWork();
+					this._notifySessionInputCheckpointChange();
+				},
 			});
 			configuredBaseToolDefinitions = createAllToolDefinitions(this._cwd, {
 				ipython: {
@@ -10863,7 +10944,7 @@ export class AgentSession {
 			}),
 		};
 		if (this._includeGoals) {
-			for (const type of ["goal.get", "goal.create", "goal.complete"]) {
+			for (const type of ["goal.get", "goal.create", "goal.complete", "goal.pause"]) {
 				handlers[type] = async (payload) => this.handleGoalHostRequest(type, payload);
 			}
 		}

@@ -115,6 +115,102 @@ describe("compaction continuation", () => {
 		};
 	}
 
+	it.each(["successful", "skipped"])("pauses the third idle cycle across %s threshold compaction", async (outcome) => {
+		const sessionRef: { current?: AgentSession } = {};
+		const harness = await createHarness({
+			tools: [createFauxIpythonTool(sessionRef)],
+			autonomous: { enabled: true, maxContinuations: 5 },
+			settings: { compaction: { enabled: true, reserveTokens: 8_000, keepRecentTokens: 1 } },
+			models: [{ id: "faux-1", contextWindow: 10_000 }],
+			persistSession: true,
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "compacted",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+							details: {},
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		sessionRef.current = harness.session;
+		if (outcome === "skipped")
+			vi.spyOn(harness.session as unknown as SessionInternals, "_performCompaction").mockRejectedValue(
+				new CompactionSkippedError("skipped"),
+			);
+		harness.setResponses([
+			...Array.from({ length: 3 }, (_, i) => fauxAssistantMessage(`blocked ${i} ${"x".repeat(3500)}`)),
+			fauxAssistantMessage("sentinel"),
+		]);
+		await harness.session.prompt("/goal blocked work");
+		await harness.session.waitForHeadlessIdle();
+		expect(harness.eventsOfType("compaction_start").some((event) => event.reason === "threshold")).toBe(true);
+		expect(harness.session.goalState).toMatchObject({ status: "paused", continuationsUsed: 2 });
+		expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(0);
+		expect(harness.getPendingResponseCount()).toBe(1);
+	});
+
+	it("does not count intermediate tool turns as idle at threshold compaction", async () => {
+		const harness = await createHarness({
+			settings: { compaction: { enabled: true, reserveTokens: 1000 } },
+			models: [{ id: "faux-1", contextWindow: 200_000 }],
+		});
+		harnesses.push(harness);
+		harness.session.handleGoalHostRequest("goal.create", { objective: "work" });
+		const internals = harness.session as unknown as SessionInternals;
+		for (let i = 0; i < 4; i++) {
+			const context = midToolLoopContext(harness);
+			expect(await internals._shouldStopAfterTurn(context)).toBe(true);
+		}
+		expect(harness.session.goalState).toMatchObject({ status: "active", continuationsUsed: 0 });
+		expect(harness.session.queuedActionCount).toBe(0);
+	});
+
+	it("deduplicates an idle cycle in the later compaction fallback and blocks paused autonomous fallthrough", async () => {
+		const harness = await createHarness({
+			autonomous: { enabled: true, maxContinuations: 5 },
+			settings: { compaction: { enabled: false } },
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("One"),
+			fauxAssistantMessage("Two"),
+			fauxAssistantMessage("", { stopReason: "aborted" }),
+		]);
+		await harness.session.prompt("/goal work");
+		const internals = harness.session as unknown as SessionInternals & {
+			_checkCompaction: (message: AssistantMessage) => Promise<boolean>;
+		};
+		const last = harness.session.messages
+			.filter(
+				(message): message is AssistantMessage => message.role === "assistant" && message.stopReason === "stop",
+			)
+			.at(-1)!;
+		harness.settingsManager.setCompactionEnabled(true);
+		vi.spyOn(internals, "_runAutoCompaction").mockResolvedValue(true);
+		const threshold = vi
+			.spyOn(
+				harness.session as unknown as { _getThresholdContextTokens: () => number },
+				"_getThresholdContextTokens",
+			)
+			.mockReturnValue(1_000_000);
+		const pause = harness.session.acquireQueuedWorkPause();
+		try {
+			await internals._checkCompaction(last);
+			expect(harness.session.goalState.status).toBe("active");
+			harness.session.handleGoalHostRequest("goal.pause", { reason: "blocked" });
+			await internals._checkCompaction(last);
+			expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(0);
+		} finally {
+			pause.release();
+			threshold.mockRestore();
+		}
+	});
+
 	it("resumes the interrupted tool loop when a threshold compaction is skipped", async () => {
 		vi.useFakeTimers();
 		const harness = await createHarness({
@@ -302,6 +398,7 @@ describe("compaction continuation", () => {
 		harness.setResponses([
 			fauxAssistantMessage(`step one done, more to do ${largeStep}`),
 			fauxAssistantMessage(`step two done, still more to do ${largeStep}`),
+			fauxAssistantMessage(fauxToolCall("ipython", { code: "pass" }), { stopReason: "toolUse" }),
 			fauxAssistantMessage(`step three done, still not finished ${largeStep}`),
 			fauxAssistantMessage(fauxToolCall("ipython", { code: "goal.complete" }), { stopReason: "toolUse" }),
 			fauxAssistantMessage("Goal complete."),
@@ -335,6 +432,10 @@ describe("compaction continuation", () => {
 		harness.session.handleGoalHostRequest("goal.create", { objective: "finish the task" });
 		const internals = harness.session as unknown as SessionInternals;
 		const context = midToolLoopContext(harness);
+		context.message.stopReason = "stop";
+		context.toolResults = [];
+		context.newMessages = [context.message];
+		harness.session.agent.state.messages = [context.message];
 
 		const shouldStop = await internals._shouldStopAfterTurn(context);
 		expect(shouldStop).toBe(true);
@@ -358,6 +459,10 @@ describe("compaction continuation", () => {
 		harness.session.handleGoalHostRequest("goal.create", { objective: "finish the task" });
 		const internals = harness.session as unknown as SessionInternals;
 		const context = midToolLoopContext(harness);
+		context.message.stopReason = "stop";
+		context.toolResults = [];
+		context.newMessages = [context.message];
+		harness.session.agent.state.messages = [context.message];
 
 		const shouldStop = await internals._shouldStopAfterTurn(context);
 		expect(shouldStop).toBe(true);
@@ -393,6 +498,10 @@ describe("compaction continuation", () => {
 		harness.session.handleGoalHostRequest("goal.create", { objective: "finish the task" });
 		const internals = harness.session as unknown as SessionInternals;
 		const context = midToolLoopContext(harness);
+		context.message.stopReason = "stop";
+		context.toolResults = [];
+		context.newMessages = [context.message];
+		harness.session.agent.state.messages = [context.message];
 
 		await internals._shouldStopAfterTurn(context);
 		expect(harness.session.goalState.continuationsUsed).toBe(1);
