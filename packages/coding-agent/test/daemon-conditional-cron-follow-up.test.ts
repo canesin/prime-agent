@@ -220,4 +220,122 @@ describe("daemon conditional cron follow-up", () => {
 			deliveryRecoveryCount: 1,
 		});
 	});
+
+	type RecoverFollowUp = (
+		receiptId: string,
+		text: string,
+		options: { recoveryCommitted?(): void | Promise<void> },
+	) => Promise<boolean>;
+
+	async function interruptedFollowUp(recover: RecoverFollowUp, extraSession: Record<string, unknown> = {}) {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-conditional-follow-up-recovery-"));
+		tempDirs.push(tempDir);
+		const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+			createRuntime: vi.fn(),
+		});
+		const goalState = {
+			active: true,
+			status: "active" as const,
+			goalId: "goal-1",
+			objective: "finish kene",
+			tokensUsed: 0,
+			timeUsedSeconds: 0,
+			continuationsUsed: 0,
+			followUpDispatchReceiptId: "pending",
+			followUpDispatchPhase: "receipt" as const,
+		};
+		const recoverConditionalGoalFollowUpDelivery = vi.fn(recover);
+		const state = {
+			runtime: {
+				session: { sessionId: "session-kene", goalState, recoverConditionalGoalFollowUpDelivery, ...extraSession },
+			},
+		} as unknown as ActiveSessionState;
+		const internals = daemon as unknown as {
+			cronStore: AgentCronJobStore;
+			updateRestart?: unknown;
+			sessions: Map<string, ActiveSessionState>;
+			recoverConditionalCronDeliveryForState(state: ActiveSessionState): Promise<void>;
+			rememberRecoveredConditionalCronJobs(jobs: readonly unknown[]): Promise<void>;
+		};
+		const job = await internals.cronStore.create({
+			activeSessionId: "active-kene",
+			sessionId: "session-kene",
+			sessionFile: join(tempDir, "kene.jsonl"),
+			cwd: tempDir,
+			scheduleText: "in 1m",
+			prompt: "Continue after restart.",
+			deliveryMode: "follow_up",
+			deliveryFence: {
+				version: 1,
+				activeSessionId: "active-kene",
+				sessionName: "kene",
+				cwd: tempDir,
+				model: { provider: "openai", id: "gpt-5.6" },
+				thinkingLevel: "xhigh",
+				messageCount: 2,
+				lastActivityAt: "2026-09-01T10:00:00.000Z",
+				taskState: "needs_input",
+				goal: { active: true, status: "active", goalId: "goal-1" },
+			},
+		});
+		goalState.followUpDispatchReceiptId = job.id;
+		await internals.cronStore.rejectDelivery(job.id, "Interrupted before scheduled operation completion");
+		return { internals, state, job, recoverConditionalGoalFollowUpDelivery };
+	}
+
+	it("does not recover conditional deliveries while an update restart is preparing", async () => {
+		const { internals, state, recoverConditionalGoalFollowUpDelivery } = await interruptedFollowUp(async () => true);
+		internals.updateRestart = { phase: "preparing" };
+
+		await internals.recoverConditionalCronDeliveryForState(state);
+
+		expect(recoverConditionalGoalFollowUpDelivery).not.toHaveBeenCalled();
+		expect(internals.cronStore.list()[0]).not.toHaveProperty("deliveryRecoveryCount");
+	});
+
+	it("runs overlapping recoveries for one receipt once and counts one attempt", async () => {
+		let release = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const { internals, state, job, recoverConditionalGoalFollowUpDelivery } = await interruptedFollowUp(
+			async (_receiptId, _text, options) => {
+				await options.recoveryCommitted?.();
+				await gate;
+				return true;
+			},
+		);
+
+		const first = internals.recoverConditionalCronDeliveryForState(state);
+		const second = internals.recoverConditionalCronDeliveryForState(state);
+		release();
+		await Promise.all([first, second]);
+
+		expect(recoverConditionalGoalFollowUpDelivery).toHaveBeenCalledOnce();
+		expect(internals.cronStore.list()[0]).toMatchObject({ id: job.id, deliveryRecoveryCount: 1 });
+	});
+
+	it("exhausts a cached recovered receipt after the bounded attempts even when recovery keeps failing", async () => {
+		const failConditionalGoalFollowUpDelivery = vi.fn(() => true);
+		const { internals, state, job } = await interruptedFollowUp(
+			async (_receiptId, _text, options) => {
+				await options.recoveryCommitted?.();
+				throw new Error("follow-up not accepted");
+			},
+			{ failConditionalGoalFollowUpDelivery },
+		);
+		await internals.rememberRecoveredConditionalCronJobs(internals.cronStore.list());
+
+		for (let attempt = 0; attempt < 6; attempt += 1) {
+			await internals.recoverConditionalCronDeliveryForState(state);
+		}
+
+		expect(failConditionalGoalFollowUpDelivery).toHaveBeenCalledOnce();
+		expect(internals.cronStore.list()[0]).toMatchObject({
+			id: job.id,
+			deliveryRecoveryCount: 5,
+			deliveryRecoveryExhaustedAt: expect.any(String),
+		});
+	});
 });

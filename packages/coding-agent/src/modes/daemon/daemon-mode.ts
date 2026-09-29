@@ -632,6 +632,8 @@ export class AgentDaemon {
 	/** In-flight admission spawn appends, awaited (and consumed) by createRlmSubagentRuntime. */
 	private readonly pendingRlmSpawnAppends = new Map<string, Promise<void>>();
 	private readonly recoveredConditionalCronJobs = new Map<string, AgentCronJob>();
+	/** One recovery per receipt: overlapping triggers must not spend the bounded attempt budget twice. */
+	private readonly conditionalRecoveriesInFlight = new Map<string, Promise<void>>();
 
 	constructor(
 		private readonly socketPath: string,
@@ -1845,11 +1847,46 @@ export class AgentDaemon {
 	}
 
 	private async recoverConditionalCronDeliveryForState(state: ActiveSessionState): Promise<void> {
-		const goalState = state.runtime.session.goalState;
-		const receiptId = goalState?.dispatchReceiptId;
-		if (receiptId) await this.recoverConditionalGoalStartForState(state, receiptId);
-		const followUpReceiptId = goalState?.followUpDispatchReceiptId;
-		if (followUpReceiptId) await this.recoverConditionalGoalFollowUpForState(state, followUpReceiptId);
+		// Recovery writes the cron store and queues goal turns, so it is a mutation: stay out of an
+		// update restart and hold the drain open until it settles.
+		if (this.updateRestart !== undefined) return;
+		this.mutationDrain.begin();
+		try {
+			const goalState = state.runtime.session.goalState;
+			const receiptId = goalState?.dispatchReceiptId;
+			if (receiptId) {
+				await this.runConditionalRecoveryOnce(receiptId, () =>
+					this.recoverConditionalGoalStartForState(state, receiptId),
+				);
+			}
+			const followUpReceiptId = goalState?.followUpDispatchReceiptId;
+			if (followUpReceiptId) {
+				await this.runConditionalRecoveryOnce(followUpReceiptId, () =>
+					this.recoverConditionalGoalFollowUpForState(state, followUpReceiptId),
+				);
+			}
+		} finally {
+			this.mutationDrain.end();
+		}
+	}
+
+	private runConditionalRecoveryOnce(receiptId: string, recover: () => Promise<void>): Promise<void> {
+		const inFlight = this.conditionalRecoveriesInFlight.get(receiptId);
+		if (inFlight) return inFlight;
+		const run = recover().finally(() => {
+			if (this.conditionalRecoveriesInFlight.get(receiptId) === run) {
+				this.conditionalRecoveriesInFlight.delete(receiptId);
+			}
+		});
+		this.conditionalRecoveriesInFlight.set(receiptId, run);
+		return run;
+	}
+
+	/** Count the attempt durably and keep any cached snapshot in step, or its stale count would bypass the bound. */
+	private async recordConditionalRecoveryAttempt(receiptId: string, label: string): Promise<void> {
+		const updated = await this.cronStore.recordDeliveryRecoveryAttempt(receiptId);
+		if (!updated) throw new Error(`Conditional cron ${label} receipt ${receiptId} disappeared`);
+		if (this.recoveredConditionalCronJobs.has(receiptId)) this.recoveredConditionalCronJobs.set(receiptId, updated);
 	}
 
 	private conditionalRecoveryJob(state: ActiveSessionState, receiptId: string): AgentCronJob | undefined {
@@ -1892,11 +1929,7 @@ export class AgentDaemon {
 		if (typeof recover !== "function") return;
 		try {
 			await recover.call(state.runtime.session, receiptId, {
-				recoveryCommitted: async () => {
-					if (!(await this.cronStore.recordDeliveryRecoveryAttempt(receiptId))) {
-						throw new Error(`Conditional cron recovery receipt ${receiptId} disappeared`);
-					}
-				},
+				recoveryCommitted: () => this.recordConditionalRecoveryAttempt(receiptId, "recovery"),
 			});
 			this.recoveredConditionalCronJobs.delete(receiptId);
 		} catch (error) {
@@ -1929,11 +1962,7 @@ export class AgentDaemon {
 		if (typeof recover !== "function") return;
 		try {
 			await recover.call(state.runtime.session, receiptId, job.prompt, {
-				recoveryCommitted: async () => {
-					if (!(await this.cronStore.recordDeliveryRecoveryAttempt(receiptId))) {
-						throw new Error(`Conditional cron follow-up recovery receipt ${receiptId} disappeared`);
-					}
-				},
+				recoveryCommitted: () => this.recordConditionalRecoveryAttempt(receiptId, "follow-up recovery"),
 			});
 			this.recoveredConditionalCronJobs.delete(receiptId);
 		} catch (error) {
