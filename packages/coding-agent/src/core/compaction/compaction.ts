@@ -546,7 +546,8 @@ export async function generateSummary(
 	// Serialize before the LLM call so it summarizes rather than continues this conversation.
 	const promptText = boundedSummaryPrompt(
 		serializeConversationParts(convertToLlm(currentMessages)),
-		recentStateAnchorBlock(recentStateAnchor) + buildSummarizationPrompt(customInstructions, previousSummary),
+		(conversation, previous) =>
+			buildHistorySummaryPrompt(conversation, previous, recentStateAnchor, customInstructions, previousSummary),
 		previousSummary,
 		maxInputBytes - Buffer.byteLength(SUMMARIZATION_SYSTEM_PROMPT),
 	);
@@ -775,13 +776,15 @@ function buildHistorySummaryPrompt(
 	previousSummary?: string,
 	recentStateAnchor?: string,
 	customInstructions?: string,
+	/** The untruncated previous summary selects the update template even when the embedded copy is bounded. */
+	templateSummary: string | undefined = previousSummary,
 ): string {
 	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
 	if (previousSummary) {
 		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
 	}
 	promptText += recentStateAnchorBlock(recentStateAnchor);
-	promptText += buildSummarizationPrompt(customInstructions, previousSummary);
+	promptText += buildSummarizationPrompt(customInstructions, templateSummary);
 	return promptText;
 }
 
@@ -929,7 +932,7 @@ async function generateTurnPrefixSummary(
 	const llmMessages = convertToLlm(messages);
 	const promptText = boundedSummaryPrompt(
 		serializeConversationParts(llmMessages),
-		TURN_PREFIX_SUMMARIZATION_PROMPT,
+		(conversation) => buildTurnPrefixSummaryPrompt(conversation),
 		undefined,
 		maxInputBytes - Buffer.byteLength(SUMMARIZATION_SYSTEM_PROMPT),
 	);
@@ -976,7 +979,10 @@ async function generateTurnPrefixSummary(
  * the estimate cannot drift from the requests on the wire; both carry
  * SUMMARIZATION_SYSTEM_PROMPT as the system prompt, so its size counts too.
  * The largest slice wins: routing must fit every request the compaction will
- * issue, not the average. 0 means no summary request is applicable.
+ * issue, not the average. 0 means no summary request is applicable. The wire
+ * requests are additionally bounded to the summarizing model's window, so they
+ * never exceed this estimate; a model that holds it summarizes without
+ * truncating history.
  */
 export function estimateSummaryRequestTokens(preparation: CompactionPreparation, customInstructions?: string): number {
 	const { messagesToSummarize, turnPrefixMessages, isSplitTurn, previousSummary, recentStateAnchor, settings } =
@@ -984,10 +990,10 @@ export function estimateSummaryRequestTokens(preparation: CompactionPreparation,
 	const systemPromptTokens = Math.ceil(SUMMARIZATION_SYSTEM_PROMPT.length / 4);
 	let required = 0;
 	// compact() issues the history slice for every compaction except a split
-	// turn with a non-empty prefix and nothing to summarize ("No prior history"
-	// needs no wire call); a stale previousSummary alone never adds a request
-	// compact() skips.
-	const issuesHistoryCall = messagesToSummarize.length > 0 || !(isSplitTurn && turnPrefixMessages.length > 0);
+	// turn with a non-empty prefix, nothing to summarize, and no previous
+	// summary to carry forward ("No prior history" needs no wire call).
+	const issuesHistoryCall =
+		messagesToSummarize.length > 0 || !!previousSummary || !(isSplitTurn && turnPrefixMessages.length > 0);
 	if (issuesHistoryCall) {
 		const promptText = buildHistorySummaryPrompt(
 			serializeConversation(convertToLlm(messagesToSummarize)),

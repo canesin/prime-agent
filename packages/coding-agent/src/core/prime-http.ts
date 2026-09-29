@@ -1,4 +1,4 @@
-/** Shared helpers for the Prime HTTP boundary used by agent traces and Prime Inference auth. */
+/** Shared helpers for the Prime HTTP boundary used by Prime Inference auth. */
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
