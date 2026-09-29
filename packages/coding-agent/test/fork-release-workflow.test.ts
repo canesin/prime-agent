@@ -8,6 +8,7 @@ interface WorkflowStep {
 	id?: string;
 	name?: string;
 	run?: string;
+	with?: Record<string, unknown>;
 }
 
 interface ForkReleaseWorkflow {
@@ -41,6 +42,11 @@ describe("canesin fork release workflow", () => {
 		});
 		expect(workflow.jobs.release.if).toBe("github.repository == 'canesin/prime-agent'");
 		expect(workflow.permissions).toEqual({ contents: "write" });
+	});
+
+	it("checks out history so the release check has a test-policy baseline", () => {
+		const checkout = loadWorkflow().jobs.release.steps.find((step) => step.name === "Checkout");
+		expect(checkout?.with?.["fetch-depth"]).toBe(0);
 	});
 
 	it("checks immutability and latest precedence before publishing all artifacts", () => {
