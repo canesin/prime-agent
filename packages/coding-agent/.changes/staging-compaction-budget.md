@@ -1,1 +1,1 @@
-- Fixed compaction summaries dropping most older history by budgeting summary input in bytes per token, and kept both the goal and the next steps when a long previous summary is shortened.
+- Fixed shortened compaction summaries losing their next steps: a long previous summary now keeps both its beginning and end.

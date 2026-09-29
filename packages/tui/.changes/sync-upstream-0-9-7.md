@@ -1,0 +1,1 @@
+- Merged upstream v0.9.7 terminal updates, including fullscreen touch interactions, clickable links, and faster paste handling.

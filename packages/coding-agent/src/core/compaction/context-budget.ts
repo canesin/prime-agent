@@ -1,11 +1,5 @@
 import type { Model } from "@earendil-works/pi-ai";
 
-/**
- * UTF-8 bytes budgeted per token. Token estimates elsewhere use chars/4; three bytes per token keeps
- * headroom for dense text and multi-byte characters without discarding most of the history.
- */
-const BUDGET_BYTES_PER_TOKEN = 3;
-
 /** Leave space for provider framing and tokenization differences. Text is budgeted in UTF-8 bytes. */
 export function summaryBudget(
 	model: Model<string>,
@@ -13,7 +7,8 @@ export function summaryBudget(
 ): { maxTokens: number; maxInputBytes: number } {
 	const window = Math.floor(model.contextWindow * 0.9);
 	const maxTokens = Math.max(1, Math.min(Math.floor(requestedOutput), model.maxTokens, Math.floor(window / 4)));
-	const maxInputBytes = (window - maxTokens - 512) * BUDGET_BYTES_PER_TOKEN;
+	// A token is at least one byte, so a byte budget equal to the token budget can never overflow.
+	const maxInputBytes = window - maxTokens - 512;
 	if (maxInputBytes < 1024) throw new Error("Model context window is too small for compaction");
 	return { maxTokens, maxInputBytes };
 }

@@ -12,11 +12,11 @@ const render = (conversation: string, previous: string | undefined) =>
 	`<conversation>\n${conversation}\n</conversation>\n\n${previous ? `<previous-summary>\n${previous}\n</previous-summary>\n\n` : ""}INSTRUCTIONS`;
 
 describe("compaction context budget", () => {
-	it("budgets input text in bytes rather than one byte per token", () => {
+	it("budgets input bytes no larger than the remaining token window", () => {
 		const model = { contextWindow: 200_000, maxTokens: 32_000 } as Model<string>;
 		const { maxTokens, maxInputBytes } = summaryBudget(model, 13_107);
 		expect(maxTokens).toBe(13_107);
-		expect(maxInputBytes).toBe((180_000 - 13_107 - 512) * 3);
+		expect(maxInputBytes).toBe(180_000 - 13_107 - 512);
 	});
 
 	it("renders every message through the caller's builder when the request fits", () => {
