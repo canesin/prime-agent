@@ -1,12 +1,21 @@
 import { existsSync } from "node:fs";
 import type { AgentContext, AgentTool } from "@earendil-works/pi-agent-core";
 import { Agent } from "@earendil-works/pi-agent-core";
-import { type AssistantMessage, fauxAssistantMessage, fauxToolCall, type Usage } from "@earendil-works/pi-ai";
+import {
+	type AssistantMessage,
+	fauxAssistantMessage,
+	fauxToolCall,
+	getApiProvider,
+	registerApiProvider,
+	type Usage,
+	unregisterApiProviders,
+} from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../../src/core/agent-session.js";
 import { AuthStorage } from "../../src/core/auth-storage.js";
 import type { ExtensionFactory } from "../../src/core/extensions/types.js";
+import { GoalContinuationGuard } from "../../src/core/goal-continuation-guard.js";
 import { GOAL_STATE_CUSTOM_TYPE, type GoalHostResponse } from "../../src/core/goals.js";
 import { ModelRegistry } from "../../src/core/model-registry.js";
 import { SessionManager } from "../../src/core/session-manager.js";
@@ -160,6 +169,299 @@ describe("AgentSession goals", () => {
 		harnesses.push(harness);
 		return harness;
 	}
+
+	it.each([
+		["", "", ""],
+		["Need approval.", "Still waiting for permission.", "Cannot proceed yet."],
+	])("pauses after three completed no-tool cycles: %j", async (...texts) => {
+		const harness = await createGoalHarness();
+		harness.setResponses([...texts.map((text) => fauxAssistantMessage(text)), fauxAssistantMessage("sentinel")]);
+		await harness.session.prompt("/goal blocked work");
+		expect(harness.session.goalState).toMatchObject({ status: "paused", continuationsUsed: 2 });
+		expect(harness.getPendingResponseCount()).toBe(1);
+	});
+
+	it("does not let historical tools exempt later idle cycles", async () => {
+		const harness = await createGoalHarness();
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("ipython", { code: "pass" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("Tool work finished."),
+			...Array.from({ length: 3 }, () => fauxAssistantMessage("Waiting.")),
+			fauxAssistantMessage("sentinel"),
+		]);
+		await harness.session.prompt("/goal blocked work");
+		expect(harness.session.goalState).toMatchObject({ status: "paused", continuationsUsed: 3 });
+		expect(harness.getPendingResponseCount()).toBe(1);
+	});
+
+	it("registers goal.pause with the real kernel host handlers and preserves accounting", async () => {
+		const harness = await createGoalHarness();
+		const handlers = (
+			harness.session as unknown as {
+				_createKernelHostHandlers(): Record<string, (payload: Record<string, unknown>) => Promise<unknown>>;
+			}
+		)._createKernelHostHandlers();
+		expect(handlers["goal.pause"]).toBeTypeOf("function");
+		harness.session.handleGoalHostRequest("goal.create", { objective: "needs approval" });
+		const before = harness.session.goalState;
+		const paused = await handlers["goal.pause"]({ reason: "  Approval required  " });
+		expect(paused).toMatchObject({ goal: { status: "paused", tokens_used: before.tokensUsed } });
+		expect(harness.sessionManager.getBranch().at(-1)).toMatchObject({
+			data: { status: "paused", lastReason: "Approval required" },
+		});
+		expect(await handlers["goal.pause"]({ reason: "another reason" })).toEqual(paused);
+	});
+
+	it("keeps pause from falling through to autonomous mode but allows user work", async () => {
+		const sessionRef: { current?: AgentSession } = {};
+		const harness = await createHarness({
+			tools: [createFauxIpythonTool(sessionRef)],
+			autonomous: { enabled: true, maxContinuations: 2 },
+		});
+		sessionRef.current = harness.session;
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("ipython", { code: 'goal.pause {"reason":"Approval required"}' }), {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage("Please approve."),
+			fauxAssistantMessage("sentinel"),
+		]);
+		await harness.session.prompt("/goal needs approval");
+		expect(harness.session.goalState.status).toBe("paused");
+		expect(harness.getPendingResponseCount()).toBe(1);
+		expect(harness.session.getAutonomousStatus()).toMatchObject({ enabled: true, continuationsUsed: 0 });
+		harness.setResponses([
+			fauxAssistantMessage("Side question answered."),
+			fauxAssistantMessage("Independent follow-up."),
+			fauxAssistantMessage("Finished."),
+			fauxAssistantMessage("sentinel"),
+		]);
+		await harness.session.prompt("Answer this side question");
+		expect(harness.getPendingResponseCount()).toBe(1);
+		expect(harness.session.getAutonomousStatus()).toMatchObject({ enabled: true, continuationsUsed: 2 });
+		expect(harness.session.goalState.status).toBe("paused");
+	});
+
+	it("persists the guard across restart and resets it on explicit resume", async () => {
+		const original = await createHarness({ persistSession: true });
+		harnesses.push(original);
+		original.setResponses([
+			fauxAssistantMessage("One"),
+			fauxAssistantMessage("Two"),
+			fauxAssistantMessage("", { stopReason: "aborted" }),
+		]);
+		await original.session.prompt("/goal blocked work");
+		const resumed = await createHarness({ existingSessionFile: original.sessionManager.getSessionFile()! });
+		harnesses.push(resumed);
+		resumed.setResponses([fauxAssistantMessage("Three"), fauxAssistantMessage("sentinel")]);
+		await resumed.session.prompt("continue");
+		expect(resumed.session.goalState.status).toBe("paused");
+		expect(resumed.getPendingResponseCount()).toBe(1);
+		const usage = resumed.session.goalState.tokensUsed;
+		resumed.setResponses([
+			fauxAssistantMessage("One"),
+			fauxAssistantMessage("Two"),
+			fauxAssistantMessage("Three"),
+			fauxAssistantMessage("sentinel"),
+		]);
+		await resumed.session.prompt("/goal resume");
+		expect(resumed.session.goalState.status).toBe("paused");
+		expect(resumed.session.goalState.tokensUsed).toBeGreaterThanOrEqual(usage);
+		expect(resumed.getPendingResponseCount()).toBe(1);
+	});
+
+	it.each([undefined, "", "   ", 12, "x".repeat(1001)])("rejects invalid pause reason %j", async (reason) => {
+		const harness = await createGoalHarness();
+		harness.session.handleGoalHostRequest("goal.create", { objective: "work" });
+		expect(() => harness.session.handleGoalHostRequest("goal.pause", { reason })).toThrow("goal.pause reason");
+		expect(harness.session.goalState.status).toBe("active");
+	});
+
+	it("accepts a trimmed 1000-codepoint pause reason", async () => {
+		const harness = await createGoalHarness();
+		harness.session.handleGoalHostRequest("goal.create", { objective: "work" });
+		harness.session.handleGoalHostRequest("goal.pause", { reason: `  ${"\u{1D11E}".repeat(1000)}  ` });
+		expect([...harness.session.goalState.lastReason!]).toHaveLength(1000);
+	});
+
+	it.each(["idle", "complete", "error", "budget_limited"])("does not downgrade %s through pause", async (status) => {
+		const harness = await createGoalHarness();
+		if (status !== "idle") harness.session.handleGoalHostRequest("goal.create", { objective: "work" });
+		if (status === "complete") harness.session.handleGoalHostRequest("goal.complete");
+		if (status === "error") {
+			harness.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminal" })]);
+			await harness.session.prompt("work");
+		}
+		if (status === "budget_limited") {
+			harness.setResponses([fauxAssistantMessage("spent"), fauxAssistantMessage("summary")]);
+			await harness.session.prompt("/goal --budget 1 work");
+		}
+		const before = harness.session.goalState;
+		expect(() => harness.session.handleGoalHostRequest("goal.pause", { reason: "blocked" })).toThrow(
+			`status ${status}`,
+		);
+		expect(harness.session.goalState).toEqual(before);
+	});
+
+	it("retains idle history through reload but resets it for an objective edit", async () => {
+		const harness = await createGoalHarness();
+		harness.setResponses([
+			fauxAssistantMessage("one"),
+			fauxAssistantMessage("two"),
+			fauxAssistantMessage("", { stopReason: "aborted" }),
+		]);
+		await harness.session.prompt("/goal first objective");
+		const provider = getApiProvider(harness.faux.api)!;
+		await harness.session.reload();
+		registerApiProvider(provider, "goal-reload-test");
+		harness.setResponses([fauxAssistantMessage("three"), fauxAssistantMessage("sentinel")]);
+		await harness.session.prompt("continue");
+		expect(harness.session.goalState.status).toBe("paused");
+		expect(harness.getPendingResponseCount()).toBe(1);
+		harness.setResponses([
+			fauxAssistantMessage("one"),
+			fauxAssistantMessage("two"),
+			fauxAssistantMessage("three"),
+			fauxAssistantMessage("sentinel"),
+		]);
+		await harness.session.prompt("/goal changed objective");
+		expect(harness.session.goalState).toMatchObject({
+			status: "paused",
+			objective: "changed objective",
+			continuationsUsed: 2,
+		});
+		expect(harness.getPendingResponseCount()).toBe(1);
+		unregisterApiProviders("goal-reload-test");
+	});
+
+	it.each([false, true])(
+		"resumes own background work once after settlement (completion notice: %s)",
+		async (notice) => {
+			const harness = await createHarness();
+			harnesses.push(harness);
+			const provisioner = (
+				harness.session as unknown as {
+					_ipythonKernelProvisioner: {
+						manager?: { hasBackgroundWork: boolean };
+						options: {
+							onBackgroundWorkChange: (active: boolean) => void;
+							hostHandlers: Record<string, (payload: Record<string, unknown>) => Promise<unknown>>;
+						};
+					};
+				}
+			)._ipythonKernelProvisioner;
+			let active = true;
+			const manager = vi
+				.spyOn(provisioner, "manager", "get")
+				.mockImplementation(() => ({ hasBackgroundWork: active }));
+			try {
+				harness.setResponses([fauxAssistantMessage("Waiting for command.")]);
+				await harness.session.prompt("/goal finish command work");
+				expect(harness.session.goalState).toMatchObject({ status: "active", continuationsUsed: 0 });
+				if (notice) {
+					harness.setResponses([fauxAssistantMessage("Command finished; waiting for settlement.")]);
+					await provisioner.options.hostHandlers["bash.completed"]({
+						pid: 123,
+						command: "test command",
+						exitCode: 0,
+					});
+					await harness.session.waitForIdle();
+					expect(harness.session.goalState.continuationsUsed).toBe(0);
+				}
+				harness.setResponses([
+					() => {
+						harness.session.handleGoalHostRequest("goal.complete");
+						return fauxAssistantMessage("Finished after settlement.");
+					},
+					fauxAssistantMessage("sentinel"),
+				]);
+				active = false;
+				provisioner.options.onBackgroundWorkChange(false);
+				provisioner.options.onBackgroundWorkChange(false);
+				await harness.session.waitForIdle();
+				expect(harness.session.goalState).toMatchObject({ status: "complete", continuationsUsed: 1 });
+				expect(harness.getPendingResponseCount()).toBe(1);
+			} finally {
+				manager.mockRestore();
+			}
+		},
+	);
+
+	it("lets an accepted completion turn own the wakeup when background work settles", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const provisioner = (
+			harness.session as unknown as {
+				_ipythonKernelProvisioner: {
+					manager?: { hasBackgroundWork: boolean };
+					options: {
+						onBackgroundWorkChange: (active: boolean) => void;
+						hostHandlers: Record<string, (payload: Record<string, unknown>) => Promise<unknown>>;
+					};
+				};
+			}
+		)._ipythonKernelProvisioner;
+		let active = true;
+		const manager = vi.spyOn(provisioner, "manager", "get").mockImplementation(() => ({ hasBackgroundWork: active }));
+		try {
+			harness.setResponses([fauxAssistantMessage("Waiting.")]);
+			await harness.session.prompt("/goal finish command work");
+			let release: () => void = () => {};
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			harness.setResponses([
+				async () => {
+					await gate;
+					harness.session.handleGoalHostRequest("goal.complete");
+					return fauxAssistantMessage("Done.");
+				},
+				fauxAssistantMessage("sentinel"),
+			]);
+			await provisioner.options.hostHandlers["bash.completed"]({ pid: 123, command: "test command", exitCode: 0 });
+			active = false;
+			provisioner.options.onBackgroundWorkChange(false);
+			release();
+			await harness.session.waitForIdle();
+			expect(harness.session.goalState).toMatchObject({ status: "complete", continuationsUsed: 0 });
+			expect(harness.getPendingResponseCount()).toBe(1);
+		} finally {
+			manager.mockRestore();
+		}
+	});
+
+	it("counts tools in the first cycle of a rehydrated goal without a guard record", async () => {
+		const original = await createHarness({ persistSession: true });
+		harnesses.push(original);
+		original.sessionManager.appendCustomEntryWithRollback(GOAL_STATE_CUSTOM_TYPE, {
+			active: true,
+			status: "active",
+			objective: "legacy work",
+			goalId: "legacy-goal",
+			tokensUsed: 0,
+			timeUsedSeconds: 0,
+			continuationsUsed: 0,
+		});
+		const sessionRef: { current?: AgentSession } = {};
+		const restored = await createHarness({
+			existingSessionFile: original.sessionManager.getSessionFile()!,
+			tools: [createFauxIpythonTool(sessionRef)],
+		});
+		sessionRef.current = restored.session;
+		harnesses.push(restored);
+		restored.setResponses([
+			fauxAssistantMessage(fauxToolCall("ipython", { code: "pass" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("Productive cycle."),
+			fauxAssistantMessage("One"),
+			fauxAssistantMessage("Two"),
+			fauxAssistantMessage("Three"),
+			fauxAssistantMessage("sentinel"),
+		]);
+		await restored.session.prompt("continue work");
+		expect(restored.session.goalState).toMatchObject({ status: "paused", continuationsUsed: 3 });
+		expect(restored.getPendingResponseCount()).toBe(1);
+	});
 
 	it("resumes an active goal after manual compaction", async () => {
 		const harness = await createGoalHarness();
@@ -1227,5 +1529,47 @@ describe("initial goal seeding from config", () => {
 		expect(newSession.goalState.status).toBe("active");
 		expect(newSession.goalState.objective).toBe("Initial goal");
 		newSession.dispose();
+	});
+});
+
+describe("goal continuation guard persistence failures", () => {
+	it.each(["complete", "tools", "reset"])("retries a failed %s write without losing state", (operation) => {
+		const persisted: unknown[] = [];
+		let fail = false;
+		const guard = new GoalContinuationGuard((state) => {
+			if (fail) throw new Error("disk write failed");
+			persisted.push({ ...state });
+		});
+		guard.reset("goal");
+		const final = fauxAssistantMessage("final");
+		const messages = [
+			{
+				role: "toolResult" as const,
+				toolCallId: "call",
+				toolName: "test",
+				content: [],
+				isError: false,
+				timestamp: 1,
+			},
+		];
+		const act = () =>
+			operation === "complete"
+				? guard.complete("goal", final)
+				: operation === "tools"
+					? guard.observe(messages)
+					: guard.reset("new-goal");
+		fail = true;
+		expect(act).toThrow("disk write failed");
+		fail = false;
+		act();
+		if (operation === "tools") {
+			expect(persisted.at(-1)).toMatchObject({ pendingTools: true });
+			guard.complete("goal", final);
+		}
+		expect(persisted.at(-1)).toMatchObject({
+			goalId: operation === "reset" ? "new-goal" : "goal",
+			idleCycles: operation === "complete" ? 1 : 0,
+		});
+		if (operation === "complete") expect(persisted.at(-1)).toHaveProperty("completedCycleId");
 	});
 });

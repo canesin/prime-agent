@@ -199,8 +199,12 @@ The bundled `goal` Python skill is a thin host-bridge client:
 ```python
 await goal.get()
 await goal.create("ship the release", token_budget=200000)
+await goal.pause("Waiting for independent approval.")
+# Only after the objective is achieved:
 await goal.complete()
 ```
+
+`goal.pause(reason)` preserves the incomplete objective and usage, with a concrete blocker reason of 1–1000 characters. Resume remains user-controlled through `/goal resume`.
 
 Goal state, persistence, token and wall-clock accounting, and continuation prompting live in `AgentSession`. When goals are disabled, the skill and `goal.*` host handlers are not registered.
 

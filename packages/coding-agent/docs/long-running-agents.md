@@ -187,14 +187,20 @@ Manage its state with:
 /goal clear
 ```
 
-The model uses the kernel-side `goal` skill to inspect or finish the objective:
+The model uses the kernel-side `goal` skill to inspect, pause, or finish the objective:
 
 ```python
 state = await goal.get()
+await goal.pause("Waiting for independent approval.")
+# Only after the objective is achieved:
 await goal.complete()
 ```
 
 Goal state records token usage, elapsed time, continuation count, and an optional explicit token budget. The harness keeps prompting an active goal after ordinary assistant turns; only `goal.complete()` marks successful completion. Creating a persistent goal is an explicit user or host action, not something the agent should infer from every task.
+
+A model can pause for an external blocker with `goal.pause(reason)`. The reason, objective, and usage remain saved; `/goal resume` resumes the goal without resetting usage. Ordinary user messages do not resume it. Tracked background commands and descendants hold automatic goal continuations until their work settles, rather than repeatedly prompting the waiting agent.
+
+As a safety bound, the host pauses after three consecutive completed cycles without tool execution. This is not a semantic progress detector: productive text-only work can pause, and tool-polling loops are not detected. Inspect `/goal status` and use `/goal resume` when continuing is appropriate.
 
 Resident daemon `get_state` summaries expose a non-sensitive goal fence (`active`, `status`, `goalId`, `updatedAt`, and optional `dispatchReceiptId`/`dispatchPhase`, or `null` when absent) so supervisors can make deterministic scheduling and crash-recovery decisions without receiving the goal objective.
 

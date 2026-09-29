@@ -51,6 +51,8 @@ export interface KernelManagerOptions {
 	env?: Record<string, string>;
 	sessionId?: string;
 	hostHandlers?: HostRequestHandlers;
+	/** Fires synchronously after aggregate background activity changes, including teardown. No initial notification. */
+	onBackgroundWorkChange?: (active: boolean) => void;
 	pythonSkills?: readonly KernelPythonSkill[];
 	/** Persist/revive the user namespace across kernel restarts and session resume. */
 	snapshot?: KernelSnapshotConfig;

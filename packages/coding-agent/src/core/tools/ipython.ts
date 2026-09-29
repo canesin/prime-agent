@@ -282,6 +282,8 @@ export interface IpythonToolOptions {
 	sessionId?: string;
 	/** Typed host request handlers for the kernel↔host bridge (rlm.run, goal.*, …). */
 	hostHandlers?: HostRequestHandlers;
+	/** Fires after the kernel's aggregate background activity changes, including teardown. */
+	onBackgroundWorkChange?: (active: boolean) => void;
 	pythonSkills?: readonly PythonSkillRuntimeInfo[];
 	/** Per-session artifact dir where the kernel namespace snapshot is stored. Omit to disable snapshots. */
 	snapshotDir?: string;
@@ -475,6 +477,7 @@ export class IpythonKernelProvisioner {
 				},
 				sessionId: this.options?.sessionId,
 				hostHandlers: this.options?.hostHandlers,
+				onBackgroundWorkChange: this.options?.onBackgroundWorkChange,
 				pythonSkills: this.options?.pythonSkills,
 				// Only persistent sessions (which have an artifact dir) get a revivable snapshot.
 				snapshot: snapshotDir

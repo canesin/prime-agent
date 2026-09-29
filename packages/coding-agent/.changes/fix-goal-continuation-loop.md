@@ -1,0 +1,2 @@
+- Added `goal.pause(reason)` to stop blocked goals while preserving the objective and usage for user-controlled resume.
+- Fixed unbounded goal re-prompts by pausing after three consecutive completed cycles without tool execution and waiting for tracked background work.

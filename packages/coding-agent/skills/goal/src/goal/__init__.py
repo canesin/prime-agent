@@ -41,12 +41,26 @@ async def create(objective: str, token_budget: int | None = None) -> dict[str, A
     return await host_request("goal.create", payload)
 
 
+async def pause(reason: str) -> dict[str, Any]:
+    """Pause an incomplete goal when progress requires external input.
+
+    Preserve the objective and usage. The user can resume with /goal resume.
+    Do not pause merely because tracked tools or child agents are still running.
+    """
+    if not isinstance(reason, str):
+        raise TypeError(f"reason must be str, got {type(reason).__name__}")
+    reason = reason.strip()
+    if not reason or len(reason) > 1000:
+        raise ValueError("pause reason must be between 1 and 1000 characters")
+    return await host_request("goal.pause", {"reason": reason})
+
+
 async def complete() -> dict[str, Any]:
     """Mark the existing thread goal achieved.
 
     Use only when the objective has actually been achieved and no required
     work remains — not because the budget is nearly exhausted or because you
-    are stopping work. Pause, resume, and budget-limit transitions are
-    controlled by the user and the host.
+    are stopping work. Use pause(reason) for an external blocker. Resume and
+    budget-limit transitions are controlled by the user and the host.
     """
     return await host_request("goal.complete")
