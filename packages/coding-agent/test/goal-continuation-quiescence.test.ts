@@ -5,7 +5,7 @@ type Harness = {
 	_goalState: { status: string; goalId?: string; objective?: string; continuationsUsed: number };
 	_goalContinuationAwaitsRlmWork: boolean;
 	_goalContinuationGuard: { observe: () => void; complete: () => boolean };
-	_hasGoalBackgroundWork: () => boolean;
+	_hasPendingBackgroundWork: () => boolean;
 	_allowGoalContinuation: (message: unknown) => boolean;
 	agent: { hasQueuedMessages: () => boolean };
 	queuedActionCount: number;
@@ -15,6 +15,7 @@ type Harness = {
 	_disposing: boolean;
 	_sessionInputAdmissionPauses: Set<symbol>;
 	_sessionInputPumpSuspended: boolean;
+	_quotaPark?: { waking?: boolean };
 	_hasUnsettledRlmQuiescenceWork: () => boolean;
 	_hasLiveBackgroundBashHandles: () => boolean;
 	_stopGoalContinuationForTerminalMessage: () => boolean;
@@ -37,7 +38,7 @@ function harness(overrides: Partial<Harness> = {}): Harness {
 		_goalState: { status: "active", goalId: "test-goal", objective: "ship it", continuationsUsed: 0 },
 		_goalContinuationAwaitsRlmWork: false,
 		_goalContinuationGuard: { observe: () => {}, complete: () => false },
-		_hasGoalBackgroundWork: Reflect.get(AgentSession.prototype, "_hasGoalBackgroundWork"),
+		_hasPendingBackgroundWork: Reflect.get(AgentSession.prototype, "_hasPendingBackgroundWork"),
 		_allowGoalContinuation: Reflect.get(AgentSession.prototype, "_allowGoalContinuation"),
 		agent: { hasQueuedMessages: () => false },
 		queuedActionCount: 0,
@@ -114,6 +115,17 @@ describe("goal continuation vs unsettled subagent work", () => {
 		maybeResume.call(paused);
 		expect(paused._admitSessionInput).toHaveBeenCalledTimes(1);
 		expect(paused._goalContinuationAwaitsRlmWork).toBe(false);
+	});
+
+	it("keeps the deferral while the session is quota-parked and resumes once the wake starts", () => {
+		const mode = harness({ _goalContinuationAwaitsRlmWork: true, _quotaPark: { waking: false } });
+		maybeResume.call(mode);
+		expect(mode._admitSessionInput).not.toHaveBeenCalled();
+		expect(mode._goalContinuationAwaitsRlmWork).toBe(true);
+
+		mode._quotaPark = { waking: true };
+		maybeResume.call(mode);
+		expect(mode._admitSessionInput).toHaveBeenCalledTimes(1);
 	});
 
 	it("keeps the deferral while the pump is suspended after an abort", () => {

@@ -74,6 +74,43 @@ describe("conditional cron follow-up regression", () => {
 		releaseResponse();
 	});
 
+	it("queues a recovered follow-up behind live human input", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const session = harness.session as unknown as ConditionalFollowUpSession & {
+			_actionStore: { unfinishedActions(): Array<{ agentMessageId?: string; priority: string }> };
+		};
+		const receiptId = "conditional-follow-up-priority";
+		session._setGoalState(activeGoal({ followUpDispatchReceiptId: receiptId, followUpDispatchPhase: "receipt" }));
+		let releaseResponse = () => {};
+		const responseGate = new Promise<void>((resolve) => {
+			releaseResponse = resolve;
+		});
+		let markStreaming = () => {};
+		const streaming = new Promise<void>((resolve) => {
+			markStreaming = resolve;
+		});
+		harness.setResponses([
+			async () => {
+				markStreaming();
+				await responseGate;
+				return fauxAssistantMessage("busy");
+			},
+			fauxAssistantMessage("recovered"),
+		]);
+		const busy = harness.session.prompt("keep the session busy");
+		await streaming;
+
+		expect(await session.recoverConditionalGoalFollowUpDelivery(receiptId, "Resume exact work.")).toBe(true);
+
+		const queued = session._actionStore
+			.unfinishedActions()
+			.find((action) => action.agentMessageId?.endsWith(receiptId));
+		expect(queued?.priority).toBe("background");
+		releaseResponse();
+		await busy;
+	});
+
 	it("persists no receipt when the exact admission fence rejects", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

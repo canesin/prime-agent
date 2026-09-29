@@ -2492,8 +2492,20 @@ export class AgentSession {
 	}
 
 	private _clearGoal(): void {
+		if (this._goalState.status === "active") this._dropQuotaParkForGoalStop("goal-cleared");
 		this._clearQueuedGoalContexts();
 		this._setGoalState(emptyGoalState());
+	}
+
+	/** A quota wake resumes the interrupted goal turn, so stopping the goal must not leave it armed. */
+	private _dropQuotaParkForGoalStop(outcome: "goal-paused" | "goal-cleared"): void {
+		const park = this._quotaPark;
+		if (!park) return;
+		this._quotaPark = undefined;
+		this.sessionManager.appendCustomEntry(QUOTA_RESUME_CUSTOM_ENTRY_TYPE, { outcome });
+		void this._cancelQuotaParkWake(park).catch(() => {
+			// Best effort: the park is already dropped, so a stale wake finds no park to resume.
+		});
 	}
 
 	private _pauseGoal(reason = "Paused by user"): void {
@@ -2507,6 +2519,7 @@ export class AgentSession {
 			this._emitGoalUpdate();
 			return;
 		}
+		this._dropQuotaParkForGoalStop("goal-paused");
 		const goal = this._goalWithAccountedWallClock();
 		this._setGoalState({
 			...goal,
@@ -2873,7 +2886,7 @@ export class AgentSession {
 
 	private _maybeResumeGoalContinuationAfterRlmWork(): void {
 		if (!this._goalContinuationAwaitsRlmWork) return;
-		if (this._disposed || this._disposing || this._hasGoalBackgroundWork()) return;
+		if (this._disposed || this._disposing || this._hasPendingBackgroundWork()) return;
 		if (this._goalState.status !== "active" || !this._goalState.objective) {
 			this._goalContinuationAwaitsRlmWork = false;
 			return;
@@ -2882,6 +2895,8 @@ export class AgentSession {
 		// (post-abort); the pause release and resumeQueuedWork retry.
 		if (this._sessionInputAdmissionPauses.size > 0 || this._sessionInputPumpSuspended) return;
 		if (this.isStreaming || this.unfinishedActionCount > 0 || this.agent.hasQueuedMessages()) return;
+		// A parked session makes no model calls; the quota resume turn re-evaluates the continuation.
+		if (this._quotaPark && !this._quotaPark.waking) return;
 		const goalBeforeResume = this._goalState;
 		try {
 			this._ensureGoalRuntimeActive();
@@ -2928,10 +2943,10 @@ export class AgentSession {
 			// The run is over: hold nothing so the hook can apply the limit.
 			return false;
 		}
-		if (!this._hasUnsettledRlmQuiescenceWork() && !this._hasLiveBackgroundBashHandles()) {
+		if (!this._hasPendingBackgroundWork()) {
 			return false;
 		}
-		// An active goal's own continuation gate owns the wake-up discipline;
+		// A goal that owns the wake-up (active, or paused since the last human input) gates it;
 		// drop any owed continuation so both are never queued.
 		if (this._goalOwnsContinuationWakeup()) {
 			this._clearAutonomousContinuationAwait();
@@ -2962,12 +2977,7 @@ export class AgentSession {
 	/** Deliver the owed continuation once descendant work settles. */
 	private _maybeResumeAutonomousContinuationAfterRlmWork(): void {
 		if (!this._autonomousContinuationAwaitsRlmWork) return;
-		if (
-			this._disposed ||
-			this._disposing ||
-			this._hasUnsettledRlmQuiescenceWork() ||
-			this._hasLiveBackgroundBashHandles()
-		) {
+		if (this._disposed || this._disposing || this._hasPendingBackgroundWork()) {
 			return;
 		}
 		if (!this._autonomousState.enabled || this._goalOwnsContinuationWakeup()) {
@@ -3119,7 +3129,7 @@ export class AgentSession {
 	private _fireAutonomousSubagentKeepAlive(): void {
 		if (!this._autonomousContinuationAwaitsRlmWork) return;
 		if (this._disposed || this._disposing) return;
-		if (!this._hasUnsettledRlmQuiescenceWork() && !this._hasLiveBackgroundBashHandles()) {
+		if (!this._hasPendingBackgroundWork()) {
 			// Descendants and background handles settled while the keep-alive
 			// was pending; the normal resume path owns delivery.
 			this._maybeResumeAutonomousContinuationAfterRlmWork();
@@ -3934,7 +3944,8 @@ export class AgentSession {
 		return autonomousMessage;
 	}
 
-	private _hasGoalBackgroundWork(): boolean {
+	/** Descendant RLM work or live background bash handles; either holds goal and autonomous continuations. */
+	private _hasPendingBackgroundWork(): boolean {
 		return this._hasUnsettledRlmQuiescenceWork() || this._hasLiveBackgroundBashHandles();
 	}
 
@@ -3954,7 +3965,7 @@ export class AgentSession {
 		)
 			return false;
 		if (this.queuedActionCount > 0 || this.agent.hasQueuedMessages()) return false;
-		if (this._hasGoalBackgroundWork()) {
+		if (this._hasPendingBackgroundWork()) {
 			this._goalContinuationAwaitsRlmWork = true;
 			return false;
 		}
@@ -4845,6 +4856,8 @@ export class AgentSession {
 		}
 
 		if (event.type === "agent_end") {
+			// Aborted runs skip the turn hooks, so tool results from an interrupted cycle land here.
+			this._goalContinuationGuard.observe(event.messages);
 			const msg =
 				this._lastAssistantMessage ??
 				(this._retryPromise ? this._findLastAssistantInMessages(event.messages) : undefined);
@@ -7110,6 +7123,8 @@ export class AgentSession {
 			queueKey: conditionalGoalFollowUpAgentMessageId(receiptId),
 			resumeIfIdle: true,
 			source: "rpc",
+			// Scheduled delivery must not outrank live human input.
+			priority: "background",
 			executionPolicy: this._turnExecutionPolicy(canStartImmediately ? "injected" : "queued"),
 			queueVisible: !canStartImmediately,
 		});
@@ -7758,10 +7773,13 @@ export class AgentSession {
 					this._emitQueueUpdate();
 					this._commitConditionalGoalProviderBoundary(preparedMessages);
 					this._commitConditionalGoalFollowUpProviderBoundary(turns);
+					// Only a person's own prompt lifts the pause block; scheduled and agent traffic is background priority.
 					if (
 						turns.some(
 							(action) =>
-								isHumanInputSource(action.source) && primaryDeliveryRecord(action).message.role === "user",
+								isHumanInputSource(action.source) &&
+								action.priority !== "background" &&
+								primaryDeliveryRecord(action).message.role === "user",
 						)
 					) {
 						this._goalPauseBlocksAutonomous = false;

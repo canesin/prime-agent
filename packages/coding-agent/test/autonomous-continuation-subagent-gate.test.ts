@@ -30,6 +30,7 @@ type FakeSession = {
 	_autonomousContinuationSuppressedMessages: WeakSet<object>;
 	_hasUnsettledRlmQuiescenceWork: () => boolean;
 	_hasLiveBackgroundBashHandles: () => boolean;
+	_hasPendingBackgroundWork: () => boolean;
 	_rlmTerminalNoticeAdmissionCount: number;
 	_admitSessionInput: ReturnType<typeof vi.fn>;
 	_createPreparedTurnAction: ReturnType<typeof vi.fn>;
@@ -86,6 +87,7 @@ function fakeSession(overrides: Partial<FakeSession> = {}): FakeSession {
 		_autonomousContinuationSuppressedMessages: new WeakSet(),
 		_hasUnsettledRlmQuiescenceWork: () => false,
 		_hasLiveBackgroundBashHandles: () => false,
+		_hasPendingBackgroundWork: Reflect.get(AgentSession.prototype, "_hasPendingBackgroundWork"),
 		_rlmTerminalNoticeAdmissionCount: 0,
 		_admitSessionInput: vi.fn(),
 		_createPreparedTurnAction: vi.fn(

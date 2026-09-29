@@ -15,7 +15,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../../src/core/agent-session.js";
 import { AuthStorage } from "../../src/core/auth-storage.js";
 import type { ExtensionFactory } from "../../src/core/extensions/types.js";
-import { GoalContinuationGuard } from "../../src/core/goal-continuation-guard.js";
+import { GOAL_CONTINUATION_GUARD_TYPE, GoalContinuationGuard } from "../../src/core/goal-continuation-guard.js";
 import { GOAL_STATE_CUSTOM_TYPE } from "../../src/core/goals.js";
 import { ModelRegistry } from "../../src/core/model-registry.js";
 import { SessionManager } from "../../src/core/session-manager.js";
@@ -244,6 +244,71 @@ describe("AgentSession goals", () => {
 		expect(harness.getPendingResponseCount()).toBe(1);
 		expect(harness.session.getAutonomousStatus()).toMatchObject({ enabled: true, continuationsUsed: 2 });
 		expect(harness.session.goalState.status).toBe("paused");
+	});
+
+	it("keeps the pause block across scheduled rpc prompts", async () => {
+		const sessionRef: { current?: AgentSession } = {};
+		const harness = await createHarness({
+			tools: [createFauxIpythonTool(sessionRef)],
+			autonomous: { enabled: true, maxContinuations: 2 },
+		});
+		sessionRef.current = harness.session;
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("ipython", { code: 'goal.pause {"reason":"Approval required"}' }), {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage("Please approve."),
+		]);
+		await harness.session.prompt("/goal needs approval");
+		expect(harness.session.goalState.status).toBe("paused");
+		harness.setResponses([fauxAssistantMessage("Scheduled check done."), fauxAssistantMessage("sentinel")]);
+
+		await harness.session.prompt("scheduled check", { source: "rpc", priority: "background" });
+
+		expect(harness.getPendingResponseCount()).toBe(1);
+		expect(harness.session.getAutonomousStatus()).toMatchObject({ enabled: true, continuationsUsed: 0 });
+	});
+
+	it("drops a pending quota wake when the goal is paused", async () => {
+		const harness = await createGoalHarness();
+		harness.session.handleGoalHostRequest("goal.create", { objective: "work" });
+		const internals = harness.session as unknown as { _quotaPark?: { parkCount: number; resumeAtMs: number } };
+		internals._quotaPark = { parkCount: 1, resumeAtMs: Date.now() + 60_000 };
+
+		harness.session.handleGoalHostRequest("goal.pause", { reason: "Approval required" });
+
+		expect(internals._quotaPark).toBeUndefined();
+		expect(harness.sessionManager.getBranch()).toContainEqual(
+			expect.objectContaining({ customType: "provider_quota_resume", data: { outcome: "goal-paused" } }),
+		);
+	});
+
+	it("counts tools from an interrupted cycle so the next reply is not idle", async () => {
+		const sessionRef: { current?: AgentSession } = {};
+		const stopTool: AgentTool = {
+			name: "stop",
+			label: "stop",
+			description: "interrupts the run",
+			parameters: Type.Object({}),
+			execute: async () => {
+				sessionRef.current?.requestAbort();
+				return { content: [{ type: "text", text: "interrupted" }], details: {} };
+			},
+		};
+		const harness = await createHarness({ tools: [stopTool] });
+		sessionRef.current = harness.session;
+		harnesses.push(harness);
+		harness.session.handleGoalHostRequest("goal.create", { objective: "work" });
+		harness.setResponses([fauxAssistantMessage(fauxToolCall("stop", {}), { stopReason: "toolUse" })]);
+
+		await harness.session.prompt("start");
+		await harness.session.waitForIdle();
+
+		const guardEntries = harness.sessionManager
+			.getBranch()
+			.filter((entry) => entry.type === "custom" && entry.customType === GOAL_CONTINUATION_GUARD_TYPE);
+		expect(guardEntries.at(-1)).toMatchObject({ data: { pendingTools: true, idleCycles: 0 } });
 	});
 
 	it("persists the guard across restart and resets it on explicit resume", async () => {
