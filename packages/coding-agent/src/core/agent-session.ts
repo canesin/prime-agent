@@ -2674,7 +2674,7 @@ export class AgentSession {
 		return true;
 	}
 
-	/** True while an active goal's continuation loop owns the session wake-ups. */
+	/** True while an active goal, or a goal paused since the last human input, owns the session wake-ups. */
 	private _goalOwnsContinuationWakeup(): boolean {
 		return (
 			this._goalState.status === "active" || (this._goalState.status === "paused" && this._goalPauseBlocksAutonomous)
@@ -3641,8 +3641,6 @@ export class AgentSession {
 		return autonomousMessage;
 	}
 
-	// The role heuristic reads an assistant-last threshold stop as "task finished" and
-	// agent.continue() cannot resume from it, so the goal continuation is queued as a session input.
 	private _hasGoalBackgroundWork(): boolean {
 		return (
 			this._ipythonKernelProvisioner?.manager?.hasBackgroundWork === true || this._hasUnsettledRlmQuiescenceWork()
@@ -3677,6 +3675,8 @@ export class AgentSession {
 		return true;
 	}
 
+	// The role heuristic reads an assistant-last threshold stop as "task finished" and
+	// agent.continue() cannot resume from it, so the goal continuation is queued as a session input.
 	private _queueGoalContinuationForThresholdCompaction(message: AssistantMessage): boolean {
 		if (message.stopReason === "error" || message.stopReason === "aborted") {
 			return false;
