@@ -7,7 +7,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as primeInferenceAuth from "../src/core/prime-inference-auth.js";
 import {
 	checkPrimeInferenceAccess,
-	fetchPrimeTeams,
 	loginPrimeInference,
 	resolvePrimeInferenceAuthConfig,
 } from "../src/core/prime-inference-auth.js";
@@ -50,6 +49,17 @@ function getAuthorization(init?: RequestInit): string | undefined {
 	const headerRecord = headers as Record<string, string | undefined>;
 	return headerRecord.Authorization ?? headerRecord.authorization;
 }
+
+/** One browser-challenge login flow: which endpoints answer, and with what key. */
+type BrowserChallengeCase = {
+	config: Record<string, string>;
+	apiBase: string;
+	key: string;
+	scope: Record<string, { read: boolean; write: boolean }>;
+	authUrl: string;
+	/** An already-present CLI key that lacks the required permission. */
+	staleKey?: string;
+};
 
 function encryptChallengeResult(publicKey: string, value: string): string {
 	return publicEncrypt(
@@ -117,48 +127,51 @@ describe("Prime Inference auth", () => {
 		expect(readFileSync(configPath, "utf8")).toBe(original);
 	});
 
-	it("fetches Prime teams across paginated responses", async () => {
-		const requestedUrls: string[] = [];
-		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-			requestedUrls.push(getUrl(input));
-			expect(getAuthorization(init)).toBe("Bearer prime-key");
-			if (requestedUrls.length === 1) {
-				return jsonResponse({
-					data: [{ teamId: "team-1", name: "Research", slug: "research", role: "admin" }],
-					total_count: 2,
-				});
-			}
-			return jsonResponse({
-				data: [{ teamId: "team-2", name: "Infra", slug: "infra", role: "member" }],
-				total_count: 2,
+	it.each([
+		[
+			"inference",
+			loginPrimeInference,
+			{ inference: { write: true } },
+			{ apiKey: "prime-cli-key", source: "prime-cli", primeTeam: null },
+		],
+	] as const)(
+		"imports a valid Prime CLI key for %s against the production API",
+		async (_label, login, scope, expected) => {
+			writeFileSync(
+				configPath,
+				JSON.stringify({ api_key: "prime-cli-key", base_url: "https://api.primeintellect.ai/api/v1" }),
+			);
+			const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				expect(getUrl(input)).toBe("https://api.primeintellect.ai/api/v1/user/whoami");
+				expect(getAuthorization(init)).toBe("Bearer prime-cli-key");
+				return jsonResponse({ data: { scope } });
 			});
-		});
+			const onAuth = vi.fn();
 
-		await expect(
-			fetchPrimeTeams("prime-key", "https://prime-api.example/api/v1", { fetchFn: fetchMock }),
-		).resolves.toEqual([
-			{ teamId: "team-1", name: "Research", slug: "research", role: "admin" },
-			{ teamId: "team-2", name: "Infra", slug: "infra", role: "member" },
-		]);
-		expect(requestedUrls).toEqual([
-			"https://prime-api.example/api/v1/user/teams?offset=0&limit=100",
-			"https://prime-api.example/api/v1/user/teams?offset=100&limit=100",
-		]);
-	});
+			await expect(login({ onAuth }, { configPath, fetchFn: fetchMock, requestTimeoutMs: 1000 })).resolves.toEqual(
+				expected,
+			);
+			expect(onAuth).not.toHaveBeenCalled();
+			expect(fetchMock).toHaveBeenCalledOnce();
+		},
+	);
 
-	it("checks Prime Inference access with Prime whoami permissions", async () => {
-		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-			expect(getUrl(input)).toBe("https://prime-api.example/api/v1/user/whoami");
-			expect(init?.method).toBe("GET");
-			expect(getAuthorization(init)).toBe("Bearer prime-key");
-			return jsonResponse({ data: { scope: { inference: { read: true, write: true } } } });
-		});
+	it.each([["inference", checkPrimeInferenceAccess, { inference: { read: true, write: true } }]] as const)(
+		"checks %s access with Prime whoami permissions",
+		async (_label, check, scope) => {
+			const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				expect(getUrl(input)).toBe("https://prime-api.example/api/v1/user/whoami");
+				expect(init?.method).toBe("GET");
+				expect(getAuthorization(init)).toBe("Bearer prime-key");
+				return jsonResponse({ data: { scope } });
+			});
 
-		await expect(
-			checkPrimeInferenceAccess("prime-key", "https://prime-api.example", { fetchFn: fetchMock }),
-		).resolves.toEqual({ ok: true });
-		expect(fetchMock).toHaveBeenCalledOnce();
-	});
+			await expect(check("prime-key", "https://prime-api.example", { fetchFn: fetchMock })).resolves.toEqual({
+				ok: true,
+			});
+			expect(fetchMock).toHaveBeenCalledOnce();
+		},
+	);
 
 	it.each([
 		[
@@ -211,7 +224,6 @@ describe("Prime Inference auth", () => {
 		vi.stubEnv("PRIME_AGENT_INFERENCE_API_BASE_URL", "  ");
 		vi.stubEnv("PRIME_AGENT_INFERENCE_FRONTEND_URL", "  ");
 		vi.stubEnv("PRIME_API_BASE_URL", "https://unrelated.example");
-		vi.stubEnv("PRIME_AGENT_TRACES_BASE_URL", "https://traces.example");
 		expect(resolvePrimeInferenceAuthConfig()).toEqual({
 			baseUrl: "https://api.primeintellect.ai",
 			frontendUrl: "https://app.primeintellect.ai",
@@ -222,35 +234,6 @@ describe("Prime Inference auth", () => {
 			baseUrl: "https://custom.example",
 			frontendUrl: "https://app.example",
 		});
-	});
-
-	it("throws contextual errors for invalid Prime whoami JSON", async () => {
-		const fetchMock = vi.fn(async (): Promise<Response> => {
-			return new Response("not json", {
-				status: 200,
-				headers: { "Content-Type": "application/json" },
-			});
-		});
-
-		await expect(
-			checkPrimeInferenceAccess("prime-key", "https://prime-api.example", { fetchFn: fetchMock }),
-		).rejects.toThrow("Prime whoami returned an invalid response");
-	});
-
-	it("imports a valid Prime CLI key", async () => {
-		writeFileSync(configPath, JSON.stringify({ api_key: "prime-cli-key" }));
-		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-			expect(getUrl(input)).toBe("https://api.primeintellect.ai/api/v1/user/whoami");
-			expect(getAuthorization(init)).toBe("Bearer prime-cli-key");
-			return jsonResponse({ data: { scope: { inference: { write: true } } } });
-		});
-		const onAuth = vi.fn();
-
-		const result = await loginPrimeInference({ onAuth }, { configPath, fetchFn: fetchMock, requestTimeoutMs: 1000 });
-
-		expect(result).toEqual({ apiKey: "prime-cli-key", source: "prime-cli", primeTeam: null });
-		expect(onAuth).not.toHaveBeenCalled();
-		expect(fetchMock).toHaveBeenCalledOnce();
 	});
 
 	it("honors cancellation before returning an imported Prime CLI key", async () => {
@@ -267,64 +250,63 @@ describe("Prime Inference auth", () => {
 
 		await expect(
 			loginPrimeInference(
-				{
-					onAuth: () => {},
-					signal: controller.signal,
-				},
+				{ onAuth: () => {}, signal: controller.signal },
 				{ configPath, fetchFn: fetchMock, requestTimeoutMs: 1000 },
 			),
 		).rejects.toThrow("Login cancelled");
 	});
 
-	it("falls back to browser login when the Prime CLI key cannot access inference", async () => {
-		writeFileSync(
-			configPath,
-			JSON.stringify({
-				api_key: "old-key",
-				base_url: "https://api.primeintellect.ai",
-				frontend_url: "https://app.primeintellect.ai",
-				inference_url: "https://api.pinference.ai/api/v1",
-			}),
-		);
+	it.each<[string, typeof loginPrimeInference, BrowserChallengeCase]>([
+		[
+			"inference",
+			loginPrimeInference,
+			{
+				config: {
+					api_key: "old-key",
+					base_url: "https://api.primeintellect.ai",
+					frontend_url: "https://app.primeintellect.ai",
+					inference_url: "https://api.pinference.ai/api/v1",
+				},
+				apiBase: "https://api.primeintellect.ai",
+				staleKey: "old-key",
+				key: "browser-key",
+				scope: { inference: { read: true, write: true } },
+				authUrl: "https://app.primeintellect.ai/dashboard/tokens/challenge?code=challenge-code",
+			},
+		],
+	])("runs the %s browser challenge when the CLI key cannot be used", async (_label, login, options) => {
+		writeFileSync(configPath, JSON.stringify(options.config));
 		let challengePublicKey = "";
 		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
 			const url = getUrl(input);
-			if (url === "https://api.primeintellect.ai/api/v1/user/whoami") {
+			if (url === `${options.apiBase}/api/v1/user/whoami`) {
 				const auth = getAuthorization(init);
-				if (auth === "Bearer old-key") {
+				// A stale CLI key without inference write must not short-circuit the challenge.
+				if (options.staleKey && auth === `Bearer ${options.staleKey}`) {
 					return jsonResponse({ data: { scope: { inference: { read: true, write: false } } } });
 				}
-				if (auth === "Bearer browser-key") {
-					return jsonResponse({ data: { scope: { inference: { read: true, write: true } } } });
-				}
+				expect(auth).toBe(`Bearer ${options.key}`);
+				return jsonResponse({ data: { scope: options.scope } });
 			}
-			if (url === "https://api.primeintellect.ai/api/v1/auth_challenge/generate") {
+			if (url === `${options.apiBase}/api/v1/auth_challenge/generate`) {
 				challengePublicKey = String(getJsonBody(init).encryptionPublicKey);
 				return jsonResponse({ challenge: "challenge-code", status_auth_token: "status-token" });
 			}
-			if (url.startsWith("https://api.primeintellect.ai/api/v1/auth_challenge/status")) {
+			if (url.startsWith(`${options.apiBase}/api/v1/auth_challenge/status`)) {
 				expect(getAuthorization(init)).toBe("Bearer status-token");
-				return jsonResponse({ result: encryptChallengeResult(challengePublicKey, "browser-key") });
+				return jsonResponse({ result: encryptChallengeResult(challengePublicKey, options.key) });
 			}
 			throw new Error(`Unexpected fetch URL: ${url}`);
 		});
 		const onAuth = vi.fn();
-		const progress: string[] = [];
 
-		const result = await loginPrimeInference(
-			{
-				onAuth,
-				onProgress: (message) => progress.push(message),
-			},
+		const result = await login(
+			{ onAuth },
 			{ configPath, fetchFn: fetchMock, pollIntervalMs: 0, requestTimeoutMs: 1000 },
 		);
 
-		expect(result).toEqual({ apiKey: "browser-key", source: "browser" });
-		expect(onAuth).toHaveBeenCalledWith({
-			url: "https://app.primeintellect.ai/dashboard/tokens/challenge?code=challenge-code",
-			instructions: "Code: challenge-code",
-		});
-		expect(progress.join("\n")).toContain("Existing Prime CLI key cannot access Prime Inference");
+		expect(result).toEqual({ apiKey: options.key, source: "browser" });
+		expect(onAuth).toHaveBeenCalledWith({ url: options.authUrl, instructions: "Code: challenge-code" });
 	});
 
 	it("rejects an expired browser challenge", async () => {

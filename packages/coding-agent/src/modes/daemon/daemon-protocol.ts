@@ -1,18 +1,11 @@
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent, ServiceTier, TextContent, Transport } from "@earendil-works/pi-ai";
-import type {
-	AgentSessionMessageDeliveryMode,
-	AgentSessionMessageReceipt,
-	AgentSessionMessageSafetyStatus,
-} from "../../core/agent-messages.js";
+import type { AgentSessionMessageDeliveryMode } from "../../core/agent-messages.js";
 import type { SessionActionRecoverySnapshot } from "../../core/agent-session.js";
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import type { AgentSessionRuntimeMetadata } from "../../core/agent-session-runtime.js";
-import type { AgentAutonomousStatus } from "../../core/autonomous.js";
-import type { BashResult } from "../../core/bash-executor.js";
 import type {
 	AgentCronDeliveryFence,
-	AgentCronJob,
 	AgentHeartbeatDeliveryMode,
 	AgentHeartbeatManagementAction,
 	AgentHeartbeatUpdateAction,
@@ -26,16 +19,13 @@ import type { DeleteSessionFileResult } from "../../core/session-file-actions.js
 import type { SessionUsageSummary } from "../../core/usage.js";
 import type {
 	AgentConnectionAgentStatus,
-	AgentConnectionHeartbeat,
 	AgentConnectionQueueMode,
-	AgentConnectionResourceSnapshot,
 	AgentConnectionRlmChildAgentSnapshot,
 	AgentConnectionSavedSessionScope,
 	AgentConnectionSavedSessionState,
 	AgentConnectionScopedModel,
 	AgentConnectionSessionContext,
 	AgentConnectionSessionEvent,
-	AgentConnectionSessionHeader,
 	AgentConnectionSessionTreeNode,
 	AgentConnectionSideQuestionEvent,
 	AgentConnectionSideQuestionTurn,
@@ -69,6 +59,7 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 19 adds daemon-held session input pauses.
 // Revision 20 lets cancellation target a prompt the session owns but has not started.
 // Revision 21 adds capability-gated, session-scoped ACP MCP server replacement.
+// Revision 22 scopes ACP MCP replacement and cleanup to a connection owner.
 // Revision 23 lets workers query the supervisor agent roster on demand.
 // Revision 24 adds the capability-gated agent-roster subscription and push.
 // Revision 25 adds capability-gated direct worker peer transport discovery.
@@ -79,8 +70,10 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 30 adds optional live Python directory metadata to session summaries.
 // Revision 31 adds structured session_recovering failure info for known-but-unaddressable sessions.
 // Revision 32 publishes the last recorded model on saved-session rows.
-export const DAEMON_SCHEMA_REVISION = 32;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-32-8612d9c6be24";
+// Revision 33 adds the capability-gated abort_and_send_queued command.
+// Revision 34 adds structured update_restarting failure info for opens fenced by an update restart.
+export const DAEMON_SCHEMA_REVISION = 34;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-34-87a4862265b9";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -98,11 +91,9 @@ export type DaemonClientCapability =
 	| "extension_ui"
 	| "slim_attach"
 	| "chunked_snapshot"
-	| "client_owned_sessions";
-export type DaemonPromptAdmissionCancellationStatus = "cancelled" | "owned" | "unknown";
-export interface DaemonPromptAdmissionCancellationResult {
-	status: DaemonPromptAdmissionCancellationStatus;
-}
+	| "client_owned_sessions"
+	// Client declaration, not a command gate: attach with it opts into heartbeats_changed pushes.
+	| "heartbeat_catalog";
 export type DaemonServerCapability =
 	| DaemonClientCapability
 	| "delete_rlm_subagent"
@@ -132,7 +123,8 @@ export type DaemonServerCapability =
 	| "conditional_cron_follow_up"
 	| "conditional_session_profile"
 	| "kernel_cwd"
-	| "direct_peer_transport";
+	| "direct_peer_transport"
+	| "abort_and_send_queued";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -158,12 +150,12 @@ export const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: readonly DaemonClientCapabili
 	"slim_attach",
 	"chunked_snapshot",
 	"client_owned_sessions",
+	"heartbeat_catalog",
 ];
 
 export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
 	...DAEMON_SUPPORTED_CLIENT_CAPABILITIES,
 	"delete_rlm_subagent",
-	"heartbeat_catalog",
 	"heartbeat_management",
 	"model_catalog",
 	"side_question_transcript",
@@ -182,6 +174,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"conditional_cron_follow_up",
 	"conditional_session_profile",
 	"kernel_cwd",
+	"abort_and_send_queued",
 ];
 
 export interface DaemonSessionProfilePrecondition {
@@ -317,8 +310,6 @@ export interface DaemonCommandEnvelope<TCommand extends DaemonCommand = DaemonCo
 	clientId?: DaemonClientId;
 	command: TCommand;
 }
-
-export type DaemonCommandWire = DaemonCommand | DaemonCommandEnvelope;
 
 export interface DaemonEventEnvelope<TEvent extends DaemonOutbound = DaemonOutbound> {
 	type: "event";
@@ -563,6 +554,7 @@ export type DaemonCommand =
 	| { id?: string; type: "agent_messages_resume"; activeSessionId?: string }
 	| { id?: string; type: "agent_messages_clear"; activeSessionId: string }
 	| { id?: string; type: "abort"; activeSessionId: string }
+	| { id?: string; type: "abort_and_send_queued"; activeSessionId: string }
 	| {
 			id?: string;
 			type: "start_side_question";
@@ -848,6 +840,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	agent_messages_resume: LEGACY_DAEMON_COMMAND,
 	agent_messages_clear: LEGACY_DAEMON_COMMAND,
 	abort: LEGACY_DAEMON_COMMAND,
+	abort_and_send_queued: { minProtocol: 7, minSchemaRevision: 33, capability: "abort_and_send_queued" },
 	start_side_question: LEGACY_DAEMON_COMMAND,
 	abort_side_question: LEGACY_DAEMON_COMMAND,
 	execute_bash: LEGACY_DAEMON_COMMAND,
@@ -929,6 +922,24 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	shutdown: LEGACY_DAEMON_COMMAND,
 } as const satisfies Record<DaemonCommandName, DaemonCommandCompatibility>;
 
+/** Commands only the supervisor serves; a worker rejects them as unknown. */
+const SUPERVISOR_ONLY_DAEMON_COMMANDS: ReadonlySet<string> = new Set([
+	"complete_owned_session",
+	"get_direct_worker_transport",
+	"list_agent_peers",
+	"promote_owned_session",
+	"reattach",
+	"roster_subscribe",
+	"roster_unsubscribe",
+] satisfies DaemonCommandName[]);
+
+/** Commands the supervisor admits: every command in the compatibility table. */
+export const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set(Object.keys(DAEMON_COMMAND_COMPATIBILITY));
+
+export const WORKER_DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set(
+	[...DAEMON_COMMAND_TYPES].filter((type) => !SUPERVISOR_ONLY_DAEMON_COMMANDS.has(type)),
+);
+
 /**
  * Which endpoint serves each command when a client holds both a supervisor
  * (control-plane) and a direct worker (session-plane) connection. Session is
@@ -967,6 +978,7 @@ export const DAEMON_COMMAND_PLANE = {
 	agent_messages_resume: "control",
 	agent_messages_clear: "control",
 	abort: "session",
+	abort_and_send_queued: "session",
 	start_side_question: "session",
 	abort_side_question: "session",
 	execute_bash: "session",
@@ -1124,6 +1136,7 @@ export type DaemonErrorInfo =
 			actualRosterToken: string;
 	  }
 	| { code: "session_recovering"; activeSessionId: string }
+	| { code: "update_restarting" }
 	| { code: "command_result_uncertain"; clientId: DaemonClientId; commandId: DaemonCommandId };
 
 export type DaemonSessionClosedReason = "killed" | "shutdown" | "completed" | "replaced" | "update";
@@ -1180,16 +1193,6 @@ export interface DaemonSavedSessionInfo {
 }
 
 export type DaemonDeleteSavedSessionResult = DeleteSessionFileResult;
-export type DaemonAutonomousStatus = AgentAutonomousStatus;
-export type DaemonBashResult = BashResult;
-export type DaemonSessionHeader = AgentConnectionSessionHeader;
-
-export type DaemonResourceSnapshot = AgentConnectionResourceSnapshot;
-
-export type DaemonCronJob = AgentCronJob;
-export type DaemonHeartbeat = AgentConnectionHeartbeat;
-export type DaemonAgentSessionMessageReceipt = AgentSessionMessageReceipt;
-export type DaemonAgentSessionMessageSafetyStatus = AgentSessionMessageSafetyStatus;
 
 export type DaemonOutbound =
 	| DaemonResponse
@@ -1358,6 +1361,26 @@ export function isDaemonCommandEnvelope(value: unknown): value is DaemonCommandE
 	);
 }
 
+export function isSessionSummary(value: unknown): value is SessionSummary {
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	const candidate = value as { id?: unknown; sessionId?: unknown; cwd?: unknown };
+	return (
+		typeof candidate.id === "string" && typeof candidate.sessionId === "string" && typeof candidate.cwd === "string"
+	);
+}
+
+export function isDaemonResponse(value: unknown): value is DaemonResponse {
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	const candidate = value as { type?: unknown; success?: unknown; command?: unknown };
+	return (
+		candidate.type === "response" && typeof candidate.success === "boolean" && typeof candidate.command === "string"
+	);
+}
+
 /**
  * Best-effort id salvage for rejected command lines, so parse failures reach
  * the sender as correlatable responses instead of client-side timeouts.
@@ -1425,22 +1448,6 @@ export const UPDATE_RESTART_DRAIN_COMMANDS: ReadonlySet<DaemonCommand["type"]> =
 	"abort_compaction",
 	"abort_retry",
 ]);
-
-export function createDaemonEventEnvelope<TEvent extends DaemonOutbound>(
-	event: TEvent,
-	meta: DaemonEventMeta,
-): DaemonEventEnvelope<TEvent> {
-	return {
-		type: "event",
-		id: meta.id,
-		protocol: meta.protocol,
-		...(meta.activeSessionId ? { activeSessionId: meta.activeSessionId } : {}),
-		...(meta.sequence !== undefined ? { sequence: meta.sequence } : {}),
-		...(meta.cursor ? { cursor: meta.cursor } : {}),
-		emittedAt: meta.emittedAt,
-		event,
-	};
-}
 
 export function createDaemonEventMeta(
 	activeSessionId: string,

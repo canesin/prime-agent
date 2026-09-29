@@ -6,11 +6,11 @@
 import { execSyncHidden, spawnSyncHidden } from "../utils/child-process.js";
 import { getShellConfig } from "../utils/shell.js";
 
-const commandResultCache = new Map<string, string | undefined>();
+const commandResultCache = new Map<string, string>();
 
 /**
  * Resolve a config value (API key, header value, etc.) to an actual value.
- * - If starts with "!", executes the rest as a shell command and uses stdout (cached)
+ * - If starts with "!", executes the rest as a shell command and uses stdout (successful results are cached)
  * - Otherwise checks environment variable first, then treats as literal (not cached)
  */
 export function resolveConfigValue(config: string): string | undefined {
@@ -82,18 +82,22 @@ function executeCommandUncached(commandConfig: string): string | undefined {
 }
 
 function executeCommand(commandConfig: string): string | undefined {
-	if (commandResultCache.has(commandConfig)) {
-		return commandResultCache.get(commandConfig);
+	const cached = commandResultCache.get(commandConfig);
+	if (cached !== undefined) {
+		return cached;
 	}
 
+	// A command that produced no value is not a resolution: a locked keychain, a
+	// missing network, or a rotated secret must be retried on the next lookup
+	// instead of pinning the failure for the lifetime of the process.
 	const result = executeCommandUncached(commandConfig);
-	commandResultCache.set(commandConfig, result);
+	if (result !== undefined) {
+		commandResultCache.set(commandConfig, result);
+	}
 	return result;
 }
 
-/**
- * Resolve all header values using the same resolution logic as API keys.
- */
+/** Like resolveConfigValue, but always re-runs "!" commands instead of reading the command-result cache. */
 export function resolveConfigValueUncached(config: string): string | undefined {
 	if (config.startsWith("!")) {
 		return executeCommandUncached(config);
@@ -112,21 +116,6 @@ export function resolveConfigValueOrThrow(config: string, description: string): 
 	}
 
 	throw new Error(`Failed to resolve ${description}`);
-}
-
-/**
- * Resolve all header values using the same resolution logic as API keys.
- */
-export function resolveHeaders(headers: Record<string, string> | undefined): Record<string, string> | undefined {
-	if (!headers) return undefined;
-	const resolved: Record<string, string> = {};
-	for (const [key, value] of Object.entries(headers)) {
-		const resolvedValue = resolveConfigValue(value);
-		if (resolvedValue) {
-			resolved[key] = resolvedValue;
-		}
-	}
-	return Object.keys(resolved).length > 0 ? resolved : undefined;
 }
 
 export function resolveHeadersOrThrow(

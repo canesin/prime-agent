@@ -58,7 +58,7 @@ describeRuntime("#2053 background kernel bash residency", () => {
 	async function start(
 		beforeCompletion?: () => Promise<void>,
 		withConfiguredAuth = true,
-		onBackgroundWorkChange?: (active: boolean) => void,
+		settled?: () => void,
 	): Promise<{ session: AgentSession; kernel: ReplKernelManager }> {
 		harness = await createHarness({ tools: [], rlmDepth: 1, withConfiguredAuth });
 		const session = harness.session;
@@ -74,7 +74,7 @@ describeRuntime("#2053 background kernel bash residency", () => {
 			cwd: harness.tempDir,
 			env: { PYTHONPATH: resolve(runtimeDir, "src") },
 			hostHandlers,
-			onBackgroundWorkChange,
+			...(settled ? { onBackgroundWorkSettled: settled } : {}),
 		});
 		const provisioner = new IpythonKernelProvisioner(harness.tempDir);
 		vi.spyOn(provisioner, "manager", "get").mockReturnValue(manager);
@@ -125,7 +125,8 @@ describeRuntime("#2053 background kernel bash residency", () => {
 	});
 
 	it("keeps concurrent handles resident until the final completion and clears on kernel teardown", async () => {
-		const { session, kernel } = await start();
+		const settled = vi.fn();
+		const { session, kernel } = await start(undefined, true, settled);
 		await kernel.execute("from rlm import bash\nfirst = bash('sleep 600')\nsecond = bash('sleep 600')");
 		expect(passivationAllowed(session)).toBe(false);
 		harness!.setResponses([fauxAssistantMessage("First command finished.")]);
@@ -135,6 +136,7 @@ describeRuntime("#2053 background kernel bash residency", () => {
 		expect(passivationAllowed(session)).toBe(false);
 
 		await kernel.kill();
+		expect(settled).toHaveBeenCalledTimes(1);
 		expect(passivationAllowed(session)).toBe(true);
 		expect(
 			session.messages.filter(
@@ -156,78 +158,65 @@ describeRuntime("#2053 background kernel bash residency", () => {
 		["awaited", "(await bash('printf done')).output"],
 		["consumed", "handle = bash('printf done')\nawait asyncio.to_thread(handle._done.wait)\nhandle.output()"],
 	])("notifies settlement of %s work without a completion notice", async (_kind, code) => {
-		const transitions: Array<{ active: boolean; observed: boolean | undefined }> = [];
+		const settlement = createDeferred<void>();
+		const settled = vi.fn(() => settlement.resolve());
 		const completed = vi.fn(async () => {});
-		const { session, kernel } = await start(completed, true, (active) => {
-			transitions.push({ active, observed: manager?.hasBackgroundWork });
-		});
-		expect(transitions).toEqual([]);
+		const { session, kernel } = await start(completed, true, settled);
 		const result = await kernel.execute(`import asyncio\nfrom rlm import bash\n${code}`);
 		expect(result.status, JSON.stringify(result.error)).toBe("ok");
 		expect(result.result).toContain("done");
-		await vi.waitFor(() => expect(kernel.hasBackgroundWork).toBe(false));
-		expect(transitions).toEqual([
-			{ active: true, observed: true },
-			{ active: false, observed: false },
-		]);
+		await settlement.promise;
+		expect(kernel.hasBackgroundWork).toBe(false);
+		expect(settled).toHaveBeenCalledTimes(1);
 		expect(completed).not.toHaveBeenCalled();
 		expect(session.messages).toEqual([]);
 	});
 
-	it.each(["kill", "shutdown", "disposeSync"] as const)(
-		"notifies only the aggregate edge with multiple live handles and %s",
+	it.each(["shutdown", "disposeSync"] as const)(
+		"notifies settlement once when %s tears down live handles",
 		async (teardown) => {
-			const transitions: Array<{ active: boolean; observed: boolean | undefined }> = [];
-			const { kernel } = await start(undefined, true, (active) => {
-				transitions.push({ active, observed: manager?.hasBackgroundWork });
-			});
+			const settled = vi.fn();
+			const { kernel } = await start(undefined, true, settled);
 			const started = await kernel.execute(
 				"from rlm import bash\nfirst = bash('sleep 600')\nsecond = bash('sleep 600')",
 			);
 			expect(started.status).toBe("ok");
-			expect(transitions).toEqual([{ active: true, observed: true }]);
-			harness!.setResponses([fauxAssistantMessage("First command finished.")]);
-			await kernel.execute("first.kill()");
-			await vi.waitFor(() => expect(harness!.session.getLastAssistantText()).toBe("First command finished."));
-			await harness!.session.waitForIdle();
-			expect(kernel.hasBackgroundWork).toBe(true);
-			expect(transitions).toEqual([{ active: true, observed: true }]);
+			expect(settled).not.toHaveBeenCalled();
 			await kernel[teardown]();
 			expect(kernel.isDefunct).toBe(true);
-			expect(kernel.isRunning).toBe(false);
-			expect(transitions).toEqual([
-				{ active: true, observed: true },
-				{ active: false, observed: false },
-			]);
+			expect(kernel.hasBackgroundWork).toBe(false);
+			expect(settled).toHaveBeenCalledTimes(1);
 			await kernel.shutdown();
-			expect(transitions).toHaveLength(2);
+			expect(settled).toHaveBeenCalledTimes(1);
 		},
 	);
 
-	it("forwards activity edges through the provisioner without callback errors breaking the kernel", async () => {
+	it("forwards settlement through the provisioner without callback errors breaking the kernel", async () => {
 		harness = await createHarness({ tools: [], rlmDepth: 1 });
-		const transitions: boolean[] = [];
+		const settlement = createDeferred<void>();
+		const settled = vi.fn(() => {
+			settlement.resolve();
+			throw new Error("settlement listener failed");
+		});
 		const provisioner = new IpythonKernelProvisioner(harness.tempDir, {
 			python,
 			env: { PYTHONPATH: resolve(runtimeDir, "src") },
-			onBackgroundWorkChange: (active) => {
-				transitions.push(active);
-				throw new Error("activity listener failed");
-			},
+			onBackgroundWorkSettled: settled,
 		});
 		try {
 			const kernel = await provisioner.ensure();
 			const result = await kernel.execute("(await bash('printf done')).output");
 			expect(result.status, JSON.stringify(result.error)).toBe("ok");
 			expect(result.result).toContain("done");
-			await vi.waitFor(() => expect(kernel.hasBackgroundWork).toBe(false));
-			expect(transitions).toEqual([true, false]);
+			await settlement.promise;
+			expect(kernel.hasBackgroundWork).toBe(false);
+			expect(settled).toHaveBeenCalledTimes(1);
 			expect((await kernel.execute("6 * 7")).result).toBe("42");
 			expect((await kernel.execute("handle = bash('sleep 600')")).status).toBe("ok");
 			await provisioner.kill();
 			expect(kernel.isDefunct).toBe(true);
 			expect(kernel.hasBackgroundWork).toBe(false);
-			expect(transitions).toEqual([true, false, true, false]);
+			expect(settled).toHaveBeenCalledTimes(2);
 		} finally {
 			await provisioner.dispose({ snapshot: false });
 		}
@@ -354,10 +343,8 @@ describeRuntime("#2053 background kernel bash residency", () => {
 
 describe("kernel bash activity validation", () => {
 	it("ignores unrelated display data and rejects malformed or mismatched releases", async () => {
-		const transitions: Array<{ active: boolean; observed: boolean }> = [];
-		const kernel = new ReplKernelManager({
-			onBackgroundWorkChange: (active) => transitions.push({ active, observed: kernel.hasBackgroundWork }),
-		});
+		const settled = vi.fn();
+		const kernel = new ReplKernelManager({ onBackgroundWorkSettled: settled });
 		const deliver = (data: Record<string, unknown>) =>
 			(kernel as unknown as { handleEvent(event: Record<string, unknown>): void }).handleEvent({
 				event: "display",
@@ -365,11 +352,10 @@ describe("kernel bash activity validation", () => {
 				data,
 			});
 		const activity = { id: "a".repeat(32), pid: 42, active: true };
-		expect(transitions).toEqual([]);
 		deliver({ [BASH_ACTIVITY_DISPLAY_MIME]: activity });
 		deliver({ [BASH_ACTIVITY_DISPLAY_MIME]: activity });
 		expect(kernel.hasBackgroundWork).toBe(true);
-		expect(transitions).toEqual([{ active: true, observed: true }]);
+		expect(settled).not.toHaveBeenCalled();
 		for (const invalid of [
 			{ ...activity, pid: 0, active: false },
 			{ ...activity, pid: -1, active: false },
@@ -386,11 +372,8 @@ describe("kernel bash activity validation", () => {
 		expect(kernel.hasBackgroundWork).toBe(true);
 		deliver({ [BASH_ACTIVITY_DISPLAY_MIME]: { ...activity, active: false } });
 		expect(kernel.hasBackgroundWork).toBe(false);
-		deliver({ [BASH_ACTIVITY_DISPLAY_MIME]: { ...activity, active: false } });
+		expect(settled).toHaveBeenCalledTimes(1);
 		await kernel.shutdown();
-		expect(transitions).toEqual([
-			{ active: true, observed: true },
-			{ active: false, observed: false },
-		]);
+		expect(settled).toHaveBeenCalledTimes(1);
 	});
 });

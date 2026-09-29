@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getModel, getSupportedThinkingLevels } from "../src/models.js";
+import { getSupportedThinkingLevels } from "../src/models.js";
 import { streamSimpleAnthropic } from "../src/providers/anthropic.js";
 import { streamOpenAICompletions, streamSimpleOpenAICompletions } from "../src/providers/openai-completions.js";
 import { streamOpenAIResponses, streamSimpleOpenAIResponses } from "../src/providers/openai-responses.js";
@@ -8,6 +8,23 @@ import type { Context, Model, ModelThinkingLevel, SimpleStreamOptions } from "..
 const context: Context = { messages: [{ role: "user", content: "hello", timestamp: 1 }] };
 
 type ZaiApi = "anthropic-messages" | "openai-completions" | "openai-responses";
+
+/** GLM-5.3 as the runtime catalog serves it: no generated thinking metadata. */
+function catalogZaiModel(id: string): Model<"openai-completions"> {
+	return {
+		api: "openai-completions",
+		id,
+		name: id,
+		provider: "zai",
+		baseUrl: "https://api.z.ai/api/coding/paas/v4",
+		compat: { supportsDeveloperRole: false, thinkingFormat: "zai", zaiToolStream: true },
+		reasoning: true,
+		input: ["text"],
+		contextWindow: 1000000,
+		maxTokens: 131072,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	};
+}
 
 function customModel<T extends ZaiApi>(api: T, id: string): Model<T> {
 	const baseUrls = {
@@ -108,7 +125,7 @@ describe("Z.ai mandatory thinking payload", () => {
 	});
 	for (const id of ["glm-5.3", "glm-5.3-flash", "glm-5.3-highspeed"] as const) {
 		it(`${id} exposes only supported reasoning levels`, () => {
-			expect(getSupportedThinkingLevels(getModel("zai", id))).toEqual(["low", "high", "max"]);
+			expect(getSupportedThinkingLevels(catalogZaiModel(id))).toEqual(["low", "high", "max"]);
 		});
 
 		it.each([
@@ -121,7 +138,7 @@ describe("Z.ai mandatory thinking payload", () => {
 			["max", "max"],
 		] satisfies [ModelThinkingLevel, string][])(`${id} maps %s to %s`, async (reasoning, effort) => {
 			let payload: unknown;
-			await streamSimpleOpenAICompletions(getModel("zai", id), context, {
+			await streamSimpleOpenAICompletions(catalogZaiModel(id), context, {
 				apiKey: "fake-key",
 				reasoning,
 				onPayload: (value) => {
@@ -136,7 +153,7 @@ describe("Z.ai mandatory thinking payload", () => {
 
 	it("preserves the model default when reasoning is omitted", async () => {
 		let payload: unknown;
-		await streamSimpleOpenAICompletions(getModel("zai", "glm-5.3"), context, {
+		await streamSimpleOpenAICompletions(catalogZaiModel("glm-5.3"), context, {
 			apiKey: "fake-key",
 			onPayload: (value) => {
 				payload = value;
@@ -150,7 +167,7 @@ describe("Z.ai mandatory thinking payload", () => {
 
 	it("honors mandatory thinking in the provider-specific API too", async () => {
 		let payload: unknown;
-		await streamOpenAICompletions(getModel("zai", "glm-5.3"), context, {
+		await streamOpenAICompletions(catalogZaiModel("glm-5.3"), context, {
 			apiKey: "fake-key",
 			reasoningEnabled: false,
 			onPayload: (value) => {

@@ -202,18 +202,6 @@ export interface DaemonClientStartupDecision {
 	listModels?: string | true;
 }
 
-export type InteractiveDaemonStartupDecision = DaemonClientStartupDecision;
-
-/** Retained for callers that only classify persistent interactive startup. */
-export function shouldUseDaemonInteractive(options: DaemonClientStartupDecision): boolean {
-	return (
-		options.appMode === "interactive" &&
-		!options.startupBenchmark &&
-		!options.noSession &&
-		options.listModels === undefined
-	);
-}
-
 export function shouldUseDaemonClient(options: DaemonClientStartupDecision): boolean {
 	return (
 		options.appMode !== "daemon" && !options.startupBenchmark && !options.help && options.listModels === undefined
@@ -1050,6 +1038,7 @@ async function createDaemonClientConnection(options: {
 	clientOwned?: boolean;
 	noSession?: boolean;
 	supportsExtensionUi?: boolean;
+	tracksHeartbeats?: boolean;
 }): Promise<{ connection: DaemonAgentConnection; summary: SessionSummary }> {
 	// Caller must have awaited ensureInteractiveDaemonRunning for this socket.
 	const client = new DaemonClient(options.socketPath);
@@ -1064,6 +1053,7 @@ async function createDaemonClientConnection(options: {
 				ownedSession: options.clientOwned,
 				ownedSessionRecoveryConfig: options.clientOwned ? options.config : undefined,
 				supportsExtensionUi: options.supportsExtensionUi,
+				tracksHeartbeats: options.tracksHeartbeats,
 				recoverDaemon: () => ensureInteractiveDaemonRunning(options.socketPath),
 				telemetryDisabled: options.config.telemetryDisabled,
 			});
@@ -1603,6 +1593,8 @@ export async function main(args: string[], options?: MainOptions) {
 				clientOwned: isClientOwnedDaemonSession(appMode, parsed.noSession),
 				noSession: parsed.noSession,
 				supportsExtensionUi: appMode === "rpc",
+				// ACP never issues a scheduled-job command, so attach opts it into heartbeats_changed pushes.
+				tracksHeartbeats: appMode === "acp",
 			}));
 		} catch (error) {
 			if (error instanceof SessionAlreadyActiveError || error instanceof DaemonSessionCreateError) {

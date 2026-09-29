@@ -1,0 +1,1 @@
+- Merged upstream v0.9.7 runtime catalog loading, keeping Z.ai GLM-5.3 mandatory-thinking levels for catalog models without generated metadata.
