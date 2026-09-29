@@ -29,6 +29,8 @@ type FakeSession = {
 	_autonomousContinuationSuppressionDepth: number;
 	_autonomousContinuationSuppressedMessages: WeakSet<object>;
 	_hasUnsettledRlmQuiescenceWork: () => boolean;
+	_hasLiveBackgroundBashHandles: () => boolean;
+	_hasPendingBackgroundWork: () => boolean;
 	_rlmTerminalNoticeAdmissionCount: number;
 	_admitSessionInput: ReturnType<typeof vi.fn>;
 	_createPreparedTurnAction: ReturnType<typeof vi.fn>;
@@ -84,6 +86,8 @@ function fakeSession(overrides: Partial<FakeSession> = {}): FakeSession {
 		_autonomousContinuationSuppressionDepth: 0,
 		_autonomousContinuationSuppressedMessages: new WeakSet(),
 		_hasUnsettledRlmQuiescenceWork: () => false,
+		_hasLiveBackgroundBashHandles: () => false,
+		_hasPendingBackgroundWork: Reflect.get(AgentSession.prototype, "_hasPendingBackgroundWork"),
 		_rlmTerminalNoticeAdmissionCount: 0,
 		_admitSessionInput: vi.fn(),
 		_createPreparedTurnAction: vi.fn(
@@ -150,6 +154,23 @@ describe("autonomous continuation vs active subagents", () => {
 		expect(vi.getTimerCount()).toBe(1);
 	});
 
+	it("holds the timer-driven continuation while a background bash handle runs without spending budget", async () => {
+		vi.useFakeTimers();
+		const session = fakeSession({ _hasLiveBackgroundBashHandles: () => true });
+		expect(await getContinuationMessages.call(session, context)).toEqual([]);
+		expect(session._autonomousContinuationAwaitsRlmWork).toBe(true);
+		expect(session._autonomousState.continuationsUsed).toBe(0);
+	});
+	it("re-polls the keep-alive instead of waking the parent while only background handles run", () => {
+		vi.useFakeTimers();
+		const session = fakeSession({ _hasLiveBackgroundBashHandles: () => true });
+		session._autonomousState.subagentKeepAliveMs = 1_000;
+		expect(holdForRlmWork.call(session, stoppedTurn)).toBe(true);
+		vi.advanceTimersByTime(1_000);
+		expect(session._admitSessionInput).not.toHaveBeenCalled();
+		expect(session._autonomousContinuationAwaitsRlmWork).toBe(true);
+		expect(vi.getTimerCount()).toBe(1);
+	});
 	it("holds without queueing behind an active goal continuation", () => {
 		vi.useFakeTimers();
 		const session = fakeSession({

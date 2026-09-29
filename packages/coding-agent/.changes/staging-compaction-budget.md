@@ -1,0 +1,1 @@
+- Fixed shortened compaction summaries losing their next steps: a long previous summary now keeps both its beginning and end.

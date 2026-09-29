@@ -3,7 +3,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-	APP_NAME,
 	ENV_AGENT_DIR,
 	PACKAGE_NAME,
 	SELF_UPDATE_INTERACTIVE_CHILD_ENV,
@@ -79,6 +78,7 @@ describe("package commands", () => {
 	});
 
 	afterEach(() => {
+		vi.restoreAllMocks();
 		vi.unstubAllGlobals();
 		process.chdir(originalCwd);
 		process.exitCode = originalExitCode;
@@ -114,54 +114,6 @@ describe("package commands", () => {
 
 		const removedSettings = JSON.parse(readFileSync(settingsPath, "utf-8")) as { packages?: string[] };
 		expect(removedSettings.packages ?? []).toHaveLength(0);
-	});
-
-	it("shows install subcommand help", async () => {
-		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-		try {
-			await expect(main(["package", "install", "--help"])).resolves.toBeUndefined();
-
-			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");
-			expect(stdout).toContain("Usage:");
-			expect(stdout).toContain(`${APP_NAME} package install <source> [--local]`);
-			expect(errorSpy).not.toHaveBeenCalled();
-			expect(process.exitCode).toBeUndefined();
-		} finally {
-			logSpy.mockRestore();
-			errorSpy.mockRestore();
-		}
-	});
-
-	it("shows a friendly error for unknown install options", async () => {
-		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-		try {
-			await expect(main(["package", "install", "--unknown"])).resolves.toBeUndefined();
-
-			const stderr = errorSpy.mock.calls.map(([message]) => String(message)).join("\n");
-			expect(stderr).toContain('Unknown option --unknown for "install".');
-			expect(stderr).toContain(`Use "${APP_NAME} --help" or "${APP_NAME} package install <source> [--local]".`);
-			expect(process.exitCode).toBe(1);
-		} finally {
-			errorSpy.mockRestore();
-		}
-	});
-
-	it("directs the removed -l package option to --local", async () => {
-		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-		try {
-			await expect(main(["package", "install", packageDir, "-l"])).resolves.toBeUndefined();
-
-			const stderr = errorSpy.mock.calls.map(([message]) => String(message)).join("\n");
-			expect(stderr).toContain('Option -l was removed. Use "--local".');
-			expect(process.exitCode).toBe(1);
-			expect(existsSync(join(agentDir, "settings.json"))).toBe(false);
-		} finally {
-			errorSpy.mockRestore();
-		}
 	});
 
 	it("rejects combining --nightly and --stable", async () => {
@@ -240,435 +192,35 @@ describe("package commands", () => {
 		}
 	});
 
-	it("treats -l as an unknown option for package update", async () => {
-		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+	interface SelfUpdateFixtureOptions {
+		/** Scope the running CLI is installed under; drives the rename/alias paths. */
+		scope?: string;
+		/** Body the update manifest fetch returns. */
+		manifest: Record<string, unknown>;
+		/** Installed package directory under node_modules; defaults to `<scope>/pi-coding-agent`. */
+		installDir?: string;
+		/** Also write a project-scoped npmCommand, to prove the global one wins. */
+		projectNpmCommand?: boolean;
+		/** Make the fake npm fail `install`, like a broken registry package. */
+		failInstall?: boolean;
+	}
 
-		try {
-			await expect(main(["package", "update", "-l"])).resolves.toBeUndefined();
-
-			const stderr = errorSpy.mock.calls.map(([message]) => String(message)).join("\n");
-			expect(stderr).toContain('Unknown option -l for "update".');
-			expect(stderr).not.toContain('Use "--local".');
-			expect(process.exitCode).toBe(1);
-		} finally {
-			errorSpy.mockRestore();
-		}
-	});
-
-	it("shows a friendly error for missing install source", async () => {
-		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-		try {
-			await expect(main(["package", "install"])).resolves.toBeUndefined();
-
-			const stderr = errorSpy.mock.calls.map(([message]) => String(message)).join("\n");
-			expect(stderr).toContain("Missing install source.");
-			expect(stderr).toContain(`Usage: ${APP_NAME} package install <source> [--local]`);
-			expect(stderr).not.toContain("at ");
-			expect(process.exitCode).toBe(1);
-		} finally {
-			errorSpy.mockRestore();
-		}
-	});
-
-	it("uses global npmCommand and the release manifest install spec for forced self updates", async () => {
+	/**
+	 * Self-update shares one fixture: a fake npm that records every invocation, an
+	 * installed-package directory for the running CLI, and a stubbed update manifest.
+	 * Installing the wrong package or prefix is the footgun these cases guard.
+	 */
+	function setupSelfUpdate(options: SelfUpdateFixtureOptions) {
 		const globalPrefix = join(tempDir, "global-prefix");
 		const projectPrefix = join(tempDir, "project-prefix");
-		const selfPackageDir = join(globalPrefix, "lib", "node_modules", "@earendil-works", "pi-coding-agent");
+		const selfPackageDir = join(
+			globalPrefix,
+			"lib",
+			"node_modules",
+			options.installDir ?? join(options.scope ?? "@earendil-works", "pi-coding-agent"),
+		);
 		const fakeNpmPath = join(tempDir, "fake-npm.cjs");
 		const recordPath = join(tempDir, "self-update.json");
-		const release = forkManifest(VERSION);
-		const tarballUrl = release.tarball;
-		mkdirSync(selfPackageDir, { recursive: true });
-		mkdirSync(join(projectDir, ".prime", "agent"), { recursive: true });
-		writeFileSync(
-			fakeNpmPath,
-			`const fs=require("node:fs"),path=require("node:path"),args=process.argv.slice(2),prefix=args[args.indexOf("--prefix")+1];
-if(args.includes("root")) console.log(path.join(prefix,"lib","node_modules"));
-else {
-	const records=fs.existsSync(${JSON.stringify(recordPath)})?JSON.parse(fs.readFileSync(${JSON.stringify(recordPath)},"utf-8")):[];
-	records.push(args);
-	fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(records));
-}
-`,
-		);
-		writeFileSync(
-			join(agentDir, "settings.json"),
-			JSON.stringify({ npmCommand: [originalExecPath, fakeNpmPath, "--prefix", globalPrefix] }, null, 2),
-		);
-		writeFileSync(
-			join(projectDir, ".prime", "agent", "settings.json"),
-			JSON.stringify({ npmCommand: [originalExecPath, fakeNpmPath, "--prefix", projectPrefix] }, null, 2),
-		);
-		process.env.PI_PACKAGE_DIR = selfPackageDir;
-		Object.defineProperty(process, "execPath", {
-			value: join(selfPackageDir, "dist", "cli.js"),
-			configurable: true,
-		});
-		const fetchMock = vi.fn(async () => Response.json(release));
-		vi.stubGlobal("fetch", fetchMock);
-
-		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-		try {
-			await expect(runSelfUpdateInstallChild(["update", "--self", "--force"])).resolves.toBeUndefined();
-
-			expect(process.exitCode).toBeUndefined();
-			expect(errorSpy).not.toHaveBeenCalled();
-			expect(fetchMock).toHaveBeenCalledOnce();
-			const recordedCalls = JSON.parse(readFileSync(recordPath, "utf-8")) as string[][];
-			expect(recordedCalls).toEqual([
-				expect.arrayContaining([globalPrefix, "install", "-g", tarballUrl]),
-				expect.arrayContaining([globalPrefix, "uninstall", "-g", PACKAGE_NAME]),
-			]);
-			expect(recordedCalls.flat()).not.toContain(projectPrefix);
-		} finally {
-			logSpy.mockRestore();
-			errorSpy.mockRestore();
-		}
-	});
-
-	it("installs the canonical fork tarball when a newer release exists", async () => {
-		const globalPrefix = join(tempDir, "global-prefix");
-		const selfPackageDir = join(globalPrefix, "lib", "node_modules", "@mariozechner", "pi-coding-agent");
-		const fakeNpmPath = join(tempDir, "fake-npm.cjs");
-		const recordPath = join(tempDir, "self-update.json");
-		mkdirSync(selfPackageDir, { recursive: true });
-		writeFileSync(
-			fakeNpmPath,
-			`const fs=require("node:fs"),path=require("node:path"),args=process.argv.slice(2),prefix=args[args.indexOf("--prefix")+1];
-if(args.includes("root")) console.log(path.join(prefix,"lib","node_modules"));
-else {
-	const records=fs.existsSync(${JSON.stringify(recordPath)})?JSON.parse(fs.readFileSync(${JSON.stringify(recordPath)},"utf-8")):[];
-	records.push(args);
-	fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(records));
-}
-`,
-		);
-		writeFileSync(
-			join(agentDir, "settings.json"),
-			JSON.stringify({ npmCommand: [originalExecPath, fakeNpmPath, "--prefix", globalPrefix] }, null, 2),
-		);
-		process.env.PI_PACKAGE_DIR = selfPackageDir;
-		Object.defineProperty(process, "execPath", {
-			value: join(selfPackageDir, "dist", "cli.js"),
-			configurable: true,
-		});
-		const release = forkManifest(getNewerPatchVersion());
-		const tarballUrl = release.tarball;
-		const fetchMock = vi.fn(async () => Response.json(release));
-		vi.stubGlobal("fetch", fetchMock);
-
-		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-		try {
-			await expect(runSelfUpdateInstallChild(["update", "--self", "--force"])).resolves.toBeUndefined();
-
-			expect(process.exitCode).toBeUndefined();
-			expect(errorSpy).not.toHaveBeenCalled();
-			expect(fetchMock).toHaveBeenCalledOnce();
-			const recordedCalls = JSON.parse(readFileSync(recordPath, "utf-8")) as string[][];
-			expect(recordedCalls).toEqual([
-				expect.arrayContaining(["install", "-g", tarballUrl]),
-				expect.arrayContaining(["uninstall", "-g", PACKAGE_NAME]),
-			]);
-		} finally {
-			logSpy.mockRestore();
-			errorSpy.mockRestore();
-		}
-	});
-
-	it("replaces the installed package with the canonical fork package during self-update", async () => {
-		const globalPrefix = join(tempDir, "global-prefix");
-		const selfPackageDir = join(globalPrefix, "lib", "node_modules", "@mariozechner", "pi-coding-agent");
-		const fakeNpmPath = join(tempDir, "fake-npm.cjs");
-		const recordPath = join(tempDir, "self-update.json");
-		mkdirSync(selfPackageDir, { recursive: true });
-		writeFileSync(
-			fakeNpmPath,
-			`const fs=require("node:fs"),path=require("node:path"),args=process.argv.slice(2),prefix=args[args.indexOf("--prefix")+1];
-if(args.includes("root")) console.log(path.join(prefix,"lib","node_modules"));
-else {
-	const records=fs.existsSync(${JSON.stringify(recordPath)})?JSON.parse(fs.readFileSync(${JSON.stringify(recordPath)},"utf-8")):[];
-	records.push(args);
-	fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(records));
-}
-`,
-		);
-		writeFileSync(
-			join(agentDir, "settings.json"),
-			JSON.stringify({ npmCommand: [originalExecPath, fakeNpmPath, "--prefix", globalPrefix] }, null, 2),
-		);
-		process.env.PI_PACKAGE_DIR = selfPackageDir;
-		Object.defineProperty(process, "execPath", {
-			value: join(selfPackageDir, "dist", "cli.js"),
-			configurable: true,
-		});
-		vi.stubGlobal(
-			"fetch",
-			vi.fn(async () => Response.json(forkManifest("0.73.0"))),
-		);
-
-		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-		try {
-			await expect(runSelfUpdateInstallChild(["update", "--self", "--force"])).resolves.toBeUndefined();
-
-			expect(process.exitCode).toBeUndefined();
-			expect(errorSpy).not.toHaveBeenCalled();
-			const recordedCalls = JSON.parse(readFileSync(recordPath, "utf-8")) as string[][];
-			expect(recordedCalls).toEqual([
-				expect.arrayContaining([
-					"install",
-					"-g",
-					"https://github.com/canesin/prime-agent/releases/download/v0.73.0/prime-agent-0.73.0.tgz",
-				]),
-				expect.arrayContaining(["uninstall", "-g", PACKAGE_NAME]),
-			]);
-		} finally {
-			logSpy.mockRestore();
-			errorSpy.mockRestore();
-		}
-	});
-
-	it("fails closed without running npm when the fork release manifest is off-origin", async () => {
-		const globalPrefix = join(tempDir, "global-prefix");
-		const selfPackageDir = join(globalPrefix, "lib", "node_modules", "prime-agent");
-		const fakeNpmPath = join(tempDir, "fake-npm.cjs");
-		const recordPath = join(tempDir, "self-update.json");
-		mkdirSync(selfPackageDir, { recursive: true });
-		writeFileSync(
-			fakeNpmPath,
-			`const fs=require("node:fs"),path=require("node:path"),args=process.argv.slice(2),prefix=args[args.indexOf("--prefix")+1];
-if(args.includes("root")) console.log(path.join(prefix,"lib","node_modules"));
-else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
-`,
-		);
-		writeFileSync(
-			join(agentDir, "settings.json"),
-			JSON.stringify({ npmCommand: [originalExecPath, fakeNpmPath, "--prefix", globalPrefix] }, null, 2),
-		);
-		process.env.PI_PACKAGE_DIR = selfPackageDir;
-		Object.defineProperty(process, "execPath", {
-			value: join(selfPackageDir, "dist", "cli.js"),
-			configurable: true,
-		});
-		vi.stubGlobal(
-			"fetch",
-			vi.fn(async () =>
-				Response.json({
-					...forkManifest("0.73.0"),
-					tarball:
-						"https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.73.0/prime-agent-0.73.0.tgz",
-				}),
-			),
-		);
-
-		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-		try {
-			await expect(runSelfUpdateInstallChild(["update", "--self", "--force"])).resolves.toBeUndefined();
-
-			expect(process.exitCode).toBe(1);
-			expect(errorSpy.mock.calls.map(([message]) => String(message)).join("\n")).toContain(
-				"Could not resolve an installable fork release; update cancelled.",
-			);
-			expect(existsSync(recordPath)).toBe(false);
-		} finally {
-			logSpy.mockRestore();
-			errorSpy.mockRestore();
-		}
-	});
-
-	it("treats a channel that is behind the installed version as nothing to update", async () => {
-		const globalPrefix = join(tempDir, "global-prefix");
-		const selfPackageDir = join(globalPrefix, "lib", "node_modules", "@earendil-works", "pi-coding-agent");
-		const fakeNpmPath = join(tempDir, "fake-npm.cjs");
-		const recordPath = join(tempDir, "self-update.json");
-		mkdirSync(selfPackageDir, { recursive: true });
-		writeFileSync(
-			fakeNpmPath,
-			`const fs=require("node:fs"),path=require("node:path"),args=process.argv.slice(2),prefix=args[args.indexOf("--prefix")+1];
-if(args.includes("root")) console.log(path.join(prefix,"lib","node_modules"));
-else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
-`,
-		);
-		writeFileSync(
-			join(agentDir, "settings.json"),
-			JSON.stringify({ npmCommand: [originalExecPath, fakeNpmPath, "--prefix", globalPrefix] }, null, 2),
-		);
-		process.env.PI_PACKAGE_DIR = selfPackageDir;
-		process.env.PRIME_AGENT_DOWNLOAD_BASE_URL = "https://downloads.example.test/prime-agent";
-		Object.defineProperty(process, "execPath", {
-			value: join(selfPackageDir, "dist", "cli.js"),
-			configurable: true,
-		});
-		vi.stubGlobal(
-			"fetch",
-			vi.fn(async () => Response.json(forkManifest("0.0.1"))),
-		);
-		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-		try {
-			await expect(runSelfUpdateInstallChild(["update", "--self"])).resolves.toBeUndefined();
-
-			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");
-			expect(stdout).toContain("is ahead of the stable channel");
-			expect(process.exitCode).toBe(SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE);
-			expect(existsSync(recordPath)).toBe(false);
-		} finally {
-			logSpy.mockRestore();
-			errorSpy.mockRestore();
-		}
-	});
-
-	it("refuses a downgrade even with --nightly --force and leaves the channel unchanged", async () => {
-		const globalPrefix = join(tempDir, "global-prefix");
-		const selfPackageDir = join(globalPrefix, "lib", "node_modules", "@earendil-works", "pi-coding-agent");
-		const fakeNpmPath = join(tempDir, "fake-npm.cjs");
-		const recordPath = join(tempDir, "self-update.json");
-		mkdirSync(selfPackageDir, { recursive: true });
-		writeFileSync(
-			fakeNpmPath,
-			`const fs=require("node:fs"),path=require("node:path"),args=process.argv.slice(2),prefix=args[args.indexOf("--prefix")+1];
-if(args.includes("root")) console.log(path.join(prefix,"lib","node_modules"));
-else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
-`,
-		);
-		writeFileSync(
-			join(agentDir, "settings.json"),
-			JSON.stringify({ npmCommand: [originalExecPath, fakeNpmPath, "--prefix", globalPrefix] }, null, 2),
-		);
-		process.env.PI_PACKAGE_DIR = selfPackageDir;
-		process.env.PRIME_AGENT_DOWNLOAD_BASE_URL = "https://downloads.example.test/prime-agent";
-		Object.defineProperty(process, "execPath", {
-			value: join(selfPackageDir, "dist", "cli.js"),
-			configurable: true,
-		});
-		vi.stubGlobal(
-			"fetch",
-			vi.fn(async () => Response.json(forkManifest("0.0.1-beta.1.1.abcdef0"))),
-		);
-		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-		try {
-			await expect(runSelfUpdateInstallChild(["update", "--self", "--nightly", "--force"])).resolves.toBeUndefined();
-
-			const stderr = errorSpy.mock.calls.map(([message]) => String(message)).join("\n");
-			expect(stderr).toContain("that is a downgrade");
-			expect(existsSync(recordPath)).toBe(false);
-			expect(JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8")).updateChannel).toBeUndefined();
-		} finally {
-			logSpy.mockRestore();
-			errorSpy.mockRestore();
-		}
-	});
-
-	it("installs the Prime Agent tarball from the update manifest during self-update", async () => {
-		const globalPrefix = join(tempDir, "global-prefix");
-		const selfPackageDir = join(globalPrefix, "lib", "node_modules", "@earendil-works", "pi-coding-agent");
-		const fakeNpmPath = join(tempDir, "fake-npm.cjs");
-		const recordPath = join(tempDir, "self-update.json");
-		const release = forkManifest("0.73.0");
-		mkdirSync(selfPackageDir, { recursive: true });
-		writeFileSync(
-			fakeNpmPath,
-			`const fs=require("node:fs"),path=require("node:path"),args=process.argv.slice(2),prefix=args[args.indexOf("--prefix")+1];
-if(args.includes("root")) console.log(path.join(prefix,"lib","node_modules"));
-else {
-	const records=fs.existsSync(${JSON.stringify(recordPath)})?JSON.parse(fs.readFileSync(${JSON.stringify(recordPath)},"utf-8")):[];
-	records.push(args);
-	fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(records));
-}
-`,
-		);
-		writeFileSync(
-			join(agentDir, "settings.json"),
-			JSON.stringify({ npmCommand: [originalExecPath, fakeNpmPath, "--prefix", globalPrefix] }, null, 2),
-		);
-		process.env.PI_PACKAGE_DIR = selfPackageDir;
-		Object.defineProperty(process, "execPath", {
-			value: join(selfPackageDir, "dist", "cli.js"),
-			configurable: true,
-		});
-		vi.stubGlobal(
-			"fetch",
-			vi.fn(async () => Response.json(release)),
-		);
-
-		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-		try {
-			await expect(runSelfUpdateInstallChild(["update", "--self", "--force"])).resolves.toBeUndefined();
-
-			expect(process.exitCode).toBeUndefined();
-			expect(errorSpy).not.toHaveBeenCalled();
-			const recordedCalls = JSON.parse(readFileSync(recordPath, "utf-8")) as string[][];
-			expect(recordedCalls).toEqual([
-				expect.arrayContaining(["install", "-g", release.tarball]),
-				expect.arrayContaining(["uninstall", "-g", PACKAGE_NAME]),
-			]);
-		} finally {
-			logSpy.mockRestore();
-			errorSpy.mockRestore();
-		}
-	});
-
-	it("does not self-update when the same-version manifest uses the Prime Agent package alias", async () => {
-		const globalPrefix = join(tempDir, "global-prefix");
-		const selfPackageDir = join(globalPrefix, "lib", "node_modules", "@earendil-works", "pi-coding-agent");
-		const fakeNpmPath = join(tempDir, "fake-npm.cjs");
-		const recordPath = join(tempDir, "self-update.json");
-		mkdirSync(selfPackageDir, { recursive: true });
-		writeFileSync(
-			fakeNpmPath,
-			`const fs=require("node:fs"),path=require("node:path"),args=process.argv.slice(2),prefix=args[args.indexOf("--prefix")+1];
-if(args.includes("root")) console.log(path.join(prefix,"lib","node_modules"));
-else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
-`,
-		);
-		writeFileSync(
-			join(agentDir, "settings.json"),
-			JSON.stringify({ npmCommand: [originalExecPath, fakeNpmPath, "--prefix", globalPrefix] }, null, 2),
-		);
-		process.env.PI_PACKAGE_DIR = selfPackageDir;
-		Object.defineProperty(process, "execPath", {
-			value: join(selfPackageDir, "dist", "cli.js"),
-			configurable: true,
-		});
-		vi.stubGlobal(
-			"fetch",
-			vi.fn(async () => Response.json(forkManifest(VERSION))),
-		);
-
-		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-		try {
-			await expect(main(["update"])).resolves.toBeUndefined();
-
-			expect(process.exitCode).toBeUndefined();
-			expect(errorSpy).not.toHaveBeenCalled();
-			expect(logSpy.mock.calls.map(([message]) => String(message)).join("\n")).toContain("is already up to date");
-			expect(existsSync(recordPath)).toBe(false);
-		} finally {
-			logSpy.mockRestore();
-			errorSpy.mockRestore();
-		}
-	});
-
-	it("fails self-update when canonical fork package installation fails", async () => {
-		const globalPrefix = join(tempDir, "global-prefix");
-		const selfPackageDir = join(globalPrefix, "lib", "node_modules", "@mariozechner", "pi-coding-agent");
-		const fakeNpmPath = join(tempDir, "fake-npm-fail.cjs");
-		const recordPath = join(tempDir, "self-update-fail.json");
 		mkdirSync(selfPackageDir, { recursive: true });
 		writeFileSync(
 			fakeNpmPath,
@@ -680,46 +232,155 @@ if(args.includes("root")) {
 const records=fs.existsSync(${JSON.stringify(recordPath)})?JSON.parse(fs.readFileSync(${JSON.stringify(recordPath)},"utf-8")):[];
 records.push(args);
 fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(records));
-if(args.includes("install")) process.exit(23);
+${options.failInstall ? 'if(args.includes("install")) process.exit(23);' : ""}
 `,
 		);
 		writeFileSync(
 			join(agentDir, "settings.json"),
 			JSON.stringify({ npmCommand: [originalExecPath, fakeNpmPath, "--prefix", globalPrefix] }, null, 2),
 		);
+		if (options.projectNpmCommand) {
+			mkdirSync(join(projectDir, ".prime", "agent"), { recursive: true });
+			writeFileSync(
+				join(projectDir, ".prime", "agent", "settings.json"),
+				JSON.stringify({ npmCommand: [originalExecPath, fakeNpmPath, "--prefix", projectPrefix] }, null, 2),
+			);
+		}
 		process.env.PI_PACKAGE_DIR = selfPackageDir;
 		Object.defineProperty(process, "execPath", {
 			value: join(selfPackageDir, "dist", "cli.js"),
 			configurable: true,
 		});
-		vi.stubGlobal(
-			"fetch",
-			vi.fn(async () => Response.json(forkManifest("0.73.0"))),
-		);
-
+		const fetchMock = vi.fn(async () => Response.json(options.manifest));
+		vi.stubGlobal("fetch", fetchMock);
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
-		try {
-			await expect(main(["update", "--force"])).resolves.toBeUndefined();
+		return {
+			globalPrefix,
+			projectPrefix,
+			fetchMock,
+			errorSpy,
+			stdout: () => logSpy.mock.calls.map(([message]) => String(message)).join("\n"),
+			stderr: () => errorSpy.mock.calls.map(([message]) => String(message)).join("\n"),
+			/** Every argv the fake npm saw, in order. */
+			npmCalls: () => JSON.parse(readFileSync(recordPath, "utf-8")) as string[][],
+			ranNpm: () => existsSync(recordPath),
+		};
+	}
 
-			expect(process.exitCode).toBe(1);
-			const stdout = logSpy.mock.calls.map(([message]) => String(message)).join("\n");
-			const stderr = errorSpy.mock.calls.map(([message]) => String(message)).join("\n");
-			expect(stdout).not.toContain(`Updated pi`);
-			expect(stderr).toContain("exited with code 23");
-			const recordedCalls = JSON.parse(readFileSync(recordPath, "utf-8")) as string[][];
-			expect(recordedCalls).toEqual([
-				expect.arrayContaining([
-					"install",
-					"-g",
-					"https://github.com/canesin/prime-agent/releases/download/v0.73.0/prime-agent-0.73.0.tgz",
-				]),
-			]);
-		} finally {
-			logSpy.mockRestore();
-			errorSpy.mockRestore();
-		}
+	it("uses global npmCommand and the release manifest install spec for forced self updates", async () => {
+		const release = forkManifest(VERSION);
+		const fixture = setupSelfUpdate({ manifest: release, projectNpmCommand: true });
+
+		await expect(runSelfUpdateInstallChild(["update", "--self", "--force"])).resolves.toBeUndefined();
+
+		expect(process.exitCode).toBeUndefined();
+		expect(fixture.errorSpy).not.toHaveBeenCalled();
+		expect(fixture.fetchMock).toHaveBeenCalledOnce();
+		expect(fixture.npmCalls()).toEqual([
+			expect.arrayContaining([fixture.globalPrefix, "install", "-g", release.tarball]),
+			expect.arrayContaining([fixture.globalPrefix, "uninstall", "-g", PACKAGE_NAME]),
+		]);
+		expect(fixture.npmCalls().flat()).not.toContain(fixture.projectPrefix);
+	});
+
+	it("installs the canonical fork tarball when a newer release exists", async () => {
+		const release = forkManifest(getNewerPatchVersion());
+		const fixture = setupSelfUpdate({ scope: "@mariozechner", manifest: release });
+
+		await expect(runSelfUpdateInstallChild(["update", "--self", "--force"])).resolves.toBeUndefined();
+
+		expect(process.exitCode).toBeUndefined();
+		expect(fixture.errorSpy).not.toHaveBeenCalled();
+		expect(fixture.fetchMock).toHaveBeenCalledOnce();
+		expect(fixture.npmCalls()).toEqual([
+			expect.arrayContaining(["install", "-g", release.tarball]),
+			expect.arrayContaining(["uninstall", "-g", PACKAGE_NAME]),
+		]);
+	});
+
+	it("replaces the installed package with the canonical fork package during self-update", async () => {
+		const release = forkManifest("0.73.0");
+		const fixture = setupSelfUpdate({ scope: "@mariozechner", manifest: release });
+
+		await expect(runSelfUpdateInstallChild(["update", "--self", "--force"])).resolves.toBeUndefined();
+
+		expect(process.exitCode).toBeUndefined();
+		expect(fixture.errorSpy).not.toHaveBeenCalled();
+		expect(fixture.npmCalls()).toEqual([
+			expect.arrayContaining([
+				"install",
+				"-g",
+				"https://github.com/canesin/prime-agent/releases/download/v0.73.0/prime-agent-0.73.0.tgz",
+			]),
+			expect.arrayContaining(["uninstall", "-g", PACKAGE_NAME]),
+		]);
+	});
+
+	it("fails closed without running npm when the fork release manifest is off-origin", async () => {
+		const fixture = setupSelfUpdate({
+			installDir: "prime-agent",
+			manifest: {
+				...forkManifest("0.73.0"),
+				tarball:
+					"https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.73.0/prime-agent-0.73.0.tgz",
+			},
+		});
+
+		await expect(runSelfUpdateInstallChild(["update", "--self", "--force"])).resolves.toBeUndefined();
+
+		expect(process.exitCode).toBe(1);
+		expect(fixture.stderr()).toContain("Could not resolve an installable fork release; update cancelled.");
+		expect(fixture.ranNpm()).toBe(false);
+	});
+
+	it("treats a channel that is behind the installed version as nothing to update", async () => {
+		const fixture = setupSelfUpdate({ manifest: forkManifest("0.0.1") });
+
+		await expect(runSelfUpdateInstallChild(["update", "--self"])).resolves.toBeUndefined();
+
+		expect(fixture.stdout()).toContain("is ahead of the stable channel");
+		expect(process.exitCode).toBe(SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE);
+		expect(fixture.ranNpm()).toBe(false);
+	});
+
+	it("refuses a downgrade even with --nightly --force and leaves the channel unchanged", async () => {
+		const fixture = setupSelfUpdate({ manifest: forkManifest("0.0.1-beta.1.1.abcdef0") });
+
+		await expect(runSelfUpdateInstallChild(["update", "--self", "--nightly", "--force"])).resolves.toBeUndefined();
+
+		expect(fixture.stderr()).toContain("that is a downgrade");
+		expect(fixture.ranNpm()).toBe(false);
+		expect(JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8")).updateChannel).toBeUndefined();
+	});
+
+	it("does not self-update when the same-version manifest uses the Prime Agent package alias", async () => {
+		const fixture = setupSelfUpdate({ manifest: forkManifest(VERSION) });
+
+		await expect(main(["update"])).resolves.toBeUndefined();
+
+		expect(process.exitCode).toBeUndefined();
+		expect(fixture.errorSpy).not.toHaveBeenCalled();
+		expect(fixture.stdout()).toContain("is already up to date");
+		expect(fixture.ranNpm()).toBe(false);
+	});
+
+	it("fails self-update when canonical fork package installation fails", async () => {
+		const fixture = setupSelfUpdate({ scope: "@mariozechner", manifest: forkManifest("0.73.0"), failInstall: true });
+
+		await expect(main(["update", "--force"])).resolves.toBeUndefined();
+
+		expect(process.exitCode).toBe(1);
+		expect(fixture.stdout()).not.toContain("Updated pi");
+		expect(fixture.stderr()).toContain("exited with code 23");
+		expect(fixture.npmCalls()).toEqual([
+			expect.arrayContaining([
+				"install",
+				"-g",
+				"https://github.com/canesin/prime-agent/releases/download/v0.73.0/prime-agent-0.73.0.tgz",
+			]),
+		]);
 	});
 
 	it("suggests the configured source when update input omits the npm prefix", async () => {

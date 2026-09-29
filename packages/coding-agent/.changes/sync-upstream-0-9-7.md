@@ -1,0 +1,1 @@
+- Merged upstream v0.9.7: runtime model and MCP catalogs, service tiers, image-model routing, quota parking, incident forensics, and async cron persistence, with fork contracts preserved for goal pause guards, conditional cron recovery, bounded compaction input, fork releases, and daemon schema 34.

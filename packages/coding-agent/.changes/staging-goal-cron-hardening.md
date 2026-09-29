@@ -1,0 +1,2 @@
+- Fixed paused goals resuming through scheduled prompts or a pending quota wake, and fixed interrupted tool cycles counting toward the idle goal pause.
+- Fixed conditional cron recovery running during update restarts, spending its retry budget twice under overlapping triggers, and exceeding its attempt bound after failed recoveries.

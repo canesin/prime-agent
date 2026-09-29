@@ -7,6 +7,7 @@ export function summaryBudget(
 ): { maxTokens: number; maxInputBytes: number } {
 	const window = Math.floor(model.contextWindow * 0.9);
 	const maxTokens = Math.max(1, Math.min(Math.floor(requestedOutput), model.maxTokens, Math.floor(window / 4)));
+	// A token is at least one byte, so a byte budget equal to the token budget can never overflow.
 	const maxInputBytes = window - maxTokens - 512;
 	if (maxInputBytes < 1024) throw new Error("Model context window is too small for compaction");
 	return { maxTokens, maxInputBytes };
@@ -27,23 +28,35 @@ export function truncateUtf8(text: string, maxBytes: number, keepEnd = false): s
 	return bytes.subarray(0, end).toString("utf8");
 }
 
-/** Retain whole recent messages where possible, and disclose any omitted prefix. */
+/** Keep both ends of an over-long summary: its goal leads and its next steps close it. */
+function truncateMiddleUtf8(text: string, maxBytes: number): string {
+	if (Buffer.byteLength(text) <= maxBytes) return text;
+	const marker = "\n[... earlier summary details omitted ...]\n";
+	const available = maxBytes - Buffer.byteLength(marker);
+	if (available <= 0) return truncateUtf8(text, maxBytes, true);
+	const head = truncateUtf8(text, Math.floor(available / 2));
+	return `${head}${marker}${truncateUtf8(text, available - Buffer.byteLength(head), true)}`;
+}
+
+/**
+ * Retain whole recent messages where possible, and disclose any omitted prefix. `render` builds the
+ * complete prompt from the retained conversation text and previous summary, so the request shape is
+ * owned by the caller's prompt builder.
+ */
 export function boundedSummaryPrompt(
 	conversations: string[],
-	instructions: string,
+	render: (conversation: string, previousSummary: string | undefined) => string,
 	previousSummary: string | undefined,
 	maxBytes: number,
 ): string {
 	const omission = "[Older history omitted from this request; consult rlm.history in the session to recover it.]\n";
-	const wrapper = (conversation: string, previous: string) =>
-		`<conversation>\n${conversation}\n</conversation>\n\n${previous ? `<previous-summary>\n${previous}\n</previous-summary>\n\n` : ""}${instructions}`;
-	const overhead = Buffer.byteLength(wrapper(omission, previousSummary ? " " : ""));
+	const overhead = Buffer.byteLength(render(omission, previousSummary ? " " : undefined));
 	if (overhead >= maxBytes) throw new Error("Compaction instructions exceed the model context budget; shorten them");
 	let remaining = maxBytes - overhead;
-	const previous = previousSummary ? truncateUtf8(previousSummary, Math.floor(remaining / 3)) : "";
-	remaining -= Buffer.byteLength(previous);
+	const previous = previousSummary ? truncateMiddleUtf8(previousSummary, Math.floor(remaining / 3)) : undefined;
+	remaining -= Buffer.byteLength(previous ?? "");
 	const selected: string[] = [];
-	let omitted = previous !== (previousSummary ?? "");
+	let omitted = false;
 	for (let i = conversations.length - 1; i >= 0; i--) {
 		const text = conversations[i];
 		const bytes = Buffer.byteLength(text) + 2;
@@ -56,5 +69,5 @@ export function boundedSummaryPrompt(
 		selected.unshift(text);
 		remaining -= bytes;
 	}
-	return wrapper(`${omitted ? omission : ""}${selected.join("\n\n")}`, previous);
+	return render(`${omitted ? omission : ""}${selected.join("\n\n")}`, previous);
 }
