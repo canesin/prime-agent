@@ -147,7 +147,7 @@ describe("daemon conditional cron follow-up", () => {
 		expect(internals.cronStore.list()[0]).toMatchObject({ status: "completed", runCount: 1 });
 	});
 
-	it("rebuilds a persisted receipt-phase follow-up after daemon interruption", () => {
+	it("rebuilds a persisted receipt-phase follow-up after daemon interruption", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-conditional-follow-up-recovery-"));
 		tempDirs.push(tempDir);
 		const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
@@ -167,8 +167,8 @@ describe("daemon conditional cron follow-up", () => {
 			followUpDispatchPhase: "receipt" as const,
 		};
 		const recoverConditionalGoalFollowUpDelivery = vi.fn(
-			(_receiptId: string, _text: string, options: { recoveryCommitted?(): void }) => {
-				options.recoveryCommitted?.();
+			async (_receiptId: string, _text: string, options: { recoveryCommitted?(): void | Promise<void> }) => {
+				await options.recoveryCommitted?.();
 				return true;
 			},
 		);
@@ -183,9 +183,9 @@ describe("daemon conditional cron follow-up", () => {
 		} as unknown as ActiveSessionState;
 		const internals = daemon as unknown as {
 			cronStore: AgentCronJobStore;
-			recoverConditionalCronDeliveryForState(state: ActiveSessionState): void;
+			recoverConditionalCronDeliveryForState(state: ActiveSessionState): Promise<void>;
 		};
-		const job = internals.cronStore.create({
+		const job = await internals.cronStore.create({
 			activeSessionId: "active-kene",
 			sessionId: "session-kene",
 			sessionFile: join(tempDir, "kene.jsonl"),
@@ -207,9 +207,9 @@ describe("daemon conditional cron follow-up", () => {
 			},
 		});
 		goalState.followUpDispatchReceiptId = job.id;
-		internals.cronStore.rejectDelivery(job.id, "Interrupted before scheduled operation completion");
+		await internals.cronStore.rejectDelivery(job.id, "Interrupted before scheduled operation completion");
 
-		internals.recoverConditionalCronDeliveryForState(state);
+		await internals.recoverConditionalCronDeliveryForState(state);
 
 		expect(recoverConditionalGoalFollowUpDelivery).toHaveBeenCalledWith(job.id, marker, {
 			recoveryCommitted: expect.any(Function),

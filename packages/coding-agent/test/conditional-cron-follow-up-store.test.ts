@@ -14,11 +14,11 @@ describe("conditional cron follow-up persistence", () => {
 		}
 	});
 
-	it("persists follow-up delivery only for a fenced cron job", () => {
+	it("persists follow-up delivery only for a fenced cron job", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-conditional-follow-up-store-"));
 		tempDirs.push(tempDir);
 		const store = new AgentCronJobStore(join(tempDir, "jobs.json"));
-		const job = store.create({
+		const job = await store.create({
 			activeSessionId: "active-1",
 			sessionId: "session-1",
 			sessionFile: join(tempDir, "session.jsonl"),
@@ -62,12 +62,12 @@ describe("conditional cron follow-up persistence", () => {
 		]);
 	});
 
-	it("rejects an oversized follow-up receipt in an external delivery fence", () => {
+	it("rejects an oversized follow-up receipt in an external delivery fence", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-conditional-follow-up-store-"));
 		tempDirs.push(tempDir);
 		const store = new AgentCronJobStore(join(tempDir, "jobs.json"));
 
-		expect(() =>
+		await expect(
 			store.create({
 				activeSessionId: "active-1",
 				sessionId: "session-1",
@@ -95,6 +95,6 @@ describe("conditional cron follow-up persistence", () => {
 					},
 				},
 			}),
-		).toThrow("Cron delivery fence goal is invalid");
+		).rejects.toThrow("Cron delivery fence goal is invalid");
 	});
 });

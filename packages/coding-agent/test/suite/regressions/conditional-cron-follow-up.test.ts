@@ -12,8 +12,8 @@ interface ConditionalFollowUpSession {
 	recoverConditionalGoalFollowUpDelivery(
 		receiptId: string,
 		text: string,
-		options?: { recoveryCommitted?(): void },
-	): boolean;
+		options?: { recoveryCommitted?(): void | Promise<void> },
+	): Promise<boolean>;
 	failConditionalGoalFollowUpDelivery(receiptId: string): boolean;
 }
 
@@ -128,13 +128,13 @@ describe("conditional cron follow-up regression", () => {
 		harness.setResponses([fauxAssistantMessage("recovered")]);
 		const recoveryCommitted = vi.fn();
 
-		expect(session.recoverConditionalGoalFollowUpDelivery(receiptId, marker, { recoveryCommitted })).toBe(true);
+		expect(await session.recoverConditionalGoalFollowUpDelivery(receiptId, marker, { recoveryCommitted })).toBe(true);
 		await vi.waitFor(() => expect(getAssistantTexts(harness)).toContain("recovered"));
 
 		expect(recoveryCommitted).toHaveBeenCalledOnce();
 		expect(getUserTexts(harness)).toEqual([marker]);
 		expect(harness.session.goalState.followUpDispatchPhase).toBe("provider_committed");
-		expect(session.recoverConditionalGoalFollowUpDelivery(receiptId, marker)).toBe(false);
+		expect(await session.recoverConditionalGoalFollowUpDelivery(receiptId, marker)).toBe(false);
 	});
 
 	it("terminalizes an exhausted follow-up receipt without terminating the active goal", async () => {
