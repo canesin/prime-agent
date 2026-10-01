@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import {
 	chmodSync,
 	closeSync,
+	copyFileSync,
+	existsSync,
 	fsyncSync,
 	openSync,
 	readlinkSync,
@@ -85,6 +87,24 @@ export function writeFileAtomicSync(path: string, data: string, options: WriteFi
 			// Unavailable on some platforms; the atomic rename still protects readers.
 		}
 	}
+}
+
+export interface BackupFileOptions {
+	/** Suffix inserted after `.bak-`; defaults to a filesystem-safe UTC timestamp. */
+	stamp?: string;
+}
+
+/**
+ * Copies a file to `<path>.bak-<stamp>` beside it. Returns undefined when the
+ * file does not exist, so callers can back up opportunistically before a
+ * destructive write.
+ */
+export function backupFileSync(path: string, options: BackupFileOptions = {}): string | undefined {
+	if (!existsSync(path)) return undefined;
+	const stamp = options.stamp ?? new Date().toISOString().replace(/[:.]/g, "-");
+	const backupPath = `${path}.bak-${stamp}`;
+	copyFileSync(path, backupPath);
+	return backupPath;
 }
 
 /** Resolve symlink aliases so a replace lands on the real file (in-place-write parity). */

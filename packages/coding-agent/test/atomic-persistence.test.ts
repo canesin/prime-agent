@@ -73,7 +73,7 @@ vi.mock("node:fs", async (importOriginal) => {
 	};
 });
 
-import { writeFileAtomicSync } from "../src/utils/atomic-file.js";
+import { backupFileSync, writeFileAtomicSync } from "../src/utils/atomic-file.js";
 import { tryAcquireDirLock } from "../src/utils/dir-lock.js";
 
 const tempDirs: string[] = [];
@@ -154,6 +154,26 @@ function seedDirLock(dir: string, name: string, pid: string): string {
 	writeFileSync(join(lockDir, "pid"), pid);
 	return lockDir;
 }
+
+describe("backupFileSync", () => {
+	it("copies the file beside itself with a timestamp suffix and returns the path", () => {
+		const dir = createTempDir();
+		const path = join(dir, "session.jsonl");
+		writeFileSync(path, "original");
+
+		const backupPath = backupFileSync(path, { stamp: "2026-01-01T00-00-00-000Z" });
+
+		expect(backupPath).toBe(`${path}.bak-2026-01-01T00-00-00-000Z`);
+		expect(readFileSync(backupPath!, "utf8")).toBe("original");
+		expect(readdirSync(dir).sort()).toEqual(["session.jsonl", "session.jsonl.bak-2026-01-01T00-00-00-000Z"]);
+	});
+
+	it("returns undefined for a missing file", () => {
+		const dir = createTempDir();
+		expect(backupFileSync(join(dir, "missing.jsonl"))).toBeUndefined();
+		expect(readdirSync(dir)).toEqual([]);
+	});
+});
 
 describe("tryAcquireDirLock", () => {
 	it("recovers a lost-reply rename: reclaims a stale lock, restores a swapped rival", async () => {

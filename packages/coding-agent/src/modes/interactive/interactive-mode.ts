@@ -173,6 +173,7 @@ import { getChangelogPath, parseChangelog } from "../../utils/changelog.js";
 import { spawnHidden, spawnSyncHidden } from "../../utils/child-process.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
 import { readClipboardImage } from "../../utils/clipboard-image.js";
+import { editTextInExternalEditor, resolveEditorCommand } from "../../utils/external-editor.js";
 import { parseGitUrl } from "../../utils/git.js";
 import { resizeImage } from "../../utils/image-resize.js";
 import { getCwdRelativePath } from "../../utils/paths.js";
@@ -8069,46 +8070,27 @@ export class InteractiveMode {
 	}
 
 	private openExternalEditor(): void {
-		// Determine editor (respect $VISUAL, then $EDITOR)
-		const editorCmd = process.env.VISUAL || process.env.EDITOR;
+		// Respect $VISUAL, then $EDITOR
+		const editorCmd = resolveEditorCommand(undefined, process.env);
 		if (!editorCmd) {
 			this.showWarning("No editor configured. Set $VISUAL or $EDITOR environment variable.");
 			return;
 		}
 
 		const currentText = this.editor.getExpandedText?.() ?? this.editor.getText();
-		const tmpFile = path.join(os.tmpdir(), `pi-editor-${Date.now()}.pi.md`);
 
+		// Stop TUI to release terminal
+		this.ui.stop();
 		try {
-			// Write current content to temp file
-			fs.writeFileSync(tmpFile, currentText, "utf-8");
-
-			// Stop TUI to release terminal
-			this.ui.stop();
-
-			// Split by space to support editor arguments (e.g., "code --wait")
-			const [editor, ...editorArgs] = editorCmd.split(" ");
-
 			// Spawn editor synchronously with inherited stdio for interactive editing
-			const result = spawnSync(editor, [...editorArgs, tmpFile], {
-				stdio: "inherit",
-				shell: process.platform === "win32",
-			});
+			const result = editTextInExternalEditor({ contents: currentText, command: editorCmd, suffix: ".pi.md" });
 
 			// On successful exit (status 0), replace editor content
-			if (result.status === 0) {
-				const newContent = fs.readFileSync(tmpFile, "utf-8").replace(/\n$/, "");
-				this.editor.setText(newContent);
+			if (result.status === 0 && result.text !== undefined) {
+				this.editor.setText(result.text.replace(/\n$/, ""));
 			}
 			// On non-zero exit, keep original text (no action needed)
 		} finally {
-			// Clean up temp file
-			try {
-				fs.unlinkSync(tmpFile);
-			} catch {
-				// Ignore cleanup errors
-			}
-
 			// Restart TUI
 			this.ui.start();
 			// ui.stop() left fullscreen so the editor got a clean terminal

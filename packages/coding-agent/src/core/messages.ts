@@ -6,7 +6,18 @@
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
+import type {
+	Api,
+	AssistantMessage,
+	ImageContent,
+	Message,
+	Provider,
+	StopReason,
+	TextContent,
+	ToolResultMessage,
+	Usage,
+	UserMessage,
+} from "@earendil-works/pi-ai";
 import type { AgentCronJob } from "./cron-jobs.js";
 import {
 	type AppliedRefinementEdit,
@@ -15,6 +26,7 @@ import {
 	type RefinementResult,
 } from "./refinement/refinement.js";
 import { isSessionSlashCommandName, parseSessionSlashCommand, type SessionSlashCommand } from "./slash-commands.js";
+import { emptyUsage } from "./usage.js";
 
 export const COMPACTION_SUMMARY_PREFIX = `[compaction-summary]
 
@@ -416,6 +428,61 @@ export function bashOutputToText(
  */
 export function bashExecutionToText(msg: BashExecutionMessage): string {
 	return `Ran \`${msg.command}\`\n${bashOutputToText(msg)}`;
+}
+
+/** Creates a user message. Coding-agent callers pass block content. */
+export function createUserMessage(
+	content: string | (TextContent | ImageContent)[],
+	timestamp: number = Date.now(),
+): UserMessage {
+	return { role: "user", content, timestamp };
+}
+
+export interface CreateAssistantMessageOptions {
+	content: AssistantMessage["content"];
+	api: Api;
+	provider: Provider;
+	model: string;
+	usage?: Usage;
+	stopReason?: StopReason;
+	timestamp?: number;
+}
+
+/** Creates an assistant message; usage and stop reason default to an empty turn. */
+export function createAssistantMessage(options: CreateAssistantMessageOptions): AssistantMessage {
+	return {
+		role: "assistant",
+		content: options.content,
+		api: options.api,
+		provider: options.provider,
+		model: options.model,
+		usage: options.usage ?? emptyUsage(),
+		stopReason: options.stopReason ?? "stop",
+		timestamp: options.timestamp ?? Date.now(),
+	};
+}
+
+export interface CreateToolResultMessageOptions {
+	toolCallId: string;
+	toolName: string;
+	content: (TextContent | ImageContent)[];
+	details?: unknown;
+	isError?: boolean;
+	timestamp?: number;
+}
+
+/** Creates a tool result message for a preceding tool call. */
+export function createToolResultMessage(options: CreateToolResultMessageOptions): ToolResultMessage {
+	const message: ToolResultMessage = {
+		role: "toolResult",
+		toolCallId: options.toolCallId,
+		toolName: options.toolName,
+		content: options.content,
+		isError: options.isError ?? false,
+		timestamp: options.timestamp ?? Date.now(),
+	};
+	if (options.details !== undefined) message.details = options.details;
+	return message;
 }
 
 export function createBranchSummaryMessage(summary: string, fromId: string, timestamp: string): BranchSummaryMessage {
