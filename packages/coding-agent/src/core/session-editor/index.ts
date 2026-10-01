@@ -4,7 +4,12 @@ import { basename, join, resolve } from "node:path";
 import { getAgentDir } from "../../config.js";
 import { backupFileSync, realpathIfPresentSync, writeFileAtomicSync } from "../../utils/atomic-file.js";
 import { type EditorRunResult, resolveEditorCommand, runEditorCommand } from "../../utils/external-editor.js";
-import { acquireSessionLease, SessionAlreadyActiveError, type SessionLease } from "../session-lease.js";
+import {
+	acquireSessionLease,
+	SESSION_LEASES_ENABLED_ENV,
+	SessionAlreadyActiveError,
+	type SessionLease,
+} from "../session-lease.js";
 import {
 	parseSessionFileContents,
 	type SessionEntry,
@@ -102,36 +107,21 @@ export function writeSessionEntries(options: SessionWriteOptions): SessionWriteR
 	if (!existsSync(sessionPath)) {
 		throw new Error(`Session file not found: ${sessionPath}`);
 	}
-	const currentStat = statSync(sessionPath);
-	if (
-		options.expectedStat !== undefined &&
-		(currentStat.size !== options.expectedStat.size || currentStat.mtimeMs !== options.expectedStat.mtimeMs)
-	) {
-		issues.push({
-			level: "error",
-			message: "session file changed while it was open in the editor; nothing was written",
-		});
-		return { written: false, issues };
-	}
-
-	let lease: SessionLease | undefined;
-	if (options.leaseHeld !== true) {
-		try {
-			lease = acquireSessionLease(sessionPath, agentDir, env);
-		} catch (error) {
-			if (error instanceof SessionAlreadyActiveError) {
-				if (options.force !== true) {
-					throw new Error(
-						`Session is active in another agent: ${sessionPath}. Stop it first, or pass --force to edit anyway.`,
-					);
-				}
-				issues.push({ level: "warning", message: "session is active in another agent; editing anyway" });
-			} else {
-				throw error;
-			}
-		}
-	}
+	const lease = options.leaseHeld
+		? undefined
+		: acquireSessionEditLease(sessionPath, agentDir, env, options.force, issues);
 	try {
+		const currentStat = statSync(sessionPath);
+		if (
+			options.expectedStat !== undefined &&
+			(currentStat.size !== options.expectedStat.size || currentStat.mtimeMs !== options.expectedStat.mtimeMs)
+		) {
+			issues.push({
+				level: "error",
+				message: "session file changed while it was open in the editor; nothing was written",
+			});
+			return { written: false, issues };
+		}
 		const backupPath = options.backup === false ? undefined : backupFileSync(sessionPath);
 		// Write through symlinks and keep ownership, exactly like the session writer.
 		const targetPath = realpathIfPresentSync(sessionPath);
@@ -154,6 +144,28 @@ export function writeSessionEntries(options: SessionWriteOptions): SessionWriteR
 	}
 }
 
+/** Editing must honor worker leases even when invoked from an ordinary shell. */
+export function acquireSessionEditLease(
+	sessionPath: string,
+	agentDir: string,
+	env: NodeJS.ProcessEnv,
+	force: boolean | undefined,
+	issues: SessionDocumentIssue[],
+): SessionLease | undefined {
+	try {
+		return acquireSessionLease(sessionPath, agentDir, { ...env, [SESSION_LEASES_ENABLED_ENV]: "1" });
+	} catch (error) {
+		if (!(error instanceof SessionAlreadyActiveError)) throw error;
+		if (!force) {
+			throw new Error(
+				`Session is active in another agent: ${sessionPath}. Stop it first, or pass --force to edit anyway.`,
+			);
+		}
+		issues.push({ level: "warning", message: "session is active in another agent; editing anyway" });
+		return undefined;
+	}
+}
+
 export function editSession(options: SessionEditOptions): SessionEditOutcome {
 	const env = options.env ?? process.env;
 	const agentDir = options.agentDir ?? getAgentDir();
@@ -161,11 +173,11 @@ export function editSession(options: SessionEditOptions): SessionEditOutcome {
 	if (!existsSync(sessionPath)) {
 		throw new Error(`Session file not found: ${options.sessionPath}`);
 	}
+	const initialStat = statSync(sessionPath);
 	const { header, entries, skippedLines } = parseSessionFileContents(readFileSync(sessionPath, "utf8"));
 	if (!header) {
 		throw new Error(`Session file has no header: ${sessionPath}`);
 	}
-	const initialStat = statSync(sessionPath);
 	const issues: SessionDocumentIssue[] = [];
 	if (skippedLines > 0) {
 		issues.push({ level: "warning", message: `${skippedLines} unreadable line(s) in the session file were skipped` });
@@ -198,21 +210,7 @@ export function editSession(options: SessionEditOptions): SessionEditOutcome {
 		};
 	}
 
-	let lease: SessionLease | undefined;
-	try {
-		lease = acquireSessionLease(sessionPath, agentDir, env);
-	} catch (error) {
-		if (error instanceof SessionAlreadyActiveError) {
-			if (!options.force) {
-				throw new Error(
-					`Session is active in another agent: ${sessionPath}. Stop it first, or pass --force to edit anyway.`,
-				);
-			}
-			issues.push({ level: "warning", message: "session is active in another agent; editing anyway" });
-		} else {
-			throw error;
-		}
-	}
+	const lease = acquireSessionEditLease(sessionPath, agentDir, env, options.force, issues);
 
 	let tempDirectory: string | undefined;
 	let preserveTemp = false;

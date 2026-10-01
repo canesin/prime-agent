@@ -1,6 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -93,16 +92,17 @@ export function runEditorCommand(command: string, file: string): EditorRunResult
 export function editTextInExternalEditor(options: ExternalEditorOptions): ExternalEditorResult {
 	const command = resolveEditorCommand(options.command, options.env ?? process.env);
 	if (command === undefined) return { ran: false, status: null };
-	const file = join(tmpdir(), `pi-editor-${Date.now()}-${randomUUID().slice(0, 8)}${options.suffix ?? ".txt"}`);
-	writeFileSync(file, options.contents, "utf8");
+	const directory = mkdtempSync(join(tmpdir(), "pi-editor-"));
+	const file = join(directory, `contents${options.suffix ?? ".txt"}`);
 	try {
+		writeFileSync(file, options.contents, { encoding: "utf8", mode: 0o600 });
 		const result = runEditorCommand(command, file);
 		if (result.error !== undefined) return { ran: true, status: result.status, error: result.error };
 		if (result.status !== 0) return { ran: true, status: result.status };
 		return { ran: true, status: result.status, text: readFileSync(file, "utf8") };
 	} finally {
 		try {
-			unlinkSync(file);
+			rmSync(directory, { recursive: true, force: true });
 		} catch {
 			// The editor already removed it.
 		}
