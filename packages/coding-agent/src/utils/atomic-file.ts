@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
 	chmodSync,
 	closeSync,
+	constants,
 	copyFileSync,
 	existsSync,
 	fsyncSync,
@@ -102,9 +103,16 @@ export interface BackupFileOptions {
 export function backupFileSync(path: string, options: BackupFileOptions = {}): string | undefined {
 	if (!existsSync(path)) return undefined;
 	const stamp = options.stamp ?? new Date().toISOString().replace(/[:.]/g, "-");
-	const backupPath = `${path}.bak-${stamp}`;
-	copyFileSync(path, backupPath);
-	return backupPath;
+	let backupPath = `${path}.bak-${stamp}`;
+	for (;;) {
+		try {
+			copyFileSync(path, backupPath, constants.COPYFILE_EXCL);
+			return backupPath;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			backupPath = `${path}.bak-${stamp}-${randomUUID()}`;
+		}
+	}
 }
 
 /** Resolve symlink aliases so a replace lands on the real file (in-place-write parity). */

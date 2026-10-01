@@ -3,11 +3,13 @@ import { createAssistantMessage, createToolResultMessage, createUserMessage } fr
 import { generateEntryId, type SessionEntry, type SessionHeader, serializeSessionFile } from "../session-manager.js";
 import {
 	describeEntry,
+	hasErrors,
 	inferAssistantIdentity,
 	parseEntryBlock,
 	renderEntryBlock,
 	renderSessionDocument,
 	type SessionDocumentIssue,
+	summarizeSessionChanges,
 	validateEntries,
 } from "./document.js";
 
@@ -63,6 +65,7 @@ export class SessionEditModel {
 	private undoStack: VersionedEntries[] = [];
 	private redoStack: VersionedEntries[] = [];
 	private version = 0;
+	private nextVersion = 0;
 	private savedVersion = 0;
 
 	constructor(init: SessionEditModelInit) {
@@ -311,6 +314,7 @@ export class SessionEditModel {
 			return { issues: [{ level: "error", message: `unknown entry id ${id}`, entryId: id }] };
 		}
 		const parsed = parseEntryBlock(text, entry);
+		if (hasErrors(parsed.issues)) return { issues: parsed.issues };
 		if (parsed.entry === undefined) {
 			if (parsed.changed) this.removeEntry(id);
 			return { issues: parsed.issues };
@@ -333,18 +337,8 @@ export class SessionEditModel {
 
 	/** Entry counts by change kind, for a save summary. */
 	diffSummary(): { edited: number; added: number; removed: number; total: number } {
-		const initialById = new Map(this.initialEntries.map((entry) => [entry.id, entry]));
-		let edited = 0;
-		for (const entry of this.entries) {
-			const original = initialById.get(entry.id);
-			if (original !== undefined && !deepEqual(original, entry)) edited++;
-		}
-		return {
-			edited,
-			added: this.entries.filter((entry) => !initialById.has(entry.id)).length,
-			removed: this.initialEntries.filter((entry) => this.indexOf(entry.id) === -1).length,
-			total: this.entries.length,
-		};
+		const { edited, added, removed, total } = summarizeSessionChanges(this.initialEntries, this.entries).stats;
+		return { edited, added, removed, total };
 	}
 
 	undo(): boolean {
@@ -371,7 +365,7 @@ export class SessionEditModel {
 		this.undoStack.push({ entries: this.entries.slice(), version: this.version });
 		if (this.undoStack.length > UNDO_LIMIT) this.undoStack.shift();
 		this.redoStack = [];
-		this.version++;
+		this.version = ++this.nextVersion;
 	}
 
 	/** Chains every entry to its predecessor; first entry has no parent. */

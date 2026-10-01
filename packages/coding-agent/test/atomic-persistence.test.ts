@@ -156,6 +156,15 @@ function seedDirLock(dir: string, name: string, pid: string): string {
 }
 
 describe("backupFileSync", () => {
+	it("preserves both backups when timestamps collide (#18)", () => {
+		const path = join(createTempDir(), "session.jsonl");
+		writeFileSync(path, "first");
+		const first = backupFileSync(path, { stamp: "same" })!;
+		writeFileSync(path, "second");
+		const second = backupFileSync(path, { stamp: "same" })!;
+		expect([readFileSync(first, "utf8"), readFileSync(second, "utf8")]).toEqual(["first", "second"]);
+	});
+
 	it("copies the file beside itself with a timestamp suffix and returns the path", () => {
 		const dir = createTempDir();
 		const path = join(dir, "session.jsonl");

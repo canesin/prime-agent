@@ -1,0 +1,1 @@
+- Fixed session editing to honor active-session locks, save reordered transcripts, retain unsaved edits after undo, reject invalid edits without changes, preserve empty and damaged content, and keep distinct backups and private editor files.

@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { UserMessage } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { SESSION_DOCUMENT_MARKER as M } from "../src/core/session-editor/document.js";
+import { SESSION_DOCUMENT_MARKER as M, renderSessionDocument } from "../src/core/session-editor/document.js";
 import {
 	editSession,
 	type SessionEditOptions,
@@ -46,7 +46,7 @@ let directory: string;
 let sessionPath: string;
 let originalFile: string;
 
-/** Runs the editor with a hermetic environment: no session leases in the test directory. */
+/** Runs the editor with lease state confined to the test directory. */
 function edit(overrides: Partial<SessionEditOptions>): SessionEditOutcome {
 	return editSession({ sessionPath, agentDir: directory, env: {}, ...overrides });
 }
@@ -83,6 +83,19 @@ afterEach(() => {
 });
 
 describe("session edit file flow", () => {
+	it("persists a document that only reorders entries (#18)", () => {
+		const outcome = edit({
+			runEditor: editorWriting(() => renderSessionDocument({ header, entries: [...originalEntries].reverse() })),
+		});
+		expect(outcome.written).toBe(true);
+		expect(outcome.stats).toMatchObject({ edited: 2, unchanged: 0 });
+		const entries = parseSessionFileContents(readFileSync(sessionPath, "utf8")).entries;
+		expect(entries.map(({ id, parentId }) => [id, parentId])).toEqual([
+			["aaaa0002", null],
+			["aaaa0001", "aaaa0002"],
+		]);
+	});
+
 	it("writes edits, keeps a backup, and preserves the header", () => {
 		const outcome = edit({
 			runEditor: editorWriting((document) => rewriteQuestion(document, "edited question")),
@@ -98,6 +111,7 @@ describe("session edit file flow", () => {
 		expect(readdirSync(directory).sort()).toEqual([
 			"01a00000.jsonl",
 			`01a00000.jsonl.bak-${outcome.backupPath!.split(".bak-")[1]}`,
+			"session-leases",
 		]);
 	});
 
@@ -107,7 +121,8 @@ describe("session edit file flow", () => {
 		expect(outcome.changes).toEqual([]);
 		expect(outcome.backupPath).toBeUndefined();
 		expect(readFileSync(sessionPath, "utf8")).toBe(originalFile);
-		expect(readdirSync(directory)).toEqual(["01a00000.jsonl"]);
+		expect(readdirSync(directory)).toEqual(["01a00000.jsonl", "session-leases"]);
+		expect(readdirSync(join(directory, "session-leases"))).toEqual([]);
 	});
 
 	it("does not write when the document has errors and keeps it for repair", () => {
@@ -223,13 +238,12 @@ describe("session edit file flow", () => {
 		expect(outcome.backupPath).toBeUndefined();
 	});
 
-	it("refuses to write an active session unless forced", () => {
+	it("refuses to write an active session without the worker-only lease flag unless forced (#18)", () => {
 		const env = { PRIME_AGENT_INTERNAL_SESSION_LEASES: "1" };
 		const lease = acquireSessionLease(sessionPath, directory, env);
 		try {
 			expect(() =>
 				edit({
-					env,
 					runEditor: editorWriting((document) => rewriteQuestion(document, "blocked")),
 				}),
 			).toThrow(/active/i);
@@ -238,7 +252,6 @@ describe("session edit file flow", () => {
 			);
 
 			const forced = edit({
-				env,
 				force: true,
 				runEditor: editorWriting((document) => rewriteQuestion(document, "forced")),
 			});
