@@ -151,6 +151,9 @@ import { PRIME_INFERENCE_PROVIDER_ID } from "../../core/prime-inference-auth.js"
 import { resolvePrimeInferencePostLoginModelAction } from "../../core/prime-inference-model-selection.js";
 import { parseCommandArgs } from "../../core/prompt-templates.js";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.js";
+import { createSessionForkTarget, readSessionHeader, type SessionForkTarget } from "../../core/session-editor/fork.js";
+import { SessionEditModel } from "../../core/session-editor/model.js";
+import { deleteSessionFile } from "../../core/session-file-actions.js";
 import { SessionImportFileNotFoundError } from "../../core/session-import-errors.js";
 import { resolveSessionPath, SessionSelectorError, SessionSelectorNotFoundError } from "../../core/session-resolver.js";
 import type { ChatDetail, McpServerConfig } from "../../core/settings-manager.js";
@@ -205,6 +208,11 @@ import type {
 import { AgentConnectionPromptAdmissionError } from "../agent-connection/index.js";
 import type { SessionSummary } from "../daemon/daemon-session-list.js";
 import { getModelArgumentCompletions } from "../model-autocomplete.js";
+import {
+	SessionEditorMode,
+	type SessionEditorModeOptions,
+	type SessionEditorModeResult,
+} from "../session-editor/session-editor-mode.js";
 import {
 	checkForPackageUpdates,
 	checkTmuxKeyboardSetup,
@@ -5323,6 +5331,16 @@ export class InteractiveMode {
 					await this.handleCloneCommand();
 					return;
 				}
+				if (commandName === "fork-edit") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /fork-edit");
+						return;
+					}
+					this.editor.setText("");
+					await this.handleForkEditCommand();
+					return;
+				}
 				if (commandName === "tree") {
 					if (commandArgs) {
 						this.editor.setText(text);
@@ -9146,6 +9164,65 @@ export class InteractiveMode {
 			);
 			return { component: selector, focus: selector.getMessageList() };
 		});
+	}
+
+	/** Test seam: builds the transcript editor used by /fork-edit. */
+	protected createSessionEditorMode(options: SessionEditorModeOptions): SessionEditorMode {
+		return new SessionEditorMode(options);
+	}
+
+	/**
+	 * Forks the session and opens the transcript editor on the copy, so the live
+	 * session keeps running while its flow is rewritten.
+	 */
+	private async handleForkEditCommand(): Promise<void> {
+		const sessionFile = this.connectionState?.sessionFile;
+		if (sessionFile === undefined) {
+			this.showError("This session is not saved to disk, so it cannot be fork-edited.");
+			return;
+		}
+		const cwd = this.connectionState?.cwd ?? process.cwd();
+		let target: SessionForkTarget;
+		try {
+			target = createSessionForkTarget(sessionFile, cwd, path.dirname(sessionFile));
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+			return;
+		}
+
+		const model = new SessionEditModel({
+			header: target.forkHeader,
+			entries: target.sourceEntries,
+			filePath: target.forkPath,
+		});
+		const forkStat = fs.statSync(target.forkPath);
+		const mode = this.createSessionEditorMode({
+			sessionPath: target.forkPath,
+			model,
+			backup: false,
+			stat: { size: forkStat.size, mtimeMs: forkStat.mtimeMs },
+			initialNotice: "editing a copy; this session keeps running",
+		});
+
+		this.ui.stop();
+		let result: SessionEditorModeResult;
+		try {
+			result = await mode.run();
+		} finally {
+			this.ui.start();
+			if (this.fullscreenEnabled) {
+				this.applyFullscreen(true);
+			}
+			this.ui.requestRender(true);
+		}
+
+		if (result.writes === 0) {
+			await deleteSessionFile(target.forkPath);
+			this.showStatus("Fork edit cancelled; no copy kept");
+			return;
+		}
+		const savedId = readSessionHeader(target.forkPath)?.id ?? target.forkPath;
+		this.showStatus(`Edited copy saved as ${savedId} — resume it with /resume ${savedId}`);
 	}
 
 	private async handleCloneCommand(): Promise<void> {

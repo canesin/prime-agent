@@ -51,6 +51,7 @@ Type `/` in the editor to open command completion. Extensions can register custo
 | `/tree` | Jump to any point in the session and continue from there |
 | `/fork` | Create a new session from a previous user message |
 | `/clone` | Duplicate the current active branch into a new session |
+| `/fork-edit` | Fork this session and edit the copy in the transcript editor |
 | `/compact [prompt]` | Manually compact context, optionally with custom instructions |
 | `/refine [instructions]` | Refine or roll back session-backed harness state |
 | `/copy` | Copy last assistant message to clipboard |

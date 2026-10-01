@@ -87,6 +87,18 @@ Structure stays consistent without manual bookkeeping: new entries get fresh IDs
 
 Every write copies the session to `<file>.bak-<timestamp>` first and stops if the file changed on disk while the editor was open.
 
+### Editing the current session with `/fork-edit`
+
+Inside an interactive session, `/fork-edit` forks the session and opens that copy in the transcript editor. The live session keeps running untouched, and the edited copy is written as a new session file with its own ID, so nothing overwrites the conversation you are in. On save, the status line prints the new ID; resume it with `/resume <id>` to continue from the edited flow.
+
+```text
+/fork-edit
+# the editor opens on the fork; Ctrl+S saves it, q returns to the live session
+# -> Edited copy saved as 01a08f1c-... — resume it with /resume 01a08f1c-...
+```
+
+In-place editing of an *active* session is refused on purpose: the daemon holds the session lease, and the runtime keeps the transcript in memory with a parent chain tied to its current leaf, so an external rewrite would diverge from the running session.
+
 ### Editing the transcript as a document
 
 `--print` writes the same transcript as a lossless, line-oriented document, and `--text` opens that document in `$EDITOR`. Each block maps to one session entry and each section inside a block maps to one piece of it:
