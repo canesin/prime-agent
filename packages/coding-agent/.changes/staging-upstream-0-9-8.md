@@ -1,0 +1,2 @@
+- Fixed GPT-6 Sol and Luna discovery for Codex subscriptions and refreshed the model catalog whenever the picker opens.
+- Merged the final upstream TypeScript release, 0.9.8, while preserving the fork's session editor, goal controls, privacy settings, and updates.
