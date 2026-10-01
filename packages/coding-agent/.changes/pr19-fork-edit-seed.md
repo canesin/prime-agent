@@ -1,0 +1,1 @@
+- Fixed `/fork-edit` to preserve the fork’s normalized transcript when saving edits.

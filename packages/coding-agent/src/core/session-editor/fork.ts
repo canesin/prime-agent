@@ -10,7 +10,13 @@ export function readSessionHeader(filePath: string): SessionHeader | undefined {
 export interface SessionForkTarget {
 	sourcePath: string;
 	sourceHeader: SessionHeader;
-	sourceEntries: SessionEntry[];
+	/**
+	 * Entries the editor starts from: the fork's own entries, not the source's.
+	 * The fork writer normalizes and rewrites the transcript (it drops entries
+	 * the header now carries, and applies migrations), so saving the source's
+	 * entries would undo that.
+	 */
+	forkEntries: SessionEntry[];
 	/** New session file that continues the source, for editing without touching it. */
 	forkPath: string;
 	forkHeader: SessionHeader;
@@ -38,7 +44,7 @@ export function createSessionForkTarget(sourcePath: string, cwd: string, session
 	return {
 		sourcePath,
 		sourceHeader: source.header,
-		sourceEntries: source.entries,
+		forkEntries: forkContents.entries,
 		forkPath,
 		forkHeader: forkContents.header,
 	};
