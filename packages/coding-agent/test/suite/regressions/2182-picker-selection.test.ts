@@ -187,6 +187,39 @@ it("toggles model scope instead of typing when Option+S arrives as the composed 
 	await done;
 });
 
+it("refreshes a fresh model catalog when the picker opens without a search (#20)", async () => {
+	const f = await fixture();
+	const plain = f.harness.getModel("plain")!;
+	const loaded = deferred();
+	const rendered = deferred();
+	const prototype = InteractiveMode.prototype as unknown as Record<string, (...args: unknown[]) => unknown>;
+	Object.assign(f.mode, {
+		agentConnection: {
+			getModelCatalog: async () => {
+				await loaded.promise;
+				return { models: [f.model, plain], configuredProviders: [plain.provider] };
+			},
+		},
+		connectionModelCatalog: [f.model],
+		connectionModelsFetchedAt: Date.now(),
+		connectionModelsRefreshVersion: 0,
+		getCurrentModel: () => f.model,
+		getCachedModelCandidates: prototype.getCachedModelCandidates,
+		getModelSelectorRefreshPromise: prototype.getModelSelectorRefreshPromise,
+	});
+	const done = f.mode.showConfigurationMenu("models");
+	try {
+		expect(stripAnsi(f.menu().render(100).join("\n"))).not.toContain(plain.name);
+		Object.assign(f.mode.ui, { requestRender: rendered.resolve });
+		loaded.resolve();
+		await rendered.promise;
+		expect(stripAnsi(f.menu().render(100).join("\n"))).toContain(plain.name);
+	} finally {
+		f.menu().handleInput("\x1b");
+		await done;
+	}
+});
+
 it("does not publish the removed configuration tab action", () => {
 	expect(Object.keys(KEYBINDINGS)).not.toContain("app.configuration.previousTab");
 });

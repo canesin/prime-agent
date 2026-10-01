@@ -742,75 +742,65 @@ describe("ModelRegistry", () => {
 	});
 
 	describe("auth refresh across processes", () => {
-		test("refreshAvailableModels returns while provider catalog refresh is still pending", async () => {
+		test("refreshAvailableModels returns while provider catalog refresh is pending and settles it (#20)", async () => {
 			vi.stubEnv("OPENAI_API_KEY", "test-openai-key");
 			const registry = ModelRegistry.inMemory(authStorage);
 			let providerCatalogRequested = false;
+			let finish!: (response: Response) => void;
+			const pending = new Promise<Response>((resolve) => {
+				finish = resolve;
+			});
 			vi.stubGlobal(
 				"fetch",
 				vi.fn((input: string | URL | Request) => {
-					if (String(input).includes("prime-agent-catalog/main/models/catalog.v1.json"))
+					if (String(input).includes("prime-agent-catalog/main/models/catalog.v1.json")) {
 						providerCatalogRequested = true;
-					return new Promise<Response>(() => {});
+						return pending;
+					}
+					return Promise.resolve(new Response("not found", { status: 404 }));
 				}),
 			);
 
-			// Deterministic non-blocking proof: refreshAvailableModels resolves before the
-			// pending fetch settles, and the fetch was started. A deferred promise stands in
-			// for the network; no wall-clock timer is involved.
-			const models = await registry.refreshAvailableModels();
-			expect(models.length).toBeGreaterThan(0);
-			expect(providerCatalogRequested).toBe(true);
-			await registry.waitForPendingModelRefreshes(1_000).catch(() => undefined);
+			try {
+				const models = await registry.refreshAvailableModels();
+				expect(models.length).toBeGreaterThan(0);
+				expect(providerCatalogRequested).toBe(true);
+			} finally {
+				finish(new Response("not found", { status: 404 }));
+				await registry.refreshModelCatalog();
+			}
 		});
 
 		test("model catalog includes unauthenticated public models and hides private Prime routes", async () => {
-			const savedPrimeApiKey = process.env.PRIME_API_KEY;
-			const savedOpenAiApiKey = process.env.OPENAI_API_KEY;
-			delete process.env.PRIME_API_KEY;
-			delete process.env.OPENAI_API_KEY;
-			try {
-				const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			vi.stubEnv("PRIME_API_KEY", "");
+			vi.stubEnv("OPENAI_API_KEY", "");
+			vi.stubGlobal("fetch", async () => new Response("not found", { status: 404 }));
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
 
-				const unauthenticated = await registry.refreshModelCatalog();
-				expect(unauthenticated.models.some((model) => model.provider === "openai")).toBe(true);
-				expect(unauthenticated.configuredProviders).not.toContain("openai");
-				expect(
-					unauthenticated.models.some(
-						(model) => model.provider === "prime-inference" && model.id.startsWith("internal/"),
-					),
-				).toBe(false);
+			const unauthenticated = await registry.refreshModelCatalog();
+			expect(unauthenticated.models.some((model) => model.provider === "openai")).toBe(true);
+			expect(unauthenticated.configuredProviders).not.toContain("openai");
+			expect(
+				unauthenticated.models.some(
+					(model) => model.provider === "prime-inference" && model.id.startsWith("internal/"),
+				),
+			).toBe(false);
 
-				authStorage.setRuntimeApiKey("openai", "test-key");
-				const authenticated = await registry.refreshModelCatalog();
-				expect(authenticated.configuredProviders).toContain("openai");
-			} finally {
-				if (savedPrimeApiKey !== undefined) {
-					process.env.PRIME_API_KEY = savedPrimeApiKey;
-				}
-				if (savedOpenAiApiKey !== undefined) {
-					process.env.OPENAI_API_KEY = savedOpenAiApiKey;
-				}
-			}
+			authStorage.setRuntimeApiKey("openai", "test-key");
+			const authenticated = await registry.refreshModelCatalog();
+			expect(authenticated.configuredProviders).toContain("openai");
 		});
 
 		test("refresh() picks up credentials written by another process", () => {
-			const savedEnvKey = process.env.PRIME_API_KEY;
-			delete process.env.PRIME_API_KEY;
-			try {
-				const registry = ModelRegistry.create(authStorage, modelsJsonPath);
-				expect(registry.getAvailable().some((m) => m.provider === "prime-inference")).toBe(false);
+			vi.stubEnv("PRIME_API_KEY", "");
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			expect(registry.getAvailable().some((m) => m.provider === "prime-inference")).toBe(false);
 
-				const otherProcessAuth = AuthStorage.create(join(tempDir, "auth.json"));
-				otherProcessAuth.set("prime-inference", { type: "api_key", key: "test-key" });
+			const otherProcessAuth = AuthStorage.create(join(tempDir, "auth.json"));
+			otherProcessAuth.set("prime-inference", { type: "api_key", key: "test-key" });
 
-				registry.refresh();
-				expect(registry.getAvailable().some((m) => m.provider === "prime-inference")).toBe(true);
-			} finally {
-				if (savedEnvKey !== undefined) {
-					process.env.PRIME_API_KEY = savedEnvKey;
-				}
-			}
+			registry.refresh();
+			expect(registry.getAvailable().some((m) => m.provider === "prime-inference")).toBe(true);
 		});
 	});
 
@@ -1234,63 +1224,41 @@ describe("subagent Prime Inference discovery", () => {
 	});
 });
 
-describe("issue #702 codex model discovery client version", () => {
-	const originalFetch = globalThis.fetch;
-	let codexTempDir: string;
-
-	beforeEach(() => {
-		codexTempDir = mkdtempSync(join(tmpdir(), "codex-client-version-"));
+test("discovers GPT-6 Sol and Luna from the live catalog with a supported Codex client version (#20)", async () => {
+	const directory = mkdtempSync(join(tmpdir(), "codex-model-discovery-"));
+	const ids = ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"];
+	const payload = Buffer.from(
+		JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "account-123" } }),
+	).toString("base64url");
+	const access = `header.${payload}.signature`;
+	const auth = AuthStorage.inMemory({
+		"openai-codex": { type: "oauth", access, refresh: "unused", expires: Date.now() + 3_600_000 },
 	});
-
-	afterEach(() => {
-		globalThis.fetch = originalFetch;
-		rmSync(codexTempDir, { recursive: true, force: true });
+	const models = [...ids, "unavailable-model"].map((id) => ({ ...getModels("openai-codex")[0]!, id }));
+	const requests: Array<{ url: URL; headers: Headers }> = [];
+	vi.stubEnv("PI_OFFLINE", "0");
+	vi.stubGlobal("fetch", async (input: string | URL | Request, init?: RequestInit) => {
+		const url = new URL(input instanceof Request ? input.url : input);
+		if (url.pathname.endsWith("/models/catalog.v1.json")) return Response.json({ schemaVersion: 1, models });
+		if (!url.pathname.endsWith("/codex/models")) return new Response("not found", { status: 404 });
+		requests.push({ url, headers: new Headers(init?.headers) });
+		const [major, minor] = (url.searchParams.get("client_version") ?? "0.0.0").split(".").map(Number);
+		// The backend exposes Sol/Luna only to Codex clients >= 0.155 (upstream #2544).
+		const visible = major > 0 || minor >= 155 ? ids : ids.slice(0, 1);
+		return Response.json({ models: visible.map((slug) => ({ slug })) });
 	});
-
-	function codexAccessToken(accountId: string): string {
-		const payload = Buffer.from(
-			JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: accountId } }),
-		).toString("base64url");
-		return `header.${payload}.signature`;
-	}
-
-	test("sends a Codex CLI client version on the discovery request instead of the package version", async () => {
-		const authPath = join(codexTempDir, "auth.json");
-		writeFileSync(
-			authPath,
-			JSON.stringify({
-				"openai-codex": {
-					type: "oauth",
-					access: codexAccessToken("account-123"),
-					refresh: "refresh-token",
-					expires: Date.now() + 60 * 60 * 1000,
-					accountId: "account-123",
-				},
-			}),
-		);
-		const registry = ModelRegistry.create(AuthStorage.create(authPath), join(codexTempDir, "models.json"));
-		const codexModels = registry.getAvailable().filter((model) => model.provider === "openai-codex");
-		expect(codexModels.length).toBeGreaterThan(0);
-		const requestedUrls: string[] = [];
-		globalThis.fetch = (async (input: Parameters<typeof globalThis.fetch>[0]) => {
-			requestedUrls.push(input instanceof Request ? input.url : input.toString());
-			return new Response(JSON.stringify({ models: codexModels.map((model) => ({ slug: model.id })) }), {
-				status: 200,
-				headers: { "content-type": "application/json" },
-			});
-		}) as typeof globalThis.fetch;
-
+	try {
+		const registry = ModelRegistry.create(auth, join(directory, "models.json"));
 		const executable = await registry.getExecutableModels();
-
-		const discoveryUrl = requestedUrls.find((url) => url.includes("/codex/models"));
-		expect(discoveryUrl).toBeDefined();
-		const clientVersion = new URL(discoveryUrl ?? "").searchParams.get("client_version");
-		// Prime Agent's own version is 0.x well below this floor, so comparing against VERSION
-		// would pass today and break silently once the package version reaches the pinned constant.
-		expect(clientVersion).toMatch(/^\d+\.\d+\.\d+$/);
-		const [major, minor] = (clientVersion ?? "0.0.0").split(".").map(Number);
-		// 0.153.x is the floor at which ChatGPT discovery lists GPT-6 Astra (discussion #2062).
-		expect((major ?? 0) > 0 || (minor ?? 0) >= 153).toBe(true);
-		expect(executable.some((model) => model.provider === "openai-codex")).toBe(true);
-	});
+		expect(registry.find("openai-codex", "unavailable-model")).toEqual(models[3]);
+		expect(executable.filter((model) => model.provider === "openai-codex").map((model) => model.id)).toEqual(ids);
+		expect(requests).toHaveLength(1);
+		expect(requests[0]!.url.searchParams.get("client_version")).toMatch(/^\d+\.\d+\.\d+$/);
+		expect(requests[0]!.headers.get("Authorization")).toBe(`Bearer ${access}`);
+		expect(requests[0]!.headers.get("chatgpt-account-id")).toBe("account-123");
+	} finally {
+		vi.unstubAllGlobals();
+		vi.unstubAllEnvs();
+		rmSync(directory, { recursive: true, force: true });
+	}
 });
