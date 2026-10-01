@@ -67,9 +67,9 @@ interface FakeUi {
 	enterFullscreen: () => void;
 }
 
-function createFakeUi(): FakeUi {
+function createFakeUi(rows = 24): FakeUi {
 	return {
-		terminal: { rows: 24, columns: 100, drainInput: async () => undefined },
+		terminal: { rows, columns: 100, drainInput: async () => undefined },
 		requestRender: () => undefined,
 		addChild: () => undefined,
 		setFocus: () => undefined,
@@ -79,8 +79,8 @@ function createFakeUi(): FakeUi {
 	};
 }
 
-function createMode(entries: SessionEntry[], overrides: Partial<SessionEditorModeOptions> = {}) {
-	const ui = createFakeUi();
+function createMode(entries: SessionEntry[], overrides: Partial<SessionEditorModeOptions> = {}, rows = 24) {
+	const ui = createFakeUi(rows);
 	const model = new SessionEditModel({ header, entries, filePath: "/tmp/session.jsonl" });
 	const mode = new SessionEditorMode({
 		sessionPath: "/tmp/session.jsonl",
@@ -195,6 +195,15 @@ describe("session editor mode", () => {
 		expect(screen(mode)).not.toContain("Unsaved changes.");
 		mode.handleInput("\x03");
 		expect(screen(mode)).toContain("Unsaved changes.");
+	});
+
+	it("fits the frame to a small terminal", () => {
+		const { mode } = createMode(sampleEntries(), {}, 8);
+		const lines = mode.render(80);
+		expect(lines.length).toBeGreaterThan(0);
+		expect(lines.length).toBeLessThanOrEqual(8);
+		expect(lines[0]).toContain("Prime Agent session editor");
+		expect(lines.some((line) => line.includes("─"))).toBe(true);
 	});
 
 	it("shows configurable key hints in the dock", () => {

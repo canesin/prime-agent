@@ -76,6 +76,7 @@ The editor lists every entry in flow order with its role, a summary, and a badge
 | `c` | Duplicate the selected entry |
 | `Shift+Up` / `Shift+Down` | Move the selected entry up or down |
 | `u` / `Ctrl+R` | Undo or redo the last edit |
+| `/` | Search the transcript; `n`/`Shift+N` jump between matches |
 | `v` | Toggle raw JSON details for the selected entry |
 | `Ctrl+S` | Validate, back up, and write the session |
 | `Ctrl+E` | Edit the whole transcript as one document |

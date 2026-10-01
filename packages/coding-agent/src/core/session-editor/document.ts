@@ -421,7 +421,11 @@ function parseAttributeValue(raw: string): string {
 
 function splitDocument(document: string): { blocks: RawBlock[]; issues: SessionDocumentIssue[] } {
 	const issues: SessionDocumentIssue[] = [];
-	const lines = document.split("\n");
+	// A CRLF document (Windows editor) is normalized line by line; an LF document
+	// keeps carriage returns that belong to the content itself.
+	const firstBreak = document.indexOf("\n");
+	const crlfDocument = firstBreak > 0 && document[firstBreak - 1] === "\r";
+	const lines = document.split("\n").map((line) => (crlfDocument && line.endsWith("\r") ? line.slice(0, -1) : line));
 	if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
 	const blocks: RawBlock[] = [];
 	let block: RawBlock | undefined;

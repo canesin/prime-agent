@@ -62,7 +62,7 @@ export class SessionEditorMode implements Component, Focusable {
 	private readonly ui: TUI;
 	private readonly keybindings: KeybindingsManager;
 	readonly dock: Component;
-	private readonly stat: { size: number; mtimeMs: number } | undefined;
+	private stat: { size: number; mtimeMs: number } | undefined;
 	private cursor = 0;
 	private detailScroll = 0;
 	private rawJson = false;
@@ -402,6 +402,8 @@ export class SessionEditorMode implements Component, Focusable {
 		this.model.markSaved();
 		this.saved = true;
 		this.writes++;
+		// A later save must compare against the file this session just wrote.
+		if (write.stat !== undefined) this.stat = write.stat;
 		if (write.backupPath !== undefined) this.backups.push(write.backupPath);
 		const summary = this.model.diffSummary();
 		this.notice = `saved ${summary.total} entries${write.backupPath === undefined ? "" : `; backup ${write.backupPath}`}`;

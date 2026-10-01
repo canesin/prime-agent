@@ -179,6 +179,14 @@ describe("session document format", () => {
 		expect(parse(document, entries).entries).toEqual(entries);
 	});
 
+	it("round-trips escaped marker lines and CRLF documents", () => {
+		const text = ["plain", `${M} user`, `\\${M} nested`, "tail"].join("\n");
+		const entries = [userEntry("bbbb0002", null, text)];
+		const document = render(entries);
+		expect(parse(document, entries).entries).toEqual(entries);
+		expect(parse(document.replaceAll("\n", "\r\n"), entries).entries).toEqual(entries);
+	});
+
 	it("applies text edits and keeps the entry order and roles", () => {
 		const entries = sampleSession();
 		const document = replaceSection(render(entries), "user", "first question", "edited question");
@@ -253,6 +261,68 @@ describe("session document format", () => {
 			.filter((line) => line.startsWith(`${M} `) && !line.startsWith(`${M} entry `));
 		expect(sections).toEqual([`${M} keep index=0 type=thinking`]);
 		expect(parse(document, entries).entries).toEqual(entries);
+	});
+
+	it("preserves image blocks by index and drops them only when the marker is deleted", () => {
+		const result: SessionEntry = {
+			type: "message",
+			id: "aaaa0009",
+			parentId: null,
+			timestamp: "2026-01-01T00:00:04.000Z",
+			message: {
+				role: "toolResult",
+				toolCallId: "call_img",
+				toolName: "attach_image",
+				content: [
+					{ type: "text", text: "see image" },
+					{ type: "image", data: "QUJD", mimeType: "image/png" },
+				],
+				isError: false,
+				timestamp: 1_700_000_000_003,
+			},
+		};
+		const entries = [result];
+		const document = render(entries);
+		expect(document).toContain(`${M} image index=1 mimeType=image/png`);
+		expect(parse(document, entries).entries).toEqual(entries);
+
+		const withoutImage = document
+			.split("\n")
+			.filter((line) => !line.startsWith(`${M} image `))
+			.join("\n");
+		const parsed = parse(withoutImage, entries);
+		expect(parsed.issues.filter((issue) => issue.level === "error")).toEqual([]);
+		const entry = parsed.entries[0];
+		expect(entry?.type === "message" && entry.message.role === "toolResult" && entry.message.content).toEqual([
+			{ type: "text", text: "see image" },
+		]);
+	});
+
+	it("round-trips custom messages and structural entries", () => {
+		const entries: SessionEntry[] = [
+			{
+				type: "custom_message",
+				id: "gggg0001",
+				parentId: null,
+				timestamp: "2026-01-01T00:00:05.000Z",
+				customType: "harness_digest",
+				content: [{ type: "text", text: "digest body" }],
+				display: false,
+				details: { nested: { fingerprint: "abc" } },
+			},
+			{
+				type: "model_change",
+				id: "gggg0002",
+				parentId: "gggg0001",
+				timestamp: "2026-01-01T00:00:06.000Z",
+				provider: "zai",
+				modelId: "glm-5.3-flash",
+				thinkingLevel: "high",
+			},
+		];
+		const parsed = parse(render(entries), entries);
+		expect(parsed.entries).toEqual(entries);
+		expect(parsed.stats.unchanged).toBe(2);
 	});
 
 	it("drops the provider signature when reasoning text changes", () => {

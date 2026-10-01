@@ -1,10 +1,16 @@
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { UserMessage } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SESSION_DOCUMENT_MARKER as M } from "../src/core/session-editor/document.js";
-import { editSession, type SessionEditOptions, type SessionEditOutcome } from "../src/core/session-editor/index.js";
+import {
+	editSession,
+	type SessionEditOptions,
+	type SessionEditOutcome,
+	writeSessionEntries,
+} from "../src/core/session-editor/index.js";
+import { acquireSessionLease } from "../src/core/session-lease.js";
 import {
 	parseSessionFileContents,
 	type SessionEntry,
@@ -139,6 +145,45 @@ describe("session edit file flow", () => {
 		expect(firstUserText(parseSessionFileContents(readFileSync(sessionPath, "utf8")).entries)).toBe("from document");
 	});
 
+	it("returns the rewritten stat so the same session can be saved again", () => {
+		const headerAfterWrite = parseSessionFileContents(readFileSync(sessionPath, "utf8")).header!;
+		const currentStat = () => ({ size: statSync(sessionPath).size, mtimeMs: statSync(sessionPath).mtimeMs });
+		const first = writeSessionEntries({
+			sessionPath,
+			header: headerAfterWrite,
+			entries: [userEntry("bbbb0001", null, "first save")],
+			agentDir: directory,
+			env: {},
+			expectedStat: currentStat(),
+		});
+		expect(first.written).toBe(true);
+		expect(first.stat).toEqual(currentStat());
+
+		const second = writeSessionEntries({
+			sessionPath,
+			header: headerAfterWrite,
+			entries: [userEntry("bbbb0001", null, "second save")],
+			agentDir: directory,
+			env: {},
+			expectedStat: first.stat,
+		});
+		expect(second.written).toBe(true);
+		expect(firstUserText(parseSessionFileContents(readFileSync(sessionPath, "utf8")).entries)).toBe("second save");
+
+		const stale = writeSessionEntries({
+			sessionPath,
+			header: headerAfterWrite,
+			entries: [userEntry("bbbb0001", null, "stale save")],
+			agentDir: directory,
+			env: {},
+			expectedStat: first.stat,
+		});
+		expect(stale.written).toBe(false);
+		expect(stale.issues).toEqual([
+			expect.objectContaining({ level: "error", message: expect.stringContaining("changed while it was open") }),
+		]);
+	});
+
 	it("does not write when the session file changes during the edit", () => {
 		const outcome = edit({
 			runEditor: (_command, file) => {
@@ -167,6 +212,35 @@ describe("session edit file flow", () => {
 		expect(outcome.stats.edited).toBe(1);
 		expect(readFileSync(sessionPath, "utf8")).toBe(originalFile);
 		expect(outcome.backupPath).toBeUndefined();
+	});
+
+	it("refuses to write an active session unless forced", () => {
+		const env = { PRIME_AGENT_INTERNAL_SESSION_LEASES: "1" };
+		const lease = acquireSessionLease(sessionPath, directory, env);
+		try {
+			expect(() =>
+				edit({
+					env,
+					runEditor: editorWriting((document) => rewriteQuestion(document, "blocked")),
+				}),
+			).toThrow(/active/i);
+			expect(firstUserText(parseSessionFileContents(readFileSync(sessionPath, "utf8")).entries)).toBe(
+				"first question",
+			);
+
+			const forced = edit({
+				env,
+				force: true,
+				runEditor: editorWriting((document) => rewriteQuestion(document, "forced")),
+			});
+			expect(forced.written).toBe(true);
+			expect(forced.issues).toEqual([
+				expect.objectContaining({ level: "warning", message: expect.stringContaining("active") }),
+			]);
+			expect(firstUserText(parseSessionFileContents(readFileSync(sessionPath, "utf8")).entries)).toBe("forced");
+		} finally {
+			lease?.release();
+		}
 	});
 
 	it("reports damaged session lines as a warning", () => {

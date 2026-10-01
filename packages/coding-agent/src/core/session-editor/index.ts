@@ -80,6 +80,8 @@ export interface SessionWriteOptions {
 export interface SessionWriteResult {
 	written: boolean;
 	backupPath?: string;
+	/** Stat of the rewritten file, for a caller that writes again in the same session. */
+	stat?: { size: number; mtimeMs: number };
 	issues: SessionDocumentIssue[];
 }
 
@@ -136,7 +138,8 @@ export function writeSessionEntries(options: SessionWriteOptions): SessionWriteR
 			mode: currentStat.mode & 0o777,
 			fsync: true,
 		});
-		return { written: true, backupPath, issues };
+		const writtenStat = statSync(sessionPath);
+		return { written: true, backupPath, stat: { size: writtenStat.size, mtimeMs: writtenStat.mtimeMs }, issues };
 	} finally {
 		lease?.release();
 	}
