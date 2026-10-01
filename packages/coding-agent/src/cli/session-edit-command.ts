@@ -7,9 +7,8 @@ import {
 	hasErrors,
 	type SessionDocumentIssue,
 } from "../core/session-editor/document.js";
-import { editSession, type SessionEditOutcome } from "../core/session-editor/index.js";
+import { acquireSessionEditLease, editSession, type SessionEditOutcome } from "../core/session-editor/index.js";
 import { SessionEditModel } from "../core/session-editor/model.js";
-import { acquireSessionLease, SessionAlreadyActiveError } from "../core/session-lease.js";
 import {
 	findMostRecentSessionForCwd,
 	getDefaultSessionDir,
@@ -162,6 +161,7 @@ function runDocumentSessionEdit(sessionPath: string, options: SessionEditCommand
 }
 
 async function runInteractiveSessionEdit(sessionPath: string, options: SessionEditCommandOptions): Promise<void> {
+	const initialStat = statSync(sessionPath);
 	const file = readFileSync(sessionPath, "utf8");
 	const { header, entries, skippedLines } = parseSessionFileContents(file);
 	if (!header) {
@@ -175,26 +175,15 @@ async function runInteractiveSessionEdit(sessionPath: string, options: SessionEd
 		return;
 	}
 
-	let activeWarning: string | undefined;
-	let lease: ReturnType<typeof acquireSessionLease>;
+	const leaseIssues: SessionDocumentIssue[] = [];
 	try {
-		lease = acquireSessionLease(sessionPath, getAgentDir(), process.env);
+		acquireSessionEditLease(sessionPath, getAgentDir(), process.env, options.force, leaseIssues)?.release();
 	} catch (error) {
-		if (error instanceof SessionAlreadyActiveError) {
-			if (!options.force) {
-				console.error(chalk.red(`Error: session is active in another agent: ${sessionPath}`));
-				console.error(chalk.dim("Stop it first, or pass --force to edit anyway."));
-				process.exitCode = 1;
-				return;
-			}
-			activeWarning = "session is active in another agent; editing a copy is safer";
-		} else {
-			throw error;
-		}
+		console.error(chalk.red(`Error: ${describeError(error)}`));
+		process.exitCode = 1;
+		return;
 	}
-	lease?.release();
 
-	const initialStat = statSync(sessionPath);
 	const model = new SessionEditModel({ header, entries, filePath: sessionPath });
 	const mode = new SessionEditorMode({
 		sessionPath,
@@ -205,7 +194,7 @@ async function runInteractiveSessionEdit(sessionPath: string, options: SessionEd
 		initialNotice:
 			[
 				skippedLines > 0 ? `${skippedLines} unreadable line(s) will be dropped when saving` : undefined,
-				activeWarning,
+				...leaseIssues.map((issue) => issue.message),
 			]
 				.filter((notice) => notice !== undefined)
 				.join(" · ") || undefined,

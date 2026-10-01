@@ -164,6 +164,25 @@ function removeSection(document: string, section: string): string {
 }
 
 describe("session document format", () => {
+	it.each([
+		{ role: "user", content: null },
+		{ role: "assistant", content: [null] },
+		{ role: "assistant", content: [{ type: "text" }] },
+	])("preserves damaged message payload %j without crashing (#18)", (message) => {
+		const entries = [{ ...userEntry("bad00001", null, ""), message }] as unknown as SessionEntry[];
+		const parsed = parseSessionDocument(render(entries), entries);
+		expect(parsed.entries).toEqual(entries);
+		expect(parsed.issues).toContainEqual(expect.objectContaining({ level: "error" }));
+	});
+
+	it("rejects content sections for the wrong role (#18)", () => {
+		const entries = [userEntry("aaaa0001", null, "question")];
+		const document = render(entries).replace(`${M} user index=0`, `${M} assistant index=0`);
+		expect(parseSessionDocument(document, entries).issues).toContainEqual(
+			expect.objectContaining({ level: "error" }),
+		);
+	});
+
 	it("round-trips a session without changes", () => {
 		const entries = sampleSession();
 		const parsed = parse(render(entries), entries);
@@ -344,13 +363,13 @@ describe("session document format", () => {
 		expect(parse(render(plain).replace(/\n$/, ""), plain).entries).toEqual(plain);
 	});
 
-	it("keeps a user entry whose content is an empty array", () => {
+	it.each([[], ""])("keeps unchanged empty user content %j (#18)", (content) => {
 		const entry: SessionEntry = {
 			type: "message",
 			id: "iiii0001",
 			parentId: null,
 			timestamp: "2026-01-01T00:00:01.000Z",
-			message: { role: "user", content: [], timestamp: 1 },
+			message: { role: "user", content, timestamp: 1 },
 		};
 		const parsed = parse(render([entry]), [entry]);
 		expect(parsed.entries).toEqual([entry]);

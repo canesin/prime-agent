@@ -1,6 +1,6 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { editTextInExternalEditor, resolveEditorCommand, splitCommandLine } from "../src/utils/external-editor.js";
 
@@ -73,9 +73,15 @@ describe("external editor", () => {
 		expect(result.text).toBeUndefined();
 	});
 
-	it("leaves no temp file behind", () => {
-		const script = writeEditorScript("touch.cjs", "process.exit(0);");
+	it("isolates editor contents in a temporary directory and removes it (#18)", () => {
+		const receipt = join(directory, "path.txt");
+		const script = writeEditorScript(
+			"touch.cjs",
+			`require("node:fs").writeFileSync(${JSON.stringify(receipt)}, process.argv[2]);`,
+		);
 		editTextInExternalEditor({ contents: "text", command: `"${process.execPath}" "${script}"` });
-		expect(readFileSync(script, "utf8")).toBe("process.exit(0);");
+		const file = readFileSync(receipt, "utf8");
+		expect(dirname(file)).not.toBe(tmpdir());
+		expect(existsSync(dirname(file))).toBe(false);
 	});
 });

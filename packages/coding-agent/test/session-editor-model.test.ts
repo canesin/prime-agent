@@ -76,6 +76,29 @@ function userText(instance: SessionEditModel, id: string): string {
 }
 
 describe("session edit model", () => {
+	it("keeps divergent edits dirty after undoing a save (#18)", () => {
+		const instance = model();
+		instance.removeEntry("aaaa0004");
+		instance.markSaved();
+		instance.undo();
+		instance.removeEntry("aaaa0001");
+		expect(instance.dirty).toBe(true);
+	});
+
+	it("rejects invalid entry edits without mutating the transcript (#18)", () => {
+		const instance = model();
+		const before = instance.serialize();
+		const text = instance
+			.entryText("aaaa0001")!
+			.replace("run it", "changed")
+			.replace(/time=\S+/, "time=invalid");
+		expect(instance.applyEntryText("aaaa0001", text).issues).toContainEqual(
+			expect.objectContaining({ level: "error" }),
+		);
+		expect(instance.serialize()).toBe(before);
+		expect(instance.canUndo).toBe(false);
+	});
+
 	it("cascades tool results when their assistant message is deleted", () => {
 		const instance = model();
 		const result = instance.removeEntry("aaaa0002");

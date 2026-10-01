@@ -219,6 +219,7 @@ function entryHeaderLine(entry: SessionEntry): string {
 }
 
 function renderEntrySections(entry: SessionEntry): string[] {
+	if (entryShapeIssues(entry).length > 0) return renderJsonSection(payloadWithout(entry, []));
 	if (entry.type === "message") {
 		return renderMessageSections(entry.message);
 	}
@@ -517,10 +518,6 @@ export function parseSessionDocument(
 	const seenIds = new Set<string>();
 	const usedIds = new Set(originalEntries.map((entry) => entry.id));
 	const entries: SessionEntry[] = [];
-	const changes: SessionDocumentChange[] = [];
-	let edited = 0;
-	let added = 0;
-	let unchanged = 0;
 
 	for (const block of blocks) {
 		if (block.marker.name === "entry") {
@@ -540,17 +537,7 @@ export function parseSessionDocument(
 			}
 			seenIds.add(id);
 			const result = applyExistingEntry(original, block, issues);
-			if (!result.entry) {
-				changes.push({ kind: "removed", id, label: describeEntry(original) });
-				continue;
-			}
-			entries.push(result.entry);
-			if (result.changed) {
-				edited++;
-				changes.push({ kind: "edited", id, label: describeEntry(result.entry) });
-			} else {
-				unchanged++;
-			}
+			if (result.entry) entries.push(result.entry);
 			continue;
 		}
 		if (block.marker.name === "new") {
@@ -558,17 +545,9 @@ export function parseSessionDocument(
 			if (!result.entry) continue;
 			usedIds.add(result.entry.id);
 			entries.push(result.entry);
-			added++;
-			changes.push({ kind: "added", id: result.entry.id, label: describeEntry(result.entry) });
 			continue;
 		}
 		issues.push({ level: "error", message: `line ${block.lineNumber}: unexpected block ${block.marker.name}` });
-	}
-
-	for (const original of originalEntries) {
-		if (!seenIds.has(original.id)) {
-			changes.push({ kind: "removed", id: original.id, label: describeEntry(original) });
-		}
 	}
 
 	const survivingOriginalIds = entries.filter((entry) => originalById.has(entry.id)).map((entry) => entry.id);
@@ -583,18 +562,34 @@ export function parseSessionDocument(
 	}
 	validateEntries(entries, issues);
 
-	return {
-		entries,
-		issues,
-		stats: {
-			total: entries.length,
-			edited,
-			added,
-			removed: changes.filter((change) => change.kind === "removed").length,
-			unchanged,
-		},
-		changes,
-	};
+	return { entries, issues, ...summarizeSessionChanges(originalEntries, entries) };
+}
+
+/** Compare final entries after relinking so reordered transcripts count as edits. */
+export function summarizeSessionChanges(
+	originalEntries: readonly SessionEntry[],
+	entries: readonly SessionEntry[],
+): { stats: SessionDocumentStats; changes: SessionDocumentChange[] } {
+	const originalById = new Map(originalEntries.map((entry) => [entry.id, entry]));
+	const currentIds = new Set(entries.map((entry) => entry.id));
+	const changes: SessionDocumentChange[] = [];
+	const stats: SessionDocumentStats = { total: entries.length, edited: 0, added: 0, removed: 0, unchanged: 0 };
+	for (const entry of entries) {
+		const original = originalById.get(entry.id);
+		if (original !== undefined && deepEqual(original, entry)) {
+			stats.unchanged++;
+			continue;
+		}
+		const kind = original === undefined ? "added" : "edited";
+		stats[kind]++;
+		changes.push({ kind, id: entry.id, label: describeEntry(entry) });
+	}
+	for (const entry of originalEntries) {
+		if (currentIds.has(entry.id)) continue;
+		stats.removed++;
+		changes.push({ kind: "removed", id: entry.id, label: describeEntry(entry) });
+	}
+	return { stats, changes };
 }
 
 interface EntryBuildResult {
@@ -615,7 +610,9 @@ function applyExistingEntry(original: SessionEntry, block: RawBlock, issues: Ses
 	const entry = structuredClone(original);
 	applyCommonAttrs(entry, block.marker, issues);
 	let dropped = false;
-	if (entry.type === "message" && original.type === "message") {
+	if (entryShapeIssues(original).length > 0) {
+		applyJsonPayload(entry, block, issues, []);
+	} else if (entry.type === "message" && original.type === "message") {
 		dropped = applyMessageSections(entry, original, block, issues);
 	} else if (entry.type === "custom_message" && original.type === "custom_message") {
 		applyCustomMessageSections(entry, block, issues);
@@ -765,28 +762,11 @@ function buildTextContent(
 	original: UserMessage | CustomMessage,
 	issues: SessionDocumentIssue[],
 ): string | (TextContent | ImageContent)[] | undefined {
-	const contentSections = sections.filter(
-		(section) =>
-			section.marker.name === sectionName || section.marker.name === "image" || section.marker.name === "keep",
-	);
-	if (contentSections.length === 0) return undefined;
 	const originalContent = original.content;
 	const originalBlocks = Array.isArray(originalContent) ? originalContent : [];
-	const blocks: (TextContent | ImageContent)[] = [];
-	for (const section of contentSections) {
-		const index = sectionIndex(section);
-		const text = sectionText(section);
-		if (section.marker.name === sectionName) {
-			const originalBlock = index === undefined ? undefined : originalBlocks[index];
-			if (text.length === 0) {
-				if (originalBlock?.type === "text" && originalBlock.text.length === 0) blocks.push(originalBlock);
-				continue;
-			}
-			blocks.push(updatedTextBlock(originalBlock, text));
-			continue;
-		}
-		pushPreservedBlock(blocks, section, originalBlocks, issues);
-	}
+	const blocks = buildBlockContent(sectionName, sections, originalBlocks, undefined, issues);
+	if (originalContent === "" && blocks.length === 0 && sections.some((section) => section.marker.name === sectionName))
+		return "";
 	if (blocks.length === 0) return undefined;
 	if (typeof originalContent === "string" && blocks.length === 1 && blocks[0]!.type === "text") {
 		return blocks[0]!.text;
@@ -798,7 +778,7 @@ function buildBlockContent(
 	sectionName: string,
 	sections: readonly RawSection[],
 	original: readonly (TextContent | ImageContent)[],
-	entryId: string,
+	entryId: string | undefined,
 	issues: SessionDocumentIssue[],
 ): (TextContent | ImageContent)[] {
 	const originalBlocks = Array.isArray(original) ? original : [];
@@ -1337,6 +1317,12 @@ export function validateEntries(entries: readonly SessionEntry[], issues: Sessio
  * errors block a rewrite so an editor cannot persist a payload the runtime
  * cannot read back.
  */
+function entryShapeIssues(entry: SessionEntry): SessionDocumentIssue[] {
+	const issues: SessionDocumentIssue[] = [];
+	validateEntryShape(entry, issues);
+	return issues;
+}
+
 function validateEntryShape(entry: SessionEntry, issues: SessionDocumentIssue[]): void {
 	const id = entry.id;
 	const error = (message: string): void => {
@@ -1357,6 +1343,14 @@ function validateEntryShape(entry: SessionEntry, issues: SessionDocumentIssue[])
 			if (!Array.isArray(content)) error("tool result content is not an array");
 			if (typeof (message as { toolCallId?: unknown }).toolCallId !== "string") {
 				error("tool result has no tool call id");
+			}
+		}
+		if (Array.isArray(content)) {
+			for (const block of content) {
+				if (!isRecord(block) || typeof block.type !== "string") error("has an invalid content block");
+				else if (block.type === "text" && typeof block.text !== "string") error("text block has no text");
+				else if (block.type === "thinking" && typeof block.thinking !== "string")
+					error("thinking block has no text");
 			}
 		}
 		return;
