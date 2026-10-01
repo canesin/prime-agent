@@ -26,6 +26,7 @@ import {
 	resolveIncidentWindow,
 	runIncident,
 } from "./incident.js";
+import { runSessionEditCommand } from "./session-edit-command.js";
 
 export interface PublicCommandResult {
 	handled: boolean;
@@ -160,8 +161,14 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 		}
 		case "model":
 			return rewriteNestedCommand("model", "list", "--list-models", args.slice(1));
-		case "session":
-			return rewriteNestedCommand("session", "export", "--export", args.slice(1));
+		case "session": {
+			const rest = args.slice(1);
+			if (rest[0] === "edit") {
+				await runSessionEditCommand(rest.slice(1));
+				return HANDLED;
+			}
+			return rewriteNestedCommand("session", "export", "--export", rest);
+		}
 		case "config":
 			if (!requireArgumentCount(args.slice(1), 0, "config")) return HANDLED;
 			return continueWith(args);

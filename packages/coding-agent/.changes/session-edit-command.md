@@ -1,0 +1,1 @@
+- Added `prime-agent session edit [selector]`: an interactive transcript editor that browses a saved session and edits, deletes, inserts, moves, and undoes entries with automatic id, timestamp, parent-chain, tool-call, and compaction bookkeeping, plus a lossless text document mode for `--print`, `--text`, and `--document`.

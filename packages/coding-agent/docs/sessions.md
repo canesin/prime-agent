@@ -50,6 +50,62 @@ In the picker you can:
 
 When available, Prime Agent uses the `trash` CLI for deletion instead of permanently removing files.
 
+## Editing Session Transcripts
+
+`prime-agent session edit [selector]` opens an interactive transcript editor for a saved session. The selector accepts a session ID or partial ID, a session name, or a `.jsonl` path; without a selector the most recent session for the current directory is used. The editor refuses a session that is active in another agent unless `--force` is passed.
+
+```bash
+prime-agent session edit                            # interactive editor for the most recent session
+prime-agent session edit 01a0f899                   # by session ID prefix
+prime-agent session edit my-agent                   # by session name
+prime-agent session edit --print > transcript.txt   # print the lossless transcript document
+prime-agent session edit --text                     # edit the transcript as one document in $EDITOR
+prime-agent session edit --document transcript.txt  # apply a saved document
+```
+
+The editor lists every entry in flow order with its role, a summary, and a badge when validation flags it. Keys are configurable through `keybindings.json`; the defaults are:
+
+| Key | Action |
+|-----|--------|
+| `Up`/`Down`, `k`/`j` | Select the previous or next entry |
+| `g` / `End` | Select the first or last entry |
+| `e` | Edit the selected entry in `$VISUAL`/`$EDITOR` |
+| `d` | Delete the selected entry (dependent tool results follow) |
+| `i` / `o` | Insert a user message before or after the selection |
+| `alt+a` | Add an assistant message after the selection |
+| `c` | Duplicate the selected entry |
+| `Shift+Up` / `Shift+Down` | Move the selected entry up or down |
+| `u` / `Ctrl+R` | Undo or redo the last edit |
+| `v` | Toggle raw JSON details for the selected entry |
+| `Ctrl+S` | Validate, back up, and write the session |
+| `Ctrl+E` | Edit the whole transcript as one document |
+| `?` | Show every key |
+| `q` | Quit; unsaved changes ask before they are discarded |
+
+Structure stays consistent without manual bookkeeping: new entries get fresh IDs and timestamps, the parent chain is rebuilt after deletes and moves, deleting a model reply also removes the tool results that answered it, compaction boundaries are retargeted, and labels or usage attributions for removed entries are dropped. Saving validates the full flow before writing, so a tool call without its result is reported instead of silently persisted.
+
+Every write copies the session to `<file>.bak-<timestamp>` first and stops if the file changed on disk while the editor was open.
+
+### Editing the transcript as a document
+
+`--print` writes the same transcript as a lossless, line-oriented document, and `--text` opens that document in `$EDITOR`. Each block maps to one session entry and each section inside a block maps to one piece of it:
+
+```text
+@@@@ entry 8caa7d33 type=message time=2026-10-01T17:53:07.907Z role=assistant provider=deepseek model=deepseek-v4-flash stop=toolUse
+@@@@ reasoning index=0
+I should check the session file first.
+@@@@ assistant index=1
+Reading the header now.
+@@@@ tool_call index=2 id=call_00_abc name=ipython
+{
+  "code": "print(1 + 1)"
+}
+```
+
+User text, assistant text, reasoning, tool-call arguments, tool results, compaction summaries, and custom messages are editable. Deleting a block removes the entry, moving blocks reorders the message flow, and `@@@@ new user`, `@@@@ new assistant`, and `@@@@ new toolResult call=<id>` insert entries. Structural errors (unknown entry IDs, an entry type that does not match the file, invalid tool-call JSON, an invalid timestamp) block the write; flow issues (a tool call without a matching result, a result without a call, a compaction that keeps a deleted entry) are warnings. Nothing is written when the document has no changes.
+
+`--dry-run` validates without writing, `--force` writes despite errors or an active session, `--no-backup` skips the copy, `--keep-temp` keeps the generated document, and `--json` prints machine-readable output.
+
 ## Naming Sessions
 
 Use `/name <name>` to set a human-readable session name:
