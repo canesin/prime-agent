@@ -51,6 +51,7 @@ Type `/` in the editor to open command completion. Extensions can register custo
 | `/tree` | Jump to any point in the session and continue from there |
 | `/fork` | Create a new session from a previous user message |
 | `/clone` | Duplicate the current active branch into a new session |
+| `/fork-edit` | Fork this session and edit the copy in the transcript editor |
 | `/compact [prompt]` | Manually compact context, optionally with custom instructions |
 | `/refine [instructions]` | Refine or roll back session-backed harness state |
 | `/copy` | Copy last assistant message to clipboard |
@@ -162,6 +163,10 @@ Use `/export [file]` to write a session to HTML.
 
 Use `/share` to upload a private GitHub gist with a shareable HTML link.
 
+## Editing Session Transcripts
+
+`prime-agent session edit [selector]` opens an interactive transcript editor for a saved session: select any user message, model reply, reasoning block, tool call, or tool result, then edit it in `$VISUAL`/`$EDITOR`, delete it, insert new messages, reorder entries, and undo. IDs, timestamps, the parent chain, tool-call pairing, and compaction boundaries are maintained automatically, and saving validates the whole flow before writing a timestamped `.bak` copy next to the original. `--print`, `--text`, and `--document` provide the same transcript as a lossless text document for scripting. See [Sessions](sessions.md#editing-session-transcripts) for keys and options.
+
 ## CLI Reference
 
 ```bash
@@ -231,6 +236,8 @@ Use `prime-agent model list [search]` to list available models.
 | `--no-session` | Ephemeral mode; do not save |
 
 Use `prime-agent session export <file> [output]` to export a session to HTML.
+
+Use `prime-agent session edit [selector]` to edit a session transcript interactively or as a document.
 
 ### Tool Options
 

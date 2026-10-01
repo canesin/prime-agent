@@ -36,12 +36,15 @@ vi.mock("node:fs", async (importOriginal) => {
 import { computeOwnAndTotalUsage } from "../../src/core/context-tree.js";
 import {
 	type FileEntry,
+	generateEntryId,
 	loadEntriesFromFile,
 	loadEntriesFromFileAsync,
 	migrateSessionEntries,
+	parseSessionFileContents,
 	readSessionInfo,
 	resolveSessionRlmDepth,
 	SessionManager,
+	serializeSessionFile,
 } from "../../src/core/session-manager.js";
 import { sessionUsageSummaryFrom } from "../../src/core/usage.js";
 
@@ -820,3 +823,96 @@ describe("migrateSessionEntries", () => {
 		expect(second!.parentId).toBe("abc12345");
 	});
 });
+
+describe("parseSessionFileContents and serializeSessionFile", () => {
+	it("separates the header from entries and counts damaged lines", () => {
+		const header = { type: "session", version: 3, id: "sess-1", timestamp: "2025-01-01T00:00:00Z", cwd: "/tmp" };
+		const entry = {
+			type: "message",
+			id: "abc12345",
+			parentId: null,
+			timestamp: "2025-01-01T00:00:01Z",
+			message: { role: "user", content: "hi", timestamp: 1 },
+		};
+		const parsed = parseSessionFileContents(`${JSON.stringify(header)}\n{not json}\n${JSON.stringify(entry)}\n\n`);
+
+		expect(parsed.header).toEqual(header);
+		expect(parsed.entries).toEqual([entry]);
+		expect(parsed.skippedLines).toBe(1);
+		expect(serializeSessionFile(parsed.header!, parsed.entries)).toBe(
+			`${JSON.stringify(header)}\n${JSON.stringify(entry)}\n`,
+		);
+	});
+
+	it("rejects contents whose first parseable line is not a session header", () => {
+		const parsed = parseSessionFileContents('{"type":"message","id":"abc12345","message":{}}\n');
+		expect(parsed).toEqual({ entries: [], skippedLines: 0 });
+	});
+
+	it("does not fold child usage attribution into assistant messages", () => {
+		const header = { type: "session", version: 3, id: "sess-1", timestamp: "2025-01-01T00:00:00Z", cwd: "/tmp" };
+		const assistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "hi" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 1,
+		};
+		const usage = {
+			input: 9,
+			output: 9,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 18,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		const lines = [
+			JSON.stringify(header),
+			JSON.stringify({
+				type: "message",
+				id: "abc12345",
+				parentId: null,
+				timestamp: "2025-01-01T00:00:01Z",
+				message: assistantMessage,
+			}),
+			JSON.stringify({
+				type: "child_usage_attributed",
+				id: "def67890",
+				parentId: "abc12345",
+				timestamp: "2025-01-01T00:00:02Z",
+				targetId: "abc12345",
+				childUsage: usage,
+				aggregateUsage: usage,
+			}),
+		].join("\n");
+
+		const raw = parseSessionFileContents(lines);
+		const folded = loadEntriesFromFile(writeTempSession(lines));
+
+		expect(raw.entries[0]).toMatchObject({ message: { usage: { totalTokens: 2 } } });
+		expect(folded[1]).toMatchObject({ message: { usage: { totalTokens: 18 } } });
+	});
+
+	it("allocates unused 8-hex entry ids", () => {
+		const used = new Set(["aaaaaaaa"]);
+		const generated = generateEntryId({ has: (id: string) => used.has(id) });
+		expect(generated).toMatch(/^[0-9a-f]{8}$/);
+		expect(used.has(generated)).toBe(false);
+	});
+});
+
+function writeTempSession(contents: string): string {
+	const path = join(tmpdir(), `session-primitives-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`);
+	writeFileSync(path, contents);
+	return path;
+}

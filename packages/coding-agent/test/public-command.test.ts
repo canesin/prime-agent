@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SELF_UPDATE_INTERACTIVE_CHILD_ENV } from "../src/config.js";
 
@@ -166,6 +169,38 @@ describe("public command routing", () => {
 		await expect(handlePublicCommand(argv)).resolves.toMatchObject({ handled: true });
 		expect(process.exitCode).toBe(1);
 		expect(mocks.daemonCommands).toEqual([]);
+	});
+
+	it("routes session edit to the transcript editor instead of agent startup", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "session-edit-route-"));
+		const sessionPath = join(directory, "session.jsonl");
+		const header = {
+			type: "session",
+			version: 3,
+			id: "01a00000-0000-7000-8000-000000000000",
+			timestamp: "2026-01-01T00:00:00.000Z",
+			cwd: directory,
+		};
+		const entry = {
+			type: "message",
+			id: "aaaa0001",
+			parentId: null,
+			timestamp: "2026-01-01T00:00:01.000Z",
+			message: { role: "user", content: [{ type: "text", text: "hello" }], timestamp: 1_700_000_000_000 },
+		};
+		writeFileSync(sessionPath, `${JSON.stringify(header)}\n${JSON.stringify(entry)}\n`);
+		const write = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		try {
+			await expect(handlePublicCommand(["session", "edit", sessionPath, "--print"])).resolves.toEqual({
+				handled: true,
+				args: [],
+				explicitAgentsView: false,
+			});
+			expect(write.mock.calls.map((call) => String(call[0])).join("")).toContain("prime-agent session editor");
+			expect(mocks.daemonCommands).toEqual([]);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
 	});
 
 	it("routes MCP management without entering agent startup", async () => {

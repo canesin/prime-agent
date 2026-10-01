@@ -151,6 +151,9 @@ import { PRIME_INFERENCE_PROVIDER_ID } from "../../core/prime-inference-auth.js"
 import { resolvePrimeInferencePostLoginModelAction } from "../../core/prime-inference-model-selection.js";
 import { parseCommandArgs } from "../../core/prompt-templates.js";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.js";
+import { createSessionForkTarget, readSessionHeader, type SessionForkTarget } from "../../core/session-editor/fork.js";
+import { SessionEditModel } from "../../core/session-editor/model.js";
+import { deleteSessionFile } from "../../core/session-file-actions.js";
 import { SessionImportFileNotFoundError } from "../../core/session-import-errors.js";
 import { resolveSessionPath, SessionSelectorError, SessionSelectorNotFoundError } from "../../core/session-resolver.js";
 import type { ChatDetail, McpServerConfig } from "../../core/settings-manager.js";
@@ -173,6 +176,7 @@ import { getChangelogPath, parseChangelog } from "../../utils/changelog.js";
 import { spawnHidden, spawnSyncHidden } from "../../utils/child-process.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
 import { readClipboardImage } from "../../utils/clipboard-image.js";
+import { editTextInExternalEditor, resolveEditorCommand } from "../../utils/external-editor.js";
 import { parseGitUrl } from "../../utils/git.js";
 import { resizeImage } from "../../utils/image-resize.js";
 import { getCwdRelativePath } from "../../utils/paths.js";
@@ -204,6 +208,11 @@ import type {
 import { AgentConnectionPromptAdmissionError } from "../agent-connection/index.js";
 import type { SessionSummary } from "../daemon/daemon-session-list.js";
 import { getModelArgumentCompletions } from "../model-autocomplete.js";
+import {
+	SessionEditorMode,
+	type SessionEditorModeOptions,
+	type SessionEditorModeResult,
+} from "../session-editor/session-editor-mode.js";
 import {
 	checkForPackageUpdates,
 	checkTmuxKeyboardSetup,
@@ -5322,6 +5331,16 @@ export class InteractiveMode {
 					await this.handleCloneCommand();
 					return;
 				}
+				if (commandName === "fork-edit") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /fork-edit");
+						return;
+					}
+					this.editor.setText("");
+					await this.handleForkEditCommand();
+					return;
+				}
 				if (commandName === "tree") {
 					if (commandArgs) {
 						this.editor.setText(text);
@@ -8069,46 +8088,27 @@ export class InteractiveMode {
 	}
 
 	private openExternalEditor(): void {
-		// Determine editor (respect $VISUAL, then $EDITOR)
-		const editorCmd = process.env.VISUAL || process.env.EDITOR;
+		// Respect $VISUAL, then $EDITOR
+		const editorCmd = resolveEditorCommand(undefined, process.env);
 		if (!editorCmd) {
 			this.showWarning("No editor configured. Set $VISUAL or $EDITOR environment variable.");
 			return;
 		}
 
 		const currentText = this.editor.getExpandedText?.() ?? this.editor.getText();
-		const tmpFile = path.join(os.tmpdir(), `pi-editor-${Date.now()}.pi.md`);
 
+		// Stop TUI to release terminal
+		this.ui.stop();
 		try {
-			// Write current content to temp file
-			fs.writeFileSync(tmpFile, currentText, "utf-8");
-
-			// Stop TUI to release terminal
-			this.ui.stop();
-
-			// Split by space to support editor arguments (e.g., "code --wait")
-			const [editor, ...editorArgs] = editorCmd.split(" ");
-
 			// Spawn editor synchronously with inherited stdio for interactive editing
-			const result = spawnSync(editor, [...editorArgs, tmpFile], {
-				stdio: "inherit",
-				shell: process.platform === "win32",
-			});
+			const result = editTextInExternalEditor({ contents: currentText, command: editorCmd, suffix: ".pi.md" });
 
 			// On successful exit (status 0), replace editor content
-			if (result.status === 0) {
-				const newContent = fs.readFileSync(tmpFile, "utf-8").replace(/\n$/, "");
-				this.editor.setText(newContent);
+			if (result.status === 0 && result.text !== undefined) {
+				this.editor.setText(result.text.replace(/\n$/, ""));
 			}
 			// On non-zero exit, keep original text (no action needed)
 		} finally {
-			// Clean up temp file
-			try {
-				fs.unlinkSync(tmpFile);
-			} catch {
-				// Ignore cleanup errors
-			}
-
 			// Restart TUI
 			this.ui.start();
 			// ui.stop() left fullscreen so the editor got a clean terminal
@@ -9164,6 +9164,65 @@ export class InteractiveMode {
 			);
 			return { component: selector, focus: selector.getMessageList() };
 		});
+	}
+
+	/** Test seam: builds the transcript editor used by /fork-edit. */
+	protected createSessionEditorMode(options: SessionEditorModeOptions): SessionEditorMode {
+		return new SessionEditorMode(options);
+	}
+
+	/**
+	 * Forks the session and opens the transcript editor on the copy, so the live
+	 * session keeps running while its flow is rewritten.
+	 */
+	private async handleForkEditCommand(): Promise<void> {
+		const sessionFile = this.connectionState?.sessionFile;
+		if (sessionFile === undefined) {
+			this.showError("This session is not saved to disk, so it cannot be fork-edited.");
+			return;
+		}
+		const cwd = this.connectionState?.cwd ?? process.cwd();
+		let target: SessionForkTarget;
+		try {
+			target = createSessionForkTarget(sessionFile, cwd, path.dirname(sessionFile));
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+			return;
+		}
+
+		const model = new SessionEditModel({
+			header: target.forkHeader,
+			entries: target.sourceEntries,
+			filePath: target.forkPath,
+		});
+		const forkStat = fs.statSync(target.forkPath);
+		const mode = this.createSessionEditorMode({
+			sessionPath: target.forkPath,
+			model,
+			backup: false,
+			stat: { size: forkStat.size, mtimeMs: forkStat.mtimeMs },
+			initialNotice: "editing a copy; this session keeps running",
+		});
+
+		this.ui.stop();
+		let result: SessionEditorModeResult;
+		try {
+			result = await mode.run();
+		} finally {
+			this.ui.start();
+			if (this.fullscreenEnabled) {
+				this.applyFullscreen(true);
+			}
+			this.ui.requestRender(true);
+		}
+
+		if (result.writes === 0) {
+			await deleteSessionFile(target.forkPath);
+			this.showStatus("Fork edit cancelled; no copy kept");
+			return;
+		}
+		const savedId = readSessionHeader(target.forkPath)?.id ?? target.forkPath;
+		this.showStatus(`Edited copy saved as ${savedId} — resume it with /resume ${savedId}`);
 	}
 
 	private async handleCloneCommand(): Promise<void> {

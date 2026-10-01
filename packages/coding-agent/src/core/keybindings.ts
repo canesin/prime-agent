@@ -64,6 +64,30 @@ export interface AppKeybindings {
 	"app.tree.filter.all": true;
 	"app.tree.filter.cycleForward": true;
 	"app.tree.filter.cycleBackward": true;
+	"app.sessionEdit.up": true;
+	"app.sessionEdit.down": true;
+	"app.sessionEdit.top": true;
+	"app.sessionEdit.bottom": true;
+	"app.sessionEdit.edit": true;
+	"app.sessionEdit.delete": true;
+	"app.sessionEdit.insert": true;
+	"app.sessionEdit.append": true;
+	"app.sessionEdit.appendAssistant": true;
+	"app.sessionEdit.duplicate": true;
+	"app.sessionEdit.moveUp": true;
+	"app.sessionEdit.moveDown": true;
+	"app.sessionEdit.undo": true;
+	"app.sessionEdit.redo": true;
+	"app.sessionEdit.save": true;
+	"app.sessionEdit.quit": true;
+	"app.sessionEdit.document": true;
+	"app.sessionEdit.help": true;
+	"app.sessionEdit.search": true;
+	"app.sessionEdit.searchNext": true;
+	"app.sessionEdit.searchPrevious": true;
+	"app.sessionEdit.details": true;
+	"app.sessionEdit.detailUp": true;
+	"app.sessionEdit.detailDown": true;
 }
 
 export type AppKeybinding = keyof AppKeybindings;
@@ -217,6 +241,36 @@ export const KEYBINDINGS = {
 		defaultKeys: "shift+ctrl+o",
 		description: "Tree filter: cycle backward",
 	},
+	"app.sessionEdit.up": { defaultKeys: "k", description: "Select the previous session entry" },
+	"app.sessionEdit.down": { defaultKeys: "j", description: "Select the next session entry" },
+	"app.sessionEdit.top": { defaultKeys: "g", description: "Select the first session entry" },
+	"app.sessionEdit.bottom": { defaultKeys: "end", description: "Select the last session entry" },
+	"app.sessionEdit.edit": { defaultKeys: "e", description: "Edit the selected entry in the external editor" },
+	"app.sessionEdit.delete": { defaultKeys: "d", description: "Delete the selected entry" },
+	"app.sessionEdit.insert": { defaultKeys: "i", description: "Insert a user message before the selection" },
+	"app.sessionEdit.append": { defaultKeys: "o", description: "Add a user message after the selection" },
+	"app.sessionEdit.appendAssistant": {
+		defaultKeys: "alt+a",
+		description: "Add an assistant message after the selection",
+	},
+	"app.sessionEdit.duplicate": { defaultKeys: "c", description: "Duplicate the selected entry" },
+	"app.sessionEdit.moveUp": { defaultKeys: "shift+up", description: "Move the selected entry up" },
+	"app.sessionEdit.moveDown": { defaultKeys: "shift+down", description: "Move the selected entry down" },
+	"app.sessionEdit.undo": { defaultKeys: "u", description: "Undo the last transcript edit" },
+	"app.sessionEdit.redo": { defaultKeys: "ctrl+r", description: "Redo the last undone transcript edit" },
+	"app.sessionEdit.save": { defaultKeys: "ctrl+s", description: "Save the edited session" },
+	"app.sessionEdit.quit": { defaultKeys: "q", description: "Quit the session editor" },
+	"app.sessionEdit.document": {
+		defaultKeys: "ctrl+e",
+		description: "Edit the whole transcript in the external editor",
+	},
+	"app.sessionEdit.help": { defaultKeys: "?", description: "Show session editor keys" },
+	"app.sessionEdit.search": { defaultKeys: "/", description: "Search the transcript" },
+	"app.sessionEdit.searchNext": { defaultKeys: "n", description: "Jump to the next search match" },
+	"app.sessionEdit.searchPrevious": { defaultKeys: "shift+n", description: "Jump to the previous search match" },
+	"app.sessionEdit.details": { defaultKeys: "v", description: "Toggle entry details" },
+	"app.sessionEdit.detailUp": { defaultKeys: "ctrl+u", description: "Scroll the entry detail up" },
+	"app.sessionEdit.detailDown": { defaultKeys: "ctrl+d", description: "Scroll the entry detail down" },
 } as const satisfies KeybindingDefinitions;
 
 const KEYBINDING_NAME_MIGRATIONS = {

@@ -333,7 +333,8 @@ export function getSessionArtifactPathForFile(sessionFile: string, sessionId?: s
 	return getSessionArtifactPath(dirname(sessionFile), sessionId ?? basename(sessionFile).replace(/\.jsonl$/, ""));
 }
 
-function generateId(byId: { has(id: string): boolean }): string {
+/** Allocates an unused 8-hex session entry id, matching the ids written by SessionManager. */
+export function generateEntryId(byId: { has(id: string): boolean }): string {
 	for (let i = 0; i < 100; i++) {
 		const id = randomUUID().slice(0, 8);
 		if (!byId.has(id)) return id;
@@ -351,7 +352,7 @@ function migrateV1ToV2(entries: FileEntry[]): void {
 			continue;
 		}
 
-		entry.id = generateId(ids);
+		entry.id = generateEntryId(ids);
 		entry.parentId = prevId;
 		prevId = entry.id;
 
@@ -597,35 +598,84 @@ export function getDefaultSessionDir(_cwd: string, agentDir: string = getDefault
 
 // Decode per line off a Buffer: toString("utf8") on a whole large file is far slower
 // (one giant UTF-16 string). Splitting on 0x0a is UTF-8-safe.
-function appendEntryFromBuffer(entries: FileEntry[], buffer: Buffer, start = 0, end = buffer.length): void {
-	if (end <= start) return;
+interface ParsedSessionLines {
+	entries: FileEntry[];
+	skippedLines: number;
+}
+
+function appendParsedLine(parsed: ParsedSessionLines, line: string): void {
+	if (line.length === 0) return;
 	try {
-		entries.push(JSON.parse(buffer.toString("utf8", start, end)) as FileEntry);
+		parsed.entries.push(JSON.parse(line) as FileEntry);
 	} catch {
-		// Skip malformed or blank lines.
+		// Skip malformed lines; they damage the transcript and are counted so a
+		// caller that rewrites the file can warn about them.
+		parsed.skippedLines++;
 	}
 }
 
-function parseEntriesFromBuffer(buffer: Buffer): FileEntry[] {
-	const entries: FileEntry[] = [];
+function appendEntryFromBuffer(parsed: ParsedSessionLines, buffer: Buffer, start = 0, end = buffer.length): void {
+	if (end <= start) return;
+	appendParsedLine(parsed, buffer.toString("utf8", start, end));
+}
+
+function parseBufferWithStats(buffer: Buffer): ParsedSessionLines {
+	const parsed: ParsedSessionLines = { entries: [], skippedLines: 0 };
 	let start = 0;
 	while (start < buffer.length) {
 		let end = buffer.indexOf(0x0a, start);
 		if (end === -1) end = buffer.length;
-		appendEntryFromBuffer(entries, buffer, start, end);
+		appendEntryFromBuffer(parsed, buffer, start, end);
 		start = end + 1;
 	}
-	return entries;
+	return parsed;
+}
+
+function parseEntriesFromBuffer(buffer: Buffer): FileEntry[] {
+	return parseBufferWithStats(buffer).entries;
+}
+
+export interface ParsedSessionFile {
+	header?: SessionHeader;
+	entries: SessionEntry[];
+	/** Non-empty lines that failed to parse and are dropped by a rewrite. */
+	skippedLines: number;
+}
+
+/**
+ * Parses session JSONL text into its header and entries. The header must be the
+ * first parseable line; malformed lines are skipped and counted. Unlike
+ * `loadEntriesFromFile`, this does not fold child-usage attribution into
+ * assistant messages, so a caller that rewrites the file keeps the values that
+ * were persisted.
+ */
+export function parseSessionFileContents(contents: string): ParsedSessionFile {
+	const parsed: ParsedSessionLines = { entries: [], skippedLines: 0 };
+	for (const line of contents.split("\n")) appendParsedLine(parsed, line);
+	const header = parsed.entries[0];
+	if (header === undefined || header.type !== "session" || typeof header.id !== "string") {
+		return { entries: [], skippedLines: parsed.skippedLines };
+	}
+	return {
+		header: header as SessionHeader,
+		entries: parsed.entries.slice(1) as SessionEntry[],
+		skippedLines: parsed.skippedLines,
+	};
+}
+
+/** Serializes a session to JSONL text: the header line, then one entry per line. */
+export function serializeSessionFile(header: SessionHeader, entries: readonly SessionEntry[]): string {
+	return `${[JSON.stringify(header), ...entries.map((entry) => JSON.stringify(entry))].join("\n")}\n`;
 }
 
 async function parseEntriesFromBufferAsync(buffer: Buffer): Promise<FileEntry[]> {
-	const entries: FileEntry[] = [];
+	const parsed: ParsedSessionLines = { entries: [], skippedLines: 0 };
 	let start = 0;
 	let bytesSinceYield = 0;
 	while (start < buffer.length) {
 		let end = buffer.indexOf(0x0a, start);
 		if (end === -1) end = buffer.length;
-		appendEntryFromBuffer(entries, buffer, start, end);
+		appendEntryFromBuffer(parsed, buffer, start, end);
 		bytesSinceYield += end - start + 1;
 		start = end + 1;
 		if (bytesSinceYield >= SESSION_ASYNC_PARSE_YIELD_BYTES) {
@@ -633,7 +683,7 @@ async function parseEntriesFromBufferAsync(buffer: Buffer): Promise<FileEntry[]>
 			await new Promise<void>((resolve) => setImmediate(resolve));
 		}
 	}
-	return entries;
+	return parsed.entries;
 }
 
 // Crash damage (torn tail, zero-filled append) poisons the NEXT append into the
@@ -788,17 +838,17 @@ export async function loadEntriesFromFileAsync(
 		return finalizeLoadedEntries(await parseEntriesFromBufferAsync(await readFile(filePath)));
 	}
 
-	const entries: FileEntry[] = [];
+	const parsed: ParsedSessionLines = { entries: [], skippedLines: 0 };
 	let bytesSinceYield = 0;
 	for await (const line of readLinesAsBuffers(filePath)) {
-		appendEntryFromBuffer(entries, line);
+		appendEntryFromBuffer(parsed, line);
 		bytesSinceYield += line.length + 1;
 		if (bytesSinceYield >= SESSION_ASYNC_PARSE_YIELD_BYTES) {
 			bytesSinceYield = 0;
 			await new Promise<void>((resolve) => setImmediate(resolve));
 		}
 	}
-	return finalizeLoadedEntries(entries);
+	return finalizeLoadedEntries(parsed.entries);
 }
 
 // --- Append-only metadata writes for closed sessions -------------------------
@@ -2028,7 +2078,7 @@ export class SessionManager {
 	private appendEntrySeed(): AppendEntrySeed {
 		return {
 			leafId: this.leafId,
-			newId: () => generateId(this.byId),
+			newId: () => generateEntryId(this.byId),
 			timestamp: new Date().toISOString(),
 		};
 	}
@@ -2061,7 +2111,7 @@ export class SessionManager {
 	appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
 		const entry: SessionMessageEntry = {
 			type: "message",
-			id: generateId(this.byId),
+			id: generateEntryId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			message,
@@ -2073,7 +2123,7 @@ export class SessionManager {
 	appendThinkingLevelChange(thinkingLevel: string): string {
 		const entry: ThinkingLevelChangeEntry = {
 			type: "thinking_level_change",
-			id: generateId(this.byId),
+			id: generateEntryId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			thinkingLevel,
@@ -2085,7 +2135,7 @@ export class SessionManager {
 	appendServiceTierChange(serviceTier: ServiceTier): string {
 		const entry: ServiceTierChangeEntry = {
 			type: "service_tier_change",
-			id: generateId(this.byId),
+			id: generateEntryId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			serviceTier,
@@ -2097,7 +2147,7 @@ export class SessionManager {
 	appendModelChange(provider: string, modelId: string, thinkingLevel?: string): string {
 		const entry: ModelChangeEntry = {
 			type: "model_change",
-			id: generateId(this.byId),
+			id: generateEntryId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			provider,
@@ -2130,7 +2180,7 @@ export class SessionManager {
 	): string {
 		const entry: CompactionEntry<T> = {
 			type: "compaction",
-			id: generateId(this.byId),
+			id: generateEntryId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			summary,
@@ -2152,7 +2202,7 @@ export class SessionManager {
 			type: "custom",
 			customType,
 			data,
-			id: generateId(this.byId),
+			id: generateEntryId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 		};
@@ -2178,7 +2228,7 @@ export class SessionManager {
 		target.message.usage = cloneUsage(aggregateUsage);
 		const entry: ChildUsageAttributionEntry = {
 			type: "child_usage_attributed",
-			id: generateId(this.byId),
+			id: generateEntryId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			targetId,
@@ -2256,7 +2306,7 @@ export class SessionManager {
 	appendAgentStatus(status: AgentStatus): string {
 		const entry: AgentStatusEntry = {
 			type: "agent_status",
-			id: generateId(this.byId),
+			id: generateEntryId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			status: {
@@ -2272,7 +2322,7 @@ export class SessionManager {
 	appendGitState(git: GitContext): string {
 		const entry: GitStateEntry = {
 			type: "git_state",
-			id: generateId(this.byId),
+			id: generateEntryId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			git,
@@ -2410,7 +2460,7 @@ export class SessionManager {
 		}
 		const entry: LabelEntry = {
 			type: "label",
-			id: generateId(this.byId),
+			id: generateEntryId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			targetId,
@@ -2543,7 +2593,7 @@ export class SessionManager {
 		this.leafBranchCache = null;
 		const entry: BranchSummaryEntry = {
 			type: "branch_summary",
-			id: generateId(this.byId),
+			id: generateEntryId(this.byId),
 			parentId: branchFromId,
 			timestamp: new Date().toISOString(),
 			fromId: branchFromId ?? "root",
@@ -2598,7 +2648,7 @@ export class SessionManager {
 			for (const { targetId, label, timestamp: labelTimestamp } of labelsToWrite) {
 				const labelEntry: LabelEntry = {
 					type: "label",
-					id: generateId(new Set(pathEntryIds)),
+					id: generateEntryId(new Set(pathEntryIds)),
 					parentId,
 					timestamp: labelTimestamp,
 					targetId,
@@ -2635,7 +2685,7 @@ export class SessionManager {
 		for (const { targetId, label, timestamp: labelTimestamp } of labelsToWrite) {
 			const labelEntry: LabelEntry = {
 				type: "label",
-				id: generateId(new Set([...pathEntryIds, ...labelEntries.map((e) => e.id)])),
+				id: generateEntryId(new Set([...pathEntryIds, ...labelEntries.map((e) => e.id)])),
 				parentId,
 				timestamp: labelTimestamp,
 				targetId,

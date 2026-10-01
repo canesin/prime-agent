@@ -137,6 +137,10 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "hotkeys", description: "Show all keyboard shortcuts" },
 	{ name: "fork", description: "Create a new fork from a previous user message" },
 	{ name: "clone", description: "Duplicate the current session at the current position" },
+	{
+		name: "fork-edit",
+		description: "Fork this session, then edit the copy in the transcript editor",
+	},
 	{ name: "tree", description: "Navigate session tree (switch branches)" },
 	{ name: "login", description: "Configure provider authentication" },
 	{ name: "logout", description: "Remove provider authentication" },

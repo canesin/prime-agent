@@ -189,13 +189,37 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 	},
 	{
 		path: ["session"],
-		usage: "session export <file> [output]",
+		usage: "session <export|edit>",
 		summary: "Manage saved sessions",
 	},
 	{
 		path: ["session", "export"],
 		usage: "session export <file> [output]",
 		summary: "Export a saved session to HTML",
+	},
+	{
+		path: ["session", "edit"],
+		usage: "session edit [selector] [options]",
+		summary: "Time-travel a saved session transcript in an interactive editor",
+		description:
+			"Opens an interactive transcript editor: select any user message, model reply, reasoning block, tool call, or tool result, then edit it in $VISUAL/$EDITOR, delete it, insert messages, reorder entries, search, undo, and save. Ids, timestamps, the parent chain, tool-call pairing, and compaction boundaries are maintained automatically, and saving validates the flow before writing a timestamped backup. --print, --text, and --document expose the same transcript as a lossless text document for scripting; --text opens it in $EDITOR.",
+		options: [
+			"--text              Edit the whole transcript as one document in $VISUAL/$EDITOR",
+			"--editor <command>  Editor to run (default: $VISUAL, $EDITOR, vim)",
+			"--document <file>   Apply edits from a file instead of opening an editor",
+			"--print             Print the editable document and exit",
+			"--dry-run           Validate and summarize without writing",
+			"--force             Write despite validation errors or an active session",
+			"--no-backup         Do not write a .bak copy of the session file",
+			"--keep-temp         Keep the generated document after writing",
+			"--json              Print the result as JSON",
+		],
+		examples: [
+			"session edit",
+			"session edit 01a0f899",
+			'session edit my-agent --text --editor "vim -u NONE"',
+			"session edit my-agent --print > transcript.txt",
+		],
 	},
 	{
 		path: ["config"],
