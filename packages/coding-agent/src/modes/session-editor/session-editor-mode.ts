@@ -2,6 +2,7 @@ import {
 	type Component,
 	clippedFullscreenDockHeight,
 	type Focusable,
+	type Keybinding,
 	ProcessTerminal,
 	setKeybindings,
 	TUI,
@@ -10,11 +11,16 @@ import {
 } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { KeybindingsManager } from "../../core/keybindings.js";
-import { describeEntry, parseSessionDocument, renderEntryBlock } from "../../core/session-editor/document.js";
+import {
+	describeEntry,
+	parseSessionDocument,
+	renderEntryBlock,
+	SESSION_DOCUMENT_MARKER,
+} from "../../core/session-editor/document.js";
 import { type SessionWriteResult, writeSessionEntries } from "../../core/session-editor/index.js";
 import type { NewEntryDraft, SessionEditModel } from "../../core/session-editor/model.js";
 import type { SessionEntry } from "../../core/session-manager.js";
-import { editTextInExternalEditor } from "../../utils/external-editor.js";
+import { type ExternalEditorResult, editTextInExternalEditor } from "../../utils/external-editor.js";
 import { keyText } from "../interactive/components/keybinding-hints.js";
 
 /**
@@ -38,7 +44,7 @@ export interface SessionEditorModeOptions {
 	keybindings?: KeybindingsManager;
 	/** Tests replace the save and editor side effects. */
 	writeSession?: (model: SessionEditModel) => SessionWriteResult;
-	editText?: (contents: string) => { ran: boolean; status: number | null; text?: string };
+	editText?: (contents: string) => ExternalEditorResult;
 }
 
 export interface SessionEditorModeResult {
@@ -54,6 +60,7 @@ interface QuitConfirmation {
 const DOCK_HEIGHT = 2;
 const LIST_SHARE = 0.45;
 const PAGE_STEP = 10;
+const DETAIL_SCROLL_STEP = 5;
 
 export class SessionEditorMode implements Component, Focusable {
 	focused = false;
@@ -103,16 +110,20 @@ export class SessionEditorMode implements Component, Focusable {
 	invalidate(): void {}
 
 	render(width: number): string[] {
-		const rows = this.ui.terminal.rows;
-		const contentHeight = Math.max(6, rows - clippedFullscreenDockHeight(DOCK_HEIGHT, rows));
+		const reportedRows = this.ui.terminal.rows;
+		const rows = Number.isFinite(reportedRows) && reportedRows > 0 ? reportedRows : 24;
+		const contentHeight = Math.max(1, rows - clippedFullscreenDockHeight(DOCK_HEIGHT, rows));
 		const lines: string[] = [];
 		lines.push(this.renderHeader(width));
-		const listHeight = Math.max(3, Math.min(Math.floor(contentHeight * LIST_SHARE), contentHeight - 4));
+		const listHeight = Math.max(1, Math.min(Math.floor(contentHeight * LIST_SHARE), Math.max(1, contentHeight - 3)));
 		lines.push(...this.renderList(width, listHeight));
-		lines.push(chalk.dim("─".repeat(Math.max(0, width))));
-		const detailHeight = Math.max(1, contentHeight - lines.length);
-		lines.push(...this.renderDetail(width, detailHeight));
-		return lines.slice(0, contentHeight);
+		const remaining = Math.max(0, contentHeight - lines.length);
+		if (remaining > 0) {
+			lines.push(chalk.dim("─".repeat(Math.max(0, width))));
+		}
+		const detailHeight = Math.max(0, contentHeight - lines.length);
+		if (detailHeight > 0) lines.push(...this.renderDetail(width, detailHeight));
+		return padLines(lines, contentHeight).slice(0, contentHeight);
 	}
 
 	handleInput(data: string): void {
@@ -171,6 +182,10 @@ export class SessionEditorMode implements Component, Focusable {
 			this.rawJson = !this.rawJson;
 		} else if (kb.matches(data, "app.sessionEdit.document")) {
 			this.editWholeDocument();
+		} else if (kb.matches(data, "app.sessionEdit.detailDown")) {
+			this.detailScroll += DETAIL_SCROLL_STEP;
+		} else if (kb.matches(data, "app.sessionEdit.detailUp")) {
+			this.detailScroll = Math.max(0, this.detailScroll - DETAIL_SCROLL_STEP);
 		} else if (kb.matches(data, "app.sessionEdit.search")) {
 			this.searchInput = "";
 		} else if (kb.matches(data, "app.sessionEdit.searchNext")) {
@@ -192,7 +207,7 @@ export class SessionEditorMode implements Component, Focusable {
 			this.searchQuery = query.length > 0 ? query : undefined;
 			this.searchInput = undefined;
 			this.jumpToMatch(1);
-		} else if (data === "\x7f" || data === "\b") {
+		} else if (kb.matches(data, "tui.editor.deleteCharBackward")) {
 			this.searchInput = query.slice(0, -1);
 			this.searchFromCursor();
 		} else if (data.length === 1 && data >= " ") {
@@ -320,7 +335,11 @@ export class SessionEditorMode implements Component, Focusable {
 		const text = this.model.entryText(entry.id);
 		if (text === undefined) return;
 		const result = this.editText(text);
-		if (!result.ran) {
+		if (result.error !== undefined) {
+			this.notice = `editor failed: ${result.error.message}`;
+			return;
+		}
+		if (result.ran === false) {
 			this.notice = "no editor configured; set $VISUAL or $EDITOR";
 			return;
 		}
@@ -345,7 +364,11 @@ export class SessionEditorMode implements Component, Focusable {
 	private editWholeDocument(): void {
 		const document = this.model.renderDocument();
 		const result = this.editText(document);
-		if (!result.ran) {
+		if (result.error !== undefined) {
+			this.notice = `editor failed: ${result.error.message}`;
+			return;
+		}
+		if (result.ran === false) {
 			this.notice = "no editor configured; set $VISUAL or $EDITOR";
 			return;
 		}
@@ -364,13 +387,17 @@ export class SessionEditorMode implements Component, Focusable {
 		this.notice = `document applied: ${parsed.stats.edited} edited, ${parsed.stats.added} added, ${parsed.stats.removed} removed`;
 	}
 
-	private editText(contents: string): { ran: boolean; status: number | null; text?: string } {
-		if (this.options.editText !== undefined) {
-			return this.options.editText(contents);
-		}
+	private editText(contents: string): ExternalEditorResult {
+		const run = (): ExternalEditorResult => {
+			if (this.options.editText !== undefined) return this.options.editText(contents);
+			return editTextInExternalEditor({ contents, suffix: ".session.txt" });
+		};
+		if (this.options.editText !== undefined) return run();
 		this.ui.stop();
 		try {
-			return editTextInExternalEditor({ contents, suffix: ".session.txt" });
+			return run();
+		} catch (error) {
+			return { ran: true, status: null, error: error instanceof Error ? error : new Error(String(error)) };
 		} finally {
 			this.ui.start();
 			this.ui.enterFullscreen({ scroll: [this], dock: this.dock, mouse: false, viewportControls: false });
@@ -525,15 +552,27 @@ export class SessionEditorMode implements Component, Focusable {
 		}
 		const body = this.rawJson ? JSON.stringify(entry, null, 2).split("\n") : entryDisplayLines(entry);
 		const wrapped = body.flatMap((line) => wrapTextWithAnsi(line, contentWidth));
-		const maximum = Math.max(0, wrapped.length - (height - lines.length));
+		const headerRows = lines.length;
+		const overflowing = wrapped.length > Math.max(0, height - headerRows - 1);
+		// Reserve one row for the scroll indicator whenever the body overflows.
+		const bodyRows = Math.max(0, height - headerRows - (overflowing ? 1 : 0));
+		const maximum = Math.max(0, wrapped.length - bodyRows);
 		this.detailScroll = Math.max(0, Math.min(this.detailScroll, maximum));
-		const visible = wrapped.slice(this.detailScroll, this.detailScroll + Math.max(0, height - lines.length));
-		const hiddenAbove = this.detailScroll;
-		const hiddenBelow = Math.max(0, wrapped.length - this.detailScroll - visible.length);
+		const visible = wrapped.slice(this.detailScroll, this.detailScroll + bodyRows);
 		for (const line of visible) lines.push(`  ${line}`);
-		if (height - lines.length >= 2) {
-			if (hiddenBelow > 0) lines.push(chalk.dim(`  ↓ ${hiddenBelow} more line(s)`));
-			if (hiddenAbove > 0) lines.push(chalk.dim(`  ↑ ${hiddenAbove} line(s) above`));
+		if (overflowing && lines.length < height) {
+			const hiddenBelow = maximum - this.detailScroll;
+			const parts = [
+				this.detailScroll > 0 ? `↑ ${this.detailScroll}` : "",
+				hiddenBelow > 0 ? `↓ ${hiddenBelow}` : "",
+			]
+				.filter((part) => part.length > 0)
+				.join(" · ");
+			lines.push(
+				chalk.dim(
+					`  [${parts} line(s); ${keyText("app.sessionEdit.detailDown")}/${keyText("app.sessionEdit.detailUp")} to scroll]`,
+				),
+			);
 		}
 		return padLines(lines, height).slice(0, height);
 	}
@@ -579,54 +618,54 @@ function isEmptyMessage(entry: SessionEntry | undefined): boolean {
 
 function entrySummary(entry: SessionEntry): string {
 	if (entry.type === "model_change") return `${entry.provider}/${entry.modelId}`;
-	if (entry.type === "thinking_level_change") return entry.thinkingLevel;
+	if (entry.type === "thinking_level_change") return String(entry.thinkingLevel ?? "");
 	if (entry.type === "service_tier_change") return String(entry.serviceTier ?? "default");
-	if (entry.type === "session_state") return entry.state.status;
+	if (entry.type === "session_state") return String((entry.state as { status?: unknown } | undefined)?.status ?? "");
 	if (entry.type === "session_info") return entry.name ?? "";
 	if (entry.type === "label") return `${entry.targetId}${entry.label === undefined ? "" : ` → ${entry.label}`}`;
 	if (entry.type === "compaction") return `${firstLine(entry.summary)} (${entry.tokensBefore} tokens before)`;
 	if (entry.type === "branch_summary") return `${firstLine(entry.summary)} (from ${entry.fromId})`;
-	if (entry.type === "custom_message")
-		return `${entry.customType}: ${firstLine(typeof entry.content === "string" ? entry.content : entry.content.map((block) => (block.type === "text" ? block.text : "[image]")).join(" "))}`;
-	if (entry.type === "custom") return entry.customType;
-	if (entry.type === "agent_status") return firstLine(entry.status.summary);
+	if (entry.type === "custom_message") return `${entry.customType}: ${firstLine(contentText(entry.content))}`;
+	if (entry.type === "custom") return String(entry.customType ?? "");
+	if (entry.type === "agent_status") {
+		return firstLine((entry.status as { summary?: unknown } | undefined)?.summary);
+	}
 	if (entry.type === "child_usage_attributed") return `→ ${entry.targetId}`;
 	if (entry.type !== "message") return "";
-	const message = entry.message;
+	const message = entry.message as { role?: unknown; content?: unknown } | undefined;
+	if (message === undefined || typeof message.role !== "string") return "(malformed entry)";
 	if (message.role === "user") {
-		const text =
-			typeof message.content === "string"
-				? message.content
-				: message.content.map((block) => (block.type === "text" ? block.text : "[image]")).join(" ");
-		return firstLine(text) || "(empty)";
+		return firstLine(contentText(message.content)) || "(empty)";
 	}
 	if (message.role === "assistant") {
+		const blocks = Array.isArray(message.content) ? message.content : [];
 		const text = firstLine(
-			message.content
-				.filter((block) => block.type === "text")
-				.map((block) => block.text)
+			blocks
+				.filter((block) => block?.type === "text")
+				.map((block) => (block as { text?: unknown }).text)
 				.join(" "),
 		);
-		const tools = message.content.filter((block) => block.type === "toolCall").map((block) => block.name);
-		const reasoning = message.content.some((block) => block.type === "thinking") ? "reasoning" : "";
+		const tools = blocks
+			.filter((block) => block?.type === "toolCall")
+			.map((block) => String((block as { name?: unknown }).name ?? "tool"));
+		const reasoning = blocks.some((block) => block?.type === "thinking") ? "reasoning" : "";
 		const parts = [text || "(no text)", tools.length > 0 ? `tools: ${tools.join(",")}` : "", reasoning].filter(
 			Boolean,
 		);
 		return parts.join(" · ");
 	}
 	if (message.role === "toolResult") {
-		const text = message.content.map((block) => (block.type === "text" ? block.text : "[image]")).join(" ");
+		const text = contentText(message.content);
 		return firstLine(text) || "(empty)";
 	}
 	if (message.role === "custom") {
-		const text =
-			typeof message.content === "string"
-				? message.content
-				: message.content.map((block) => (block.type === "text" ? block.text : "[image]")).join(" ");
-		return `${message.customType}: ${firstLine(text)}`;
+		const customType = String((message as { customType?: unknown }).customType ?? "custom");
+		return `${customType}: ${firstLine(contentText(message.content))}`;
 	}
-	if (message.role === "bashExecution") return firstLine(message.command);
-	return message.role;
+	if (message.role === "bashExecution") {
+		return firstLine((message as { command?: unknown }).command);
+	}
+	return String(message.role);
 }
 
 function matchesSearch(entry: SessionEntry | undefined, query: string): boolean {
@@ -634,9 +673,23 @@ function matchesSearch(entry: SessionEntry | undefined, query: string): boolean 
 	return JSON.stringify(entry).toLowerCase().includes(query.toLowerCase());
 }
 
-function firstLine(text: string): string {
+function firstLine(value: unknown): string {
+	const text = typeof value === "string" ? value : "";
 	const line = text.split("\n").find((candidate) => candidate.trim().length > 0) ?? "";
 	return line.trim().slice(0, 160);
+}
+
+/** Flattens string or block content without assuming either shape. */
+function contentText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.map((block) =>
+			block !== null && typeof block === "object" && (block as { type?: unknown }).type === "text"
+				? String((block as { text?: unknown }).text ?? "")
+				: "[image]",
+		)
+		.join(" ");
 }
 
 /** Human-readable view of one entry block: section headings plus indented bodies. */
@@ -644,12 +697,12 @@ function entryDisplayLines(entry: SessionEntry): string[] {
 	const lines: string[] = [];
 	let inSection = false;
 	for (const line of renderEntryBlock(entry).split("\n")) {
-		if (!line.startsWith("@@@@ ")) {
+		if (!line.startsWith(`${SESSION_DOCUMENT_MARKER} `)) {
 			lines.push(inSection ? `    ${line}` : line);
 			continue;
 		}
 		inSection = true;
-		const [head, ...rest] = line.slice(5).split(" ");
+		const [head, ...rest] = line.slice(SESSION_DOCUMENT_MARKER.length + 1).split(" ");
 		if (head === "entry") continue;
 		const attrs = rest.join(" ").trim();
 		lines.push(`── ${head}${attrs.length > 0 ? ` ${attrs}` : ""} `.padEnd(24, "─"));
@@ -658,7 +711,7 @@ function entryDisplayLines(entry: SessionEntry): string[] {
 }
 
 function renderHelpLines(width: number): string[] {
-	const rows: Array<[string, string]> = [
+	const rows: Array<[Keybinding, string]> = [
 		["app.sessionEdit.up", "select previous entry"],
 		["app.sessionEdit.down", "select next entry"],
 		["app.sessionEdit.top", "first entry"],
@@ -685,7 +738,7 @@ function renderHelpLines(width: number): string[] {
 	return [
 		chalk.bold(" Keys"),
 		...rows.map(([binding, description]) =>
-			truncateToWidth(`   ${keyText(binding as never).padEnd(10)} ${description}`, width),
+			truncateToWidth(`   ${keyText(binding).padEnd(10)} ${description}`, width),
 		),
 	];
 }

@@ -201,7 +201,19 @@ export class SessionEditModel {
 			entry.id = id;
 			entry.timestamp = timestamp;
 			entry.parentId = null;
-			if (entry.type === "message") entry.message.timestamp = time;
+			if (entry.type === "message") {
+				entry.message.timestamp = time;
+				// A copied reply must not reuse tool-call ids: providers pair results by
+				// id, and duplicates would attach the old result to the wrong copy.
+				if (entry.message.role === "assistant") {
+					entry.message.content = entry.message.content.map((block) => {
+						if (block.type !== "toolCall") return block;
+						const fresh = generateEntryId({ has: (candidate) => used.has(candidate) });
+						used.add(fresh);
+						return { ...block, id: `call_${fresh}` };
+					});
+				}
+			}
 		} else if (draft.kind === "user") {
 			entry = {
 				type: "message",
@@ -287,9 +299,10 @@ export class SessionEditModel {
 	entryText(id: string): string | undefined {
 		const entry = this.entry(id);
 		if (entry === undefined) return undefined;
-		// A trailing newline keeps an editor cursor out of the last marker line.
-		const block = renderEntryBlock(entry);
-		return block.endsWith("\n") ? block : `${block}\n`;
+		// The parser drops exactly one trailing newline, so add exactly one: this
+		// keeps a cursor out of the last marker line and round-trips content that
+		// itself ends with newlines.
+		return `${renderEntryBlock(entry)}\n`;
 	}
 
 	applyEntryText(id: string, text: string): EntryTextResult {
@@ -337,7 +350,7 @@ export class SessionEditModel {
 	undo(): boolean {
 		const previous = this.undoStack.pop();
 		if (previous === undefined) return false;
-		this.redoStack.push({ entries: this.entries, version: this.version });
+		this.redoStack.push({ entries: this.entries.slice(), version: this.version });
 		this.entries = previous.entries;
 		this.version = previous.version;
 		return true;
@@ -353,7 +366,9 @@ export class SessionEditModel {
 	}
 
 	private pushUndo(): void {
-		this.undoStack.push({ entries: this.entries, version: this.version });
+		// Snapshot the list shallowly: entries are replaced, never mutated, so
+		// the snapshot stays stable while later edits write new array slots.
+		this.undoStack.push({ entries: this.entries.slice(), version: this.version });
 		if (this.undoStack.length > UNDO_LIMIT) this.undoStack.shift();
 		this.redoStack = [];
 		this.version++;
@@ -361,8 +376,9 @@ export class SessionEditModel {
 
 	/** Chains every entry to its predecessor; first entry has no parent. */
 	private relink(): void {
-		this.entries.forEach((entry, index) => {
-			entry.parentId = index === 0 ? null : this.entries[index - 1]!.id;
+		this.entries = this.entries.map((entry, index) => {
+			const parentId = index === 0 ? null : this.entries[index - 1]!.id;
+			return entry.parentId === parentId ? entry : { ...entry, parentId };
 		});
 	}
 
@@ -374,7 +390,7 @@ export class SessionEditModel {
 	private repairReferences(removed: ReadonlySet<string>, removalIndex: number): string[] {
 		const notices: string[] = [];
 		const drop = new Set<string>();
-		this.entries.forEach((entry, index) => {
+		this.entries = this.entries.map((entry, index) => {
 			if (entry.type === "compaction" && removed.has(entry.firstKeptEntryId)) {
 				// The retained boundary must stay before the compaction; otherwise the
 				// compaction keeps its dangling id and contributes no retained messages.
@@ -382,8 +398,8 @@ export class SessionEditModel {
 				if (replacement === undefined) {
 					notices.push(`compaction ${entry.id} lost its retained boundary`);
 				} else {
-					entry.firstKeptEntryId = replacement.id;
 					notices.push(`compaction ${entry.id} now keeps from ${replacement.id}`);
+					return { ...entry, firstKeptEntryId: replacement.id };
 				}
 			}
 			if (entry.type === "label" && entry.targetId !== undefined && removed.has(entry.targetId)) {
@@ -397,6 +413,7 @@ export class SessionEditModel {
 			if (entry.type === "branch_summary" && removed.has(entry.fromId)) {
 				notices.push(`branch summary ${entry.id} references a removed entry`);
 			}
+			return entry;
 		});
 		if (drop.size > 0) this.entries = this.entries.filter((entry) => !drop.has(entry.id));
 		return notices;

@@ -258,7 +258,7 @@ describe("session document format", () => {
 		const document = render(entries);
 		const sections = document
 			.split("\n")
-			.filter((line) => line.startsWith(`${M} `) && !line.startsWith(`${M} entry `));
+			.filter((line) => line.startsWith(`${M} `) && !line.startsWith(`${M} entry `) && line !== `${M} end`);
 		expect(sections).toEqual([`${M} keep index=0 type=thinking`]);
 		expect(parse(document, entries).entries).toEqual(entries);
 	});
@@ -331,6 +331,119 @@ describe("session document format", () => {
 		];
 		const parsed = parse(replaceSection(render(entries), "reasoning", "old", "new"), entries);
 		expect(assistantContent(parsed.entries, "cccc0001")).toEqual([{ type: "thinking", thinking: "new" }]);
+	});
+
+	it("ignores editors that add or remove the final newline", () => {
+		const entries = [userEntry("hhhh0001", null, "hello\n")];
+		const document = render(entries);
+		expect(document.endsWith(`${M} end\n`)).toBe(true);
+		expect(parse(document, entries).entries).toEqual(entries);
+		expect(parse(document.replace(/\n$/, ""), entries).entries).toEqual(entries);
+		expect(parse(`${document}\n`, entries).entries).toEqual(entries);
+		const plain = [userEntry("hhhh0002", null, "hello")];
+		expect(parse(render(plain).replace(/\n$/, ""), plain).entries).toEqual(plain);
+	});
+
+	it("keeps a user entry whose content is an empty array", () => {
+		const entry: SessionEntry = {
+			type: "message",
+			id: "iiii0001",
+			parentId: null,
+			timestamp: "2026-01-01T00:00:01.000Z",
+			message: { role: "user", content: [], timestamp: 1 },
+		};
+		const parsed = parse(render([entry]), [entry]);
+		expect(parsed.entries).toEqual([entry]);
+		expect(parsed.stats.removed).toBe(0);
+	});
+
+	it("round-trips tool call arguments that are not JSON objects", () => {
+		const entries = [
+			assistantEntry("jjjj0001", null, [
+				{ type: "toolCall", id: "call_null", name: "ipython", arguments: null as never },
+				{ type: "toolCall", id: "call_text", name: "ipython", arguments: "raw" as never },
+			]),
+		];
+		const parsed = parse(render(entries), entries);
+		expect(parsed.entries).toEqual(entries);
+		expect(parsed.stats.unchanged).toBe(1);
+
+		const edited = render(entries).replace('"raw"', '{"code": "1+1"}');
+		const applied = parseSessionDocument(edited, entries);
+		expect(applied.issues.filter((issue) => issue.level === "error")).toEqual([]);
+		expect(assistantContent(applied.entries, "jjjj0001")[1]).toMatchObject({
+			type: "toolCall",
+			id: "call_text",
+			arguments: { code: "1+1" },
+		});
+	});
+
+	it("clears custom message string content when its section is deleted", () => {
+		const entries: SessionEntry[] = [
+			{
+				type: "custom_message",
+				id: "kkkk0001",
+				parentId: null,
+				timestamp: "2026-01-01T00:00:07.000Z",
+				customType: "notice",
+				content: "body text",
+				display: true,
+			},
+		];
+		expect(parse(removeSection(render(entries), "custom"), entries).entries[0]).toMatchObject({ content: "" });
+	});
+
+	it("warns when image attributes cannot be applied", () => {
+		const entry: SessionEntry = {
+			type: "message",
+			id: "llll0001",
+			parentId: null,
+			timestamp: "2026-01-01T00:00:08.000Z",
+			message: {
+				role: "toolResult",
+				toolCallId: "call_img",
+				toolName: "attach_image",
+				content: [{ type: "image", data: "QUJD", mimeType: "image/png" }],
+				isError: false,
+				timestamp: 1,
+			},
+		};
+		const edited = render([entry]).replace("mimeType=image/png", "mimeType=image/jpeg");
+		const mimeIssues = parseSessionDocument(edited, [entry]).issues.filter((issue) =>
+			issue.message.includes("mimeType"),
+		);
+		expect(mimeIssues).toEqual([expect.objectContaining({ level: "warning" })]);
+	});
+
+	it("round-trips damaged entries without throwing and reports their shape", () => {
+		const entries = [
+			{ type: "message", id: "mmmm0001", parentId: null, timestamp: "2026-01-01T00:00:09.000Z" },
+			{
+				type: "compaction",
+				id: "mmmm0002",
+				parentId: "mmmm0001",
+				timestamp: "2026-01-01T00:00:10.000Z",
+				tokensBefore: 5,
+			},
+			{
+				type: "agent_status",
+				id: "mmmm0003",
+				parentId: "mmmm0002",
+				timestamp: "2026-01-01T00:00:11.000Z",
+				status: {},
+			},
+			{
+				type: "session_state",
+				id: "mmmm0004",
+				parentId: "mmmm0003",
+				timestamp: "2026-01-01T00:00:12.000Z",
+			},
+		] as unknown as SessionEntry[];
+		const document = render(entries);
+		const parsed = parseSessionDocument(document, entries);
+		expect(parsed.entries).toEqual(entries);
+		expect(parsed.issues.filter((issue) => issue.level === "error").length).toBeGreaterThan(0);
+		expect(parsed.issues.map((issue) => issue.message).join("\n")).toContain("has no message payload");
 	});
 
 	it("reports invalid tool call JSON as an error", () => {

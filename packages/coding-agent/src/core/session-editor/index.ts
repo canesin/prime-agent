@@ -1,8 +1,8 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chownSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { getAgentDir } from "../../config.js";
-import { backupFileSync, writeFileAtomicSync } from "../../utils/atomic-file.js";
+import { backupFileSync, realpathIfPresentSync, writeFileAtomicSync } from "../../utils/atomic-file.js";
 import { type EditorRunResult, resolveEditorCommand, runEditorCommand } from "../../utils/external-editor.js";
 import { acquireSessionLease, SessionAlreadyActiveError, type SessionLease } from "../session-lease.js";
 import {
@@ -105,8 +105,7 @@ export function writeSessionEntries(options: SessionWriteOptions): SessionWriteR
 	const currentStat = statSync(sessionPath);
 	if (
 		options.expectedStat !== undefined &&
-		(currentStat.size !== options.expectedStat.size || currentStat.mtimeMs !== options.expectedStat.mtimeMs) &&
-		options.force !== true
+		(currentStat.size !== options.expectedStat.size || currentStat.mtimeMs !== options.expectedStat.mtimeMs)
 	) {
 		issues.push({
 			level: "error",
@@ -134,9 +133,19 @@ export function writeSessionEntries(options: SessionWriteOptions): SessionWriteR
 	}
 	try {
 		const backupPath = options.backup === false ? undefined : backupFileSync(sessionPath);
-		writeFileAtomicSync(sessionPath, serializeSessionFile(options.header, options.entries), {
-			mode: currentStat.mode & 0o777,
+		// Write through symlinks and keep ownership, exactly like the session writer.
+		const targetPath = realpathIfPresentSync(sessionPath);
+		const metadata = { mode: currentStat.mode & 0o777, uid: currentStat.uid, gid: currentStat.gid };
+		writeFileAtomicSync(targetPath, serializeSessionFile(options.header, options.entries), {
+			mode: metadata.mode,
 			fsync: true,
+			beforeRename: (tempPath) => {
+				try {
+					chownSync(tempPath, metadata.uid, metadata.gid);
+				} catch {
+					// Ownership changes need privileges; the mode bits are already set.
+				}
+			},
 		});
 		const writtenStat = statSync(sessionPath);
 		return { written: true, backupPath, stat: { size: writtenStat.size, mtimeMs: writtenStat.mtimeMs }, issues };
@@ -231,7 +240,7 @@ export function editSession(options: SessionEditOptions): SessionEditOutcome {
 			if (!hasErrors(parsed.issues) || options.force) {
 				const currentStat = statSync(sessionPath);
 				const changedOnDisk = currentStat.size !== initialStat.size || currentStat.mtimeMs !== initialStat.mtimeMs;
-				if (changedOnDisk && !options.force) {
+				if (changedOnDisk) {
 					allIssues.push({
 						level: "error",
 						message: "session file changed while it was open in the editor; nothing was written",

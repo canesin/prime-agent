@@ -1,7 +1,7 @@
 import type { AssistantMessage, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import { SessionEditModel } from "../src/core/session-editor/model.js";
-import type { SessionEntry, SessionHeader } from "../src/core/session-manager.js";
+import { parseSessionFileContents, type SessionEntry, type SessionHeader } from "../src/core/session-manager.js";
 import { emptyUsage } from "../src/core/usage.js";
 
 const header: SessionHeader = {
@@ -168,6 +168,47 @@ describe("session edit model", () => {
 		instance.undo();
 		instance.markSaved();
 		expect(instance.dirty).toBe(false);
+	});
+
+	it("restores content and the parent chain across undo and redo", () => {
+		const instance = model();
+		instance.updateEntry("aaaa0001", (entry) => {
+			if (entry.type === "message" && entry.message.role === "user") {
+				entry.message.content = [{ type: "text", text: "edited" }];
+			}
+			return entry;
+		});
+		expect(userText(instance, "aaaa0001")).toBe("edited");
+		instance.undo();
+		expect(userText(instance, "aaaa0001")).toBe("run it");
+		expect(instance.dirty).toBe(false);
+		instance.redo();
+		expect(userText(instance, "aaaa0001")).toBe("edited");
+
+		instance.removeEntry("aaaa0002");
+		expect(parents(instance)).toEqual([null, "aaaa0001"]);
+		instance.undo();
+		expect(ids(instance)).toEqual(["aaaa0001", "aaaa0002", "aaaa0003", "aaaa0004"]);
+		expect(parents(instance)).toEqual([null, "aaaa0001", "aaaa0002", "aaaa0003"]);
+		const reparsed = parseSessionFileContents(instance.serialize());
+		expect(reparsed.entries.map((entry) => entry.parentId ?? null)).toEqual([
+			null,
+			"aaaa0001",
+			"aaaa0002",
+			"aaaa0003",
+		]);
+	});
+
+	it("round-trips entry text that ends with newlines without reporting a change", () => {
+		for (const text of ["", "\n", "x\n", "x\n\n", "a\nb\n"]) {
+			const instance = model([userEntry("cccc0001", null, text)]);
+			const block = instance.entryText("cccc0001")!;
+			const applied = instance.applyEntryText("cccc0001", block);
+			expect(applied.issues).toEqual([]);
+			expect(instance.length).toBe(1);
+			expect(userText(instance, "cccc0001")).toBe(text);
+			expect(instance.dirty).toBe(false);
+		}
 	});
 
 	it("retargets a compaction boundary and drops dependent bookkeeping entries", () => {

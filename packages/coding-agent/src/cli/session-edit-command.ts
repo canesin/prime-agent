@@ -175,15 +175,21 @@ async function runInteractiveSessionEdit(sessionPath: string, options: SessionEd
 		return;
 	}
 
+	let activeWarning: string | undefined;
 	let lease: ReturnType<typeof acquireSessionLease>;
 	try {
 		lease = acquireSessionLease(sessionPath, getAgentDir(), process.env);
 	} catch (error) {
-		if (error instanceof SessionAlreadyActiveError && !options.force) {
-			console.error(chalk.red(`Error: session is active in another agent: ${sessionPath}`));
-			console.error(chalk.dim("Stop it first, or pass --force to edit anyway."));
-			process.exitCode = 1;
-			return;
+		if (error instanceof SessionAlreadyActiveError) {
+			if (!options.force) {
+				console.error(chalk.red(`Error: session is active in another agent: ${sessionPath}`));
+				console.error(chalk.dim("Stop it first, or pass --force to edit anyway."));
+				process.exitCode = 1;
+				return;
+			}
+			activeWarning = "session is active in another agent; editing a copy is safer";
+		} else {
+			throw error;
 		}
 	}
 	lease?.release();
@@ -196,7 +202,13 @@ async function runInteractiveSessionEdit(sessionPath: string, options: SessionEd
 		force: options.force,
 		backup: options.backup,
 		stat: { size: initialStat.size, mtimeMs: initialStat.mtimeMs },
-		initialNotice: skippedLines > 0 ? `${skippedLines} unreadable line(s) will be dropped when saving` : undefined,
+		initialNotice:
+			[
+				skippedLines > 0 ? `${skippedLines} unreadable line(s) will be dropped when saving` : undefined,
+				activeWarning,
+			]
+				.filter((notice) => notice !== undefined)
+				.join(" · ") || undefined,
 	});
 	const result = await mode.run();
 	if (options.json) {

@@ -206,6 +206,44 @@ describe("session editor mode", () => {
 		expect(lines.some((line) => line.includes("─"))).toBe(true);
 	});
 
+	it("survives malformed entries and tiny terminals", () => {
+		const malformed = [
+			{ type: "message", id: "mmmm0001", parentId: null, timestamp: "2026-01-01T00:00:09.000Z" },
+			{
+				type: "agent_status",
+				id: "mmmm0002",
+				parentId: "mmmm0001",
+				timestamp: "2026-01-01T00:00:10.000Z",
+				status: {},
+			},
+		] as unknown as SessionEntry[];
+		const { mode } = createMode(malformed);
+		expect(screen(mode)).toContain("Prime Agent session editor");
+		for (const rows of [1, 2, 6]) {
+			const small = createMode(sampleEntries(), {}, rows);
+			expect(small.mode.render(60).length).toBeGreaterThan(0);
+			small.mode.handleInput("j");
+		}
+	});
+
+	it("scrolls the detail pane with its keys and reports editor failures", () => {
+		const long = [userEntry("aaaa0001", null, Array.from({ length: 40 }, (_, index) => `line ${index}`).join("\n"))];
+		const { mode } = createMode(long);
+		const before = screen(mode);
+		mode.handleInput("\x04");
+		const after = screen(mode);
+		expect(after).not.toBe(before);
+		expect(after).toContain("line(s)");
+		mode.handleInput("\x15");
+		expect(screen(mode)).toBe(before);
+
+		const failing = createMode(sampleEntries(), {
+			editText: () => ({ ran: true, status: null, error: new Error("editor exploded") }),
+		});
+		failing.mode.handleInput("e");
+		expect(screen(failing.mode)).toContain("editor failed: editor exploded");
+	});
+
 	it("shows configurable key hints in the dock", () => {
 		const { mode } = createMode(sampleEntries());
 		expect(screen(mode)).toContain("Ctrl+S save");

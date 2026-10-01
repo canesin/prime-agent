@@ -1,4 +1,13 @@
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+	appendFileSync,
+	existsSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { UserMessage } from "@earendil-works/pi-ai";
@@ -241,6 +250,28 @@ describe("session edit file flow", () => {
 		} finally {
 			lease?.release();
 		}
+	});
+
+	it("refuses to overwrite a file that changed on disk even when forced", () => {
+		const expectedStat = { size: statSync(sessionPath).size, mtimeMs: statSync(sessionPath).mtimeMs };
+		appendFileSync(
+			sessionPath,
+			`${JSON.stringify(userEntry("cccc0001", "aaaa0002", "appended by another agent"))}\n`,
+		);
+		const result = writeSessionEntries({
+			sessionPath,
+			header,
+			entries: originalEntries,
+			agentDir: directory,
+			env: {},
+			expectedStat,
+			force: true,
+		});
+		expect(result.written).toBe(false);
+		expect(result.issues).toEqual([
+			expect.objectContaining({ level: "error", message: expect.stringContaining("changed while it was open") }),
+		]);
+		expect(readFileSync(sessionPath, "utf8")).toContain("appended by another agent");
 	});
 
 	it("reports damaged session lines as a warning", () => {

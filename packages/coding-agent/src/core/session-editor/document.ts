@@ -51,6 +51,10 @@ const CONTENT_SECTIONS = new Set([
 ]);
 const ALL_SECTIONS = new Set([...CONTENT_SECTIONS, "image", "keep", "json"]);
 const NEW_ROLES = new Set(["user", "assistant", "toolResult"]);
+const STOP_REASONS = new Set(["stop", "length", "toolUse", "error", "aborted"]);
+/** Section boundary written after the last block; it keeps the final body line
+ *  independent of the file's trailing newline, which editors may normalize. */
+const END_SECTION = "end";
 
 export interface SessionDocumentIssue {
 	level: "error" | "warning";
@@ -91,6 +95,7 @@ export function renderSessionDocument(options: RenderSessionDocumentOptions): st
 	for (const entry of options.entries) {
 		lines.push(...renderEntry(entry));
 	}
+	lines.push(`${SESSION_DOCUMENT_MARKER} ${END_SECTION}`);
 	return `${lines.join("\n")}\n`;
 }
 
@@ -187,14 +192,24 @@ function entryHeaderLine(entry: SessionEntry): string {
 		["time", entry.timestamp],
 	];
 	if (entry.type === "message") {
-		const message = entry.message;
-		attrs.push(["role", message.role]);
-		if (message.role === "assistant") {
-			attrs.push(["provider", message.provider], ["model", message.model], ["stop", message.stopReason]);
-		} else if (message.role === "toolResult") {
-			attrs.push(["name", message.toolName], ["call", message.toolCallId], ["error", String(message.isError)]);
-		} else if (message.role === "custom") {
-			attrs.push(["customType", message.customType], ["display", String(message.display)]);
+		const message = entry.message as unknown as Record<string, unknown> | undefined;
+		if (isRecord(message) && typeof message.role === "string") {
+			attrs.push(["role", message.role]);
+			if (message.role === "assistant") {
+				attrs.push(
+					["provider", String(message.provider ?? "")],
+					["model", String(message.model ?? "")],
+					["stop", String(message.stopReason ?? "stop")],
+				);
+			} else if (message.role === "toolResult") {
+				attrs.push(
+					["name", String(message.toolName ?? "")],
+					["call", String(message.toolCallId ?? "")],
+					["error", String(message.isError ?? false)],
+				);
+			} else if (message.role === "custom") {
+				attrs.push(["customType", String(message.customType ?? "")], ["display", String(message.display ?? false)]);
+			}
 		}
 	} else if (entry.type === "custom_message") {
 		attrs.push(["customType", entry.customType], ["display", String(entry.display)]);
@@ -208,28 +223,45 @@ function renderEntrySections(entry: SessionEntry): string[] {
 		return renderMessageSections(entry.message);
 	}
 	if (entry.type === "custom_message") {
-		return [
-			...renderContentSections("custom", entry.content),
-			...renderJsonSection(payloadWithout(entry, ["content", "customType", "display"])),
-		];
+		return isContent(entry.content)
+			? [
+					...renderContentSections("custom", entry.content),
+					...renderJsonSection(payloadWithout(entry, ["content", "customType", "display"])),
+				]
+			: renderJsonSection(payloadWithout(entry, []));
 	}
 	if (entry.type === "compaction" || entry.type === "branch_summary") {
+		if (typeof entry.summary !== "string") return renderJsonSection(payloadWithout(entry, []));
 		return [...renderTextSection("summary", entry.summary), ...renderJsonSection(payloadWithout(entry, ["summary"]))];
 	}
 	return renderJsonSection(payloadWithout(entry, []));
 }
 
 function renderMessageSections(message: AgentMessage): string[] {
+	if (!isRecord(message) || typeof message.role !== "string") {
+		return renderJsonSection(isRecord(message) ? { ...message } : { message });
+	}
 	switch (message.role) {
 		case "user":
-			return renderContentSections("user", message.content);
+			return isContent(message.content)
+				? renderContentSections("user", message.content)
+				: renderJsonSection(payloadWithoutMessage(message, []));
 		case "assistant":
-			return renderAssistantSections(message);
+			return Array.isArray(message.content)
+				? renderAssistantSections(message)
+				: renderJsonSection(payloadWithoutMessage(message, []));
 		case "toolResult":
-			return renderContentSections("tool_result", message.content);
+			return isContent(message.content)
+				? renderContentSections("tool_result", message.content)
+				: renderJsonSection(payloadWithoutMessage(message, []));
 		case "custom":
-			return renderContentSections("custom", message.content);
+			return isContent(message.content)
+				? renderContentSections("custom", message.content)
+				: renderJsonSection(payloadWithoutMessage(message, []));
 		case "bashExecution":
+			if (typeof message.command !== "string" || typeof message.output !== "string") {
+				return renderJsonSection(payloadWithoutMessage(message, []));
+			}
 			return [
 				...renderTextSection("command", message.command),
 				...renderTextSection("output", message.output),
@@ -259,7 +291,7 @@ function renderAssistantSections(message: AssistantMessage): string[] {
 			}
 		} else if (block.type === "toolCall") {
 			lines.push(
-				...renderTextSection("tool_call", JSON.stringify(block.arguments ?? {}, null, 2), {
+				...renderTextSection("tool_call", renderToolArguments(block.arguments), {
 					index,
 					id: block.id,
 					name: block.name,
@@ -298,6 +330,15 @@ function renderMarkerSection(name: string, attrs: Record<string, string | number
 		.map(([key, value]) => ` ${formatAttribute(key, String(value))}`)
 		.join("");
 	return [`${SESSION_DOCUMENT_MARKER} ${name}${rendered}`];
+}
+
+function renderToolArguments(value: unknown): string {
+	if (value === undefined) return "null";
+	try {
+		return JSON.stringify(value, null, 2) ?? "null";
+	} catch {
+		return "null";
+	}
 }
 
 function renderContentLines(text: string): string[] {
@@ -439,6 +480,12 @@ function splitDocument(document: string): { blocks: RawBlock[]; issues: SessionD
 			return;
 		}
 		if (marker) {
+			if (marker.name === END_SECTION) {
+				// Marks the end of the final section so the last body line does not
+				// depend on the file's trailing newline.
+				section = undefined;
+				return;
+			}
 			if (!block) {
 				issues.push({
 					level: "warning",
@@ -599,6 +646,18 @@ function applyMessageSections(
 	block: RawBlock,
 	issues: SessionDocumentIssue[],
 ): boolean {
+	const rawMessage = entry.message as unknown;
+	const rawOriginal = original.message as unknown;
+	if (
+		!isRecord(rawMessage) ||
+		typeof rawMessage.role !== "string" ||
+		!isRecord(rawOriginal) ||
+		typeof rawOriginal.role !== "string"
+	) {
+		// A damaged payload has no sections to apply; a JSON merge keeps it intact.
+		applyJsonPayload(entry, block, issues, []);
+		return false;
+	}
 	const message = entry.message;
 	const originalMessage = original.message;
 	const declaredRole = block.marker.attrs.role;
@@ -625,23 +684,50 @@ function applyMessageSections(
 
 	if (message.role === "user" && originalMessage.role === "user") {
 		const applied = buildTextContent("user", sections, originalMessage, issues);
-		if (applied === undefined) return originalMessage.content !== "";
+		if (applied === undefined) {
+			// Deleting every section removes the entry, but an entry that rendered no
+			// section (for example content: []) must survive an unchanged document.
+			return renderContentSections("user", originalMessage.content).length > 0;
+		}
 		message.content = applied;
 		return false;
 	}
 	if (message.role === "assistant" && originalMessage.role === "assistant") {
 		if (block.marker.attrs.provider !== undefined) message.provider = block.marker.attrs.provider;
 		if (block.marker.attrs.model !== undefined) message.model = block.marker.attrs.model;
-		if (block.marker.attrs.stop !== undefined) message.stopReason = block.marker.attrs.stop as StopReason;
-		const content = buildAssistantContent(sections, originalMessage.content, entry.id, issues);
-		if (content.length === 0 && originalMessage.content.length > 0) return true;
+		if (block.marker.attrs.stop !== undefined) {
+			const stop = block.marker.attrs.stop;
+			if (STOP_REASONS.has(stop)) {
+				message.stopReason = stop as StopReason;
+			} else {
+				issues.push({
+					level: "error",
+					message: `entry ${entry.id}: unknown stop reason ${stop}`,
+					entryId: entry.id,
+				});
+			}
+		}
+		const originalContent = Array.isArray(originalMessage.content) ? originalMessage.content : [];
+		const content = buildAssistantContent(sections, originalContent, entry.id, issues);
+		if (content.length === 0 && originalContent.length > 0) return true;
 		message.content = content;
 		return false;
 	}
 	if (message.role === "toolResult" && originalMessage.role === "toolResult") {
 		if (block.marker.attrs.name !== undefined) message.toolName = block.marker.attrs.name;
 		if (block.marker.attrs.call !== undefined) message.toolCallId = block.marker.attrs.call;
-		if (block.marker.attrs.error !== undefined) message.isError = block.marker.attrs.error === "true";
+		if (block.marker.attrs.error !== undefined) {
+			const value = block.marker.attrs.error.toLowerCase();
+			if (value === "true" || value === "false") {
+				message.isError = value === "true";
+			} else {
+				issues.push({
+					level: "error",
+					message: `entry ${entry.id}: error must be true or false`,
+					entryId: entry.id,
+				});
+			}
+		}
 		const content = buildBlockContent("tool_result", sections, originalMessage.content, entry.id, issues);
 		message.content = content.length === 0 ? [] : content;
 		return false;
@@ -685,7 +771,7 @@ function buildTextContent(
 	);
 	if (contentSections.length === 0) return undefined;
 	const originalContent = original.content;
-	const originalBlocks = typeof originalContent === "string" ? [] : originalContent;
+	const originalBlocks = Array.isArray(originalContent) ? originalContent : [];
 	const blocks: (TextContent | ImageContent)[] = [];
 	for (const section of contentSections) {
 		const index = sectionIndex(section);
@@ -715,6 +801,7 @@ function buildBlockContent(
 	entryId: string,
 	issues: SessionDocumentIssue[],
 ): (TextContent | ImageContent)[] {
+	const originalBlocks = Array.isArray(original) ? original : [];
 	const blocks: (TextContent | ImageContent)[] = [];
 	for (const section of sections) {
 		const name = section.marker.name;
@@ -729,7 +816,7 @@ function buildBlockContent(
 		if (name === sectionName) {
 			const text = sectionText(section);
 			const index = sectionIndex(section);
-			const originalBlock = index === undefined ? undefined : original[index];
+			const originalBlock = index === undefined ? undefined : originalBlocks[index];
 			if (text.length === 0) {
 				if (originalBlock?.type === "text" && originalBlock.text.length === 0) blocks.push(originalBlock);
 				continue;
@@ -737,7 +824,7 @@ function buildBlockContent(
 			blocks.push(updatedTextBlock(originalBlock, text));
 			continue;
 		}
-		pushPreservedBlock(blocks, section, original, issues);
+		pushPreservedBlock(blocks, section, originalBlocks, issues);
 	}
 	return blocks;
 }
@@ -748,11 +835,12 @@ function buildAssistantContent(
 	entryId: string,
 	issues: SessionDocumentIssue[],
 ): AssistantMessage["content"] {
+	const originalBlocks = Array.isArray(original) ? original : [];
 	const blocks: AssistantMessage["content"] = [];
 	for (const section of sections) {
 		const name = section.marker.name;
 		const index = sectionIndex(section);
-		const originalBlock = index === undefined ? undefined : original[index];
+		const originalBlock = index === undefined ? undefined : originalBlocks[index];
 		const text = sectionText(section);
 		if (name === "assistant") {
 			if (text.length === 0) {
@@ -775,14 +863,20 @@ function buildAssistantContent(
 				});
 				continue;
 			}
-			const args = parseToolArguments(text, section, entryId, issues);
+			const args = applyToolArguments(
+				parseToolArguments(text, section, entryId, issues),
+				originalBlock,
+				section,
+				entryId,
+				issues,
+			);
 			blocks.push(
 				originalBlock?.type === "toolCall"
-					? { ...originalBlock, id, name: callName, arguments: args }
-					: { type: "toolCall", id, name: callName, arguments: args },
+					? { ...originalBlock, id, name: callName, arguments: args ?? originalBlock.arguments }
+					: { type: "toolCall", id, name: callName, arguments: args ?? {} },
 			);
 		} else if (name === "keep") {
-			const block = index === undefined ? undefined : original[index];
+			const block = index === undefined ? undefined : originalBlocks[index];
 			if (!block) {
 				issues.push({ level: "error", message: `line ${section.lineNumber}: no block at index ${index}`, entryId });
 				continue;
@@ -822,6 +916,20 @@ function pushPreservedBlock(
 		issues.push({ level: "error", message: `line ${section.lineNumber}: block ${index} is not an image` });
 		return;
 	}
+	const declaredMime = section.marker.attrs.mimeType;
+	if (declaredMime !== undefined && block.type === "image" && block.mimeType !== declaredMime) {
+		issues.push({
+			level: "warning",
+			message: `line ${section.lineNumber}: mimeType cannot be changed here; the image keeps ${block.mimeType}`,
+		});
+	}
+	const declaredType = section.marker.attrs.type;
+	if (declaredType !== undefined && declaredType !== blockTypeOf(block)) {
+		issues.push({
+			level: "warning",
+			message: `line ${section.lineNumber}: block type cannot be changed here; it keeps ${blockTypeOf(block)}`,
+		});
+	}
 	target.push(block as TextContent | ImageContent);
 }
 
@@ -847,33 +955,61 @@ function updatedThinkingBlock(originalBlock: DocumentContentBlock | undefined, t
 	return { type: "thinking", thinking: text };
 }
 
+interface ParsedToolArguments {
+	/** False when the section body is not valid JSON; the original value is kept. */
+	ok: boolean;
+	value?: unknown;
+}
+
 function parseToolArguments(
 	text: string,
 	section: RawSection,
 	entryId: string,
 	issues: SessionDocumentIssue[],
-): Record<string, unknown> {
+): ParsedToolArguments {
 	const trimmed = text.trim();
-	if (trimmed.length === 0) return {};
+	if (trimmed.length === 0) return { ok: true };
 	try {
-		const parsed: unknown = JSON.parse(trimmed);
-		if (!isRecord(parsed)) {
-			issues.push({
-				level: "error",
-				message: `line ${section.lineNumber}: tool_call arguments must be a JSON object`,
-				entryId,
-			});
-			return {};
-		}
-		return parsed;
+		return { ok: true, value: JSON.parse(trimmed) as unknown };
 	} catch (error) {
 		issues.push({
 			level: "error",
 			message: `line ${section.lineNumber}: tool_call arguments are not valid JSON (${error instanceof Error ? error.message : String(error)})`,
 			entryId,
 		});
-		return {};
+		return { ok: false };
 	}
+}
+
+/**
+ * Applies edited tool-call arguments. A non-object value is only accepted when
+ * the stored arguments were already not an object, so the editor never invents
+ * a shape the provider cannot replay, and never normalizes stored values.
+ */
+function applyToolArguments(
+	parsed: ParsedToolArguments,
+	originalBlock: DocumentContentBlock | undefined,
+	section: RawSection,
+	entryId: string,
+	issues: SessionDocumentIssue[],
+): Record<string, unknown> | undefined {
+	const original = originalBlock?.type === "toolCall" ? (originalBlock.arguments as unknown) : undefined;
+	if (!parsed.ok || parsed.value === undefined) return original as Record<string, unknown> | undefined;
+	if (isRecord(parsed.value)) return parsed.value as Record<string, unknown>;
+	if (!isRecord(original)) {
+		issues.push({
+			level: "warning",
+			message: `line ${section.lineNumber}: tool_call arguments stay ${JSON.stringify(original)}; they were not a JSON object`,
+			entryId,
+		});
+		return original as Record<string, unknown> | undefined;
+	}
+	issues.push({
+		level: "error",
+		message: `line ${section.lineNumber}: tool_call arguments must be a JSON object`,
+		entryId,
+	});
+	return original as Record<string, unknown> | undefined;
 }
 
 function applyCustomMessageSections(entry: CustomMessageEntry, block: RawBlock, issues: SessionDocumentIssue[]): void {
@@ -882,15 +1018,19 @@ function applyCustomMessageSections(entry: CustomMessageEntry, block: RawBlock, 
 	const sections = block.sections.filter((section) => section.marker.name !== "json");
 	const content =
 		typeof entry.content === "string"
-			? buildStringContent("custom", sections, entry.content)
+			? buildStringContent("custom", sections)
 			: buildBlockContent("custom", sections, entry.content, entry.id, issues);
 	entry.content = content;
 	applyJsonPayload(entry, block, issues, ["content", "customType", "display"]);
 }
 
-function buildStringContent(sectionName: string, sections: readonly RawSection[], original: string): string {
+function buildStringContent(sectionName: string, sections: readonly RawSection[]): string {
 	const matching = sections.filter((section) => section.marker.name === sectionName);
-	if (matching.length === 0) return original;
+	if (matching.length === 0) {
+		// The renderer always emits a section for string content, so a missing
+		// section means the user deleted it: clear the content.
+		return "";
+	}
 	return matching
 		.map((section) => sectionText(section))
 		.filter((text) => text.length > 0)
@@ -1107,6 +1247,9 @@ function inferToolName(entries: readonly SessionEntry[], callId: string): string
 }
 
 export function validateEntries(entries: readonly SessionEntry[], issues: SessionDocumentIssue[]): void {
+	for (const entry of entries) {
+		validateEntryShape(entry, issues);
+	}
 	const pending = new Map<string, string>();
 	const flushPending = (): void => {
 		for (const [callId, ownerId] of pending) {
@@ -1120,27 +1263,33 @@ export function validateEntries(entries: readonly SessionEntry[], issues: Sessio
 	};
 	for (const entry of entries) {
 		if (entry.type !== "message") continue;
-		const message = entry.message;
-		if (message.role === "assistant") {
+		const raw = entry.message as unknown;
+		if (!isRecord(raw) || typeof raw.role !== "string") {
+			// Shape errors are reported above; pairing cannot be checked.
+			continue;
+		}
+		if (raw.role === "assistant") {
 			if (pending.size > 0) flushPending();
-			for (const block of message.content) {
-				if (block.type !== "toolCall") continue;
+			const content = Array.isArray(raw.content) ? raw.content : [];
+			for (const block of content) {
+				if (!isRecord(block) || block.type !== "toolCall" || typeof block.id !== "string") continue;
 				if (pending.has(block.id)) {
 					issues.push({ level: "warning", message: `duplicate tool call id ${block.id}`, entryId: entry.id });
 					continue;
 				}
 				pending.set(block.id, entry.id);
 			}
-			if (message.content.length === 0 && message.stopReason !== "error" && message.stopReason !== "aborted") {
+			if (content.length === 0 && raw.stopReason !== "error" && raw.stopReason !== "aborted") {
 				issues.push({ level: "warning", message: `assistant entry ${entry.id} has no content`, entryId: entry.id });
 			}
-		} else if (message.role === "toolResult") {
-			if (pending.has(message.toolCallId)) {
-				pending.delete(message.toolCallId);
+		} else if (raw.role === "toolResult") {
+			const toolCallId = typeof raw.toolCallId === "string" ? raw.toolCallId : undefined;
+			if (toolCallId !== undefined && pending.has(toolCallId)) {
+				pending.delete(toolCallId);
 			} else {
 				issues.push({
 					level: "warning",
-					message: `tool result in entry ${entry.id} references unknown tool call ${message.toolCallId}; it is dropped from model context`,
+					message: `tool result in entry ${entry.id} references unknown tool call ${toolCallId ?? "(missing)"}; it is dropped from model context`,
 					entryId: entry.id,
 				});
 			}
@@ -1183,12 +1332,59 @@ export function validateEntries(entries: readonly SessionEntry[], issues: Sessio
 	}
 }
 
+/**
+ * Shape checks for entries parsed from a damaged or newer file. Structural
+ * errors block a rewrite so an editor cannot persist a payload the runtime
+ * cannot read back.
+ */
+function validateEntryShape(entry: SessionEntry, issues: SessionDocumentIssue[]): void {
+	const id = entry.id;
+	const error = (message: string): void => {
+		issues.push({ level: "error", message: `entry ${id} ${message}`, entryId: id });
+	};
+	if (entry.type === "message") {
+		const message = (entry as { message?: unknown }).message;
+		if (!isRecord(message) || typeof message.role !== "string") {
+			error("has no message payload");
+			return;
+		}
+		const content = (message as { content?: unknown }).content;
+		if (message.role === "assistant" && !Array.isArray(content)) {
+			error("assistant content is not an array");
+		} else if ((message.role === "user" || message.role === "custom") && !isContent(content)) {
+			error(`${message.role} content is not text or content blocks`);
+		} else if (message.role === "toolResult") {
+			if (!Array.isArray(content)) error("tool result content is not an array");
+			if (typeof (message as { toolCallId?: unknown }).toolCallId !== "string") {
+				error("tool result has no tool call id");
+			}
+		}
+		return;
+	}
+	if (entry.type === "compaction" || entry.type === "branch_summary") {
+		if (typeof entry.summary !== "string") error(`${entry.type} has no summary`);
+	}
+	if (entry.type === "custom_message" && !isContent(entry.content)) {
+		error("custom message content is not text or content blocks");
+	}
+	if (entry.type === "session_state" && (!isRecord(entry.state) || typeof entry.state.status !== "string")) {
+		error("session state has no status");
+	}
+	if (entry.type === "agent_status" && !isRecord(entry.status)) {
+		error("agent status payload is missing");
+	}
+}
+
 export function describeEntry(entry: SessionEntry): string {
 	if (entry.type !== "message") return entry.type;
-	const message = entry.message;
-	if (message.role === "toolResult") return `toolResult ${message.toolName}`;
+	const message = entry.message as unknown;
+	if (!isRecord(message) || typeof message.role !== "string") return "message";
+	if (message.role === "toolResult") return `toolResult ${String(message.toolName ?? "")}`.trimEnd();
 	if (message.role === "assistant") {
-		const tools = message.content.filter((block) => block.type === "toolCall").map((block) => block.name);
+		const content = Array.isArray(message.content) ? message.content : [];
+		const tools = content
+			.filter((block) => isRecord(block) && block.type === "toolCall")
+			.map((block) => String((block as { name?: unknown }).name ?? "tool"));
 		return tools.length > 0 ? `assistant ${tools.join(",")}` : "assistant";
 	}
 	return message.role;
@@ -1237,6 +1433,10 @@ function samePayload(
 
 function entriesEqual(left: SessionEntry, right: SessionEntry): boolean {
 	return deepEqual(left, right);
+}
+
+function isContent(value: unknown): value is string | (TextContent | ImageContent)[] {
+	return typeof value === "string" || Array.isArray(value);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

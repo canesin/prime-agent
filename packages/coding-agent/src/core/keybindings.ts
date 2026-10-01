@@ -86,6 +86,8 @@ export interface AppKeybindings {
 	"app.sessionEdit.searchNext": true;
 	"app.sessionEdit.searchPrevious": true;
 	"app.sessionEdit.details": true;
+	"app.sessionEdit.detailUp": true;
+	"app.sessionEdit.detailDown": true;
 }
 
 export type AppKeybinding = keyof AppKeybindings;
@@ -267,6 +269,8 @@ export const KEYBINDINGS = {
 	"app.sessionEdit.searchNext": { defaultKeys: "n", description: "Jump to the next search match" },
 	"app.sessionEdit.searchPrevious": { defaultKeys: "shift+n", description: "Jump to the previous search match" },
 	"app.sessionEdit.details": { defaultKeys: "v", description: "Toggle entry details" },
+	"app.sessionEdit.detailUp": { defaultKeys: "ctrl+u", description: "Scroll the entry detail up" },
+	"app.sessionEdit.detailDown": { defaultKeys: "ctrl+d", description: "Scroll the entry detail down" },
 } as const satisfies KeybindingDefinitions;
 
 const KEYBINDING_NAME_MIGRATIONS = {
