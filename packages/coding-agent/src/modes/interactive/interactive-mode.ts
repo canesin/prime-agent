@@ -9192,7 +9192,7 @@ export class InteractiveMode {
 
 		const model = new SessionEditModel({
 			header: target.forkHeader,
-			entries: target.sourceEntries,
+			entries: target.forkEntries,
 			filePath: target.forkPath,
 		});
 		const forkStat = fs.statSync(target.forkPath);

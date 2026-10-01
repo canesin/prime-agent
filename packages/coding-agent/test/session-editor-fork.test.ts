@@ -40,17 +40,36 @@ afterEach(() => {
 });
 
 describe("session fork edit target", () => {
+	it("seeds the editor with the entries the fork actually wrote", () => {
+		const git: SessionEntry = {
+			type: "git_state",
+			id: "aaaa0000",
+			parentId: null,
+			timestamp: header.timestamp,
+			git: { branch: "source" },
+		};
+		writeFileSync(sourcePath, serializeSessionFile(header, [git, { ...entries[0]!, parentId: git.id }, entries[1]!]));
+
+		const target = createSessionForkTarget(sourcePath, directory, directory);
+		const written = parseSessionFileContents(readFileSync(target.forkPath, "utf8")).entries;
+
+		// The fork writer drops entries the header carries (git_state), so the
+		// editor must start from what the fork file holds, not from the source.
+		expect(written.map((entry) => entry.type)).toEqual(["message", "message"]);
+		expect(target.forkEntries).toEqual(written);
+	});
+
 	it("allocates a new session file that continues the source and copies its entries", () => {
 		const target = createSessionForkTarget(sourcePath, "/tmp/project", directory);
 
 		expect(target.sourceHeader).toEqual(header);
-		expect(target.sourceEntries).toEqual(entries);
+		expect(target.forkEntries).toEqual(entries);
 		expect(target.forkPath).not.toBe(sourcePath);
 		expect(existsSync(target.forkPath)).toBe(true);
 		expect(target.forkHeader.id).not.toBe(header.id);
 		expect(target.forkHeader.parentSession).toBe(sourcePath);
 		expect(target.forkHeader.cwd).toBe("/tmp/project");
-		expect(parseSessionFileContents(readFileSync(target.forkPath, "utf8")).entries).toEqual(entries);
+		expect(parseSessionFileContents(readFileSync(target.forkPath, "utf8")).entries).toEqual(target.forkEntries);
 		expect(readFileSync(sourcePath, "utf8")).toBe(serializeSessionFile(header, entries));
 	});
 
